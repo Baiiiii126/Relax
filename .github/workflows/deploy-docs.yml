@@ -11,14 +11,16 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 concurrency:
-  group: deploy-docs-${{ github.ref }}
-  cancel-in-progress: true
+  group: pages
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     if: github.repository == 'redai-infra/Relax'
     steps:
@@ -45,11 +47,25 @@ jobs:
           npm install --no-audit --no-fund --include=optional
           npm install --no-audit --no-fund --no-save @rollup/rollup-linux-x64-gnu
 
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
       - name: Build VitePress site
         run: npm run docs:build
 
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: docs/.vitepress/dist
+          path: docs/.vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.repository == 'redai-infra/Relax'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

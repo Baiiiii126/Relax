@@ -35,7 +35,7 @@ Rollout 运行后台循环：
 
 ## HTTP 端点
 
-<SwaggerUI specUrl="/relax/openapi/rollout.json" />
+<SwaggerUI specUrl="/Relax/openapi/rollout.json" />
 
 ## 源码
 

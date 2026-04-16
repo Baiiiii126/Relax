@@ -260,7 +260,7 @@ ______________________________________________________________________
 @software{relax2026,
   title  = {Relax: An Asynchronous Reinforcement Learning Engine for Omni-Modal Post-Training at Scale},
   author = {Relax Contributors},
-  url    = {https://github.com/redai-infra/Relax},
+  url    = {https://arxiv.org/abs/2604.11554},
   year   = {2026}
 }
 ```

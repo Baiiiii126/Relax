@@ -34,7 +34,7 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 
 ## HTTP 端点
 
-<SwaggerUI specUrl="/relax/openapi/genrm.json" />
+<SwaggerUI specUrl="/Relax/openapi/genrm.json" />
 
 ## 源码
 

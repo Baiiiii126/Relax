@@ -34,7 +34,7 @@ When colocated with the Actor (sharing GPU resources), GenRM supports offload/on
 
 ## HTTP Endpoints
 
-<SwaggerUI specUrl="/relax/openapi/genrm.json" />
+<SwaggerUI specUrl="/Relax/openapi/genrm.json" />
 
 ## Source
 

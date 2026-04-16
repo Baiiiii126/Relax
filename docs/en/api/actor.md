@@ -30,7 +30,7 @@ The Actor runs a background training loop that:
 
 ## HTTP Endpoints
 
-<SwaggerUI specUrl="/relax/openapi/actor.json" />
+<SwaggerUI specUrl="/Relax/openapi/actor.json" />
 
 ## Source
 

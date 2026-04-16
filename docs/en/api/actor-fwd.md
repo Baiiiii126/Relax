@@ -33,7 +33,7 @@ The ActorFwd runs a background loop that:
 
 ## HTTP Endpoints
 
-<SwaggerUI specUrl="/relax/openapi/actor_fwd.json" />
+<SwaggerUI specUrl="/Relax/openapi/actor_fwd.json" />
 
 ## Source
 

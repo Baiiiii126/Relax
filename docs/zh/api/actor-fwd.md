@@ -33,7 +33,7 @@ ActorFwd 运行后台循环：
 
 ## HTTP 端点
 
-<SwaggerUI specUrl="/relax/openapi/actor_fwd.json" />
+<SwaggerUI specUrl="/Relax/openapi/actor_fwd.json" />
 
 ## 源码
 

@@ -35,7 +35,7 @@ In fully-async mode, the Rollout service coordinates with the Actor for weight u
 
 ## HTTP Endpoints
 
-<SwaggerUI specUrl="/relax/openapi/rollout.json" />
+<SwaggerUI specUrl="/Relax/openapi/rollout.json" />
 
 ## Source
 
