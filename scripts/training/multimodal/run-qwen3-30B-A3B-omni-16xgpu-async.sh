@@ -25,13 +25,12 @@ EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=3000}"
 
 HF_CHECKPOINT="${HF_CHECKPOINT:-/path/to/Qwen3-Omni-30B-A3B-Instruct}"
-REF_LOAD="${REF_LOAD:-${HF_CHECKPOINT}}"
 SAVE_CKPT="${SAVE_CKPT:-${EXP_DIR}/ckpt/omni-sync-16gpu}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${HF_CHECKPOINT}
    # --load ${SAVE_CKPT}
-   --ref-load ${REF_LOAD}
+   --ref-load ${HF_CHECKPOINT}
    --megatron-to-hf-mode bridge
    --save ${SAVE_CKPT}
    --save-interval 100
@@ -61,6 +60,7 @@ ROLLOUT_ARGS=(
     --use-fault-tolerance
     --system-prompt "${SYSTEM_PROMPT}"
     --multimodal-keys '{"image":"image","audio":"audio"}'
+    --use-streaming-dataset
 )
 
 EVAL_ARGS=(
@@ -80,9 +80,9 @@ PERF_ARGS=(
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
 
-   # --recompute-granularity full
-   # --recompute-method uniform
-   # --recompute-num-layers 1
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
    --micro-batch-size 4 # avoid OOM
    --max-tokens-per-gpu 8192
 )
