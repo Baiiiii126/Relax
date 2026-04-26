@@ -13,9 +13,13 @@ from ray.actor import ActorHandle
 from tqdm import tqdm
 
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
+from relax.utils.logging_utils import get_logger
 
 from ..weight_conversion import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
+
+
+logger = get_logger(__name__)
 
 
 class UpdateWeightFromDistributed:
@@ -261,6 +265,7 @@ def connect_rollout_engines_from_distributed(
     group_name: str,
     rollout_engines: Sequence[ActorHandle],
     engine_gpu_counts: Sequence[int] | None = None,
+    max_retries: int = 3,
 ) -> dist.ProcessGroup:
     """Create NCCL group: training rank 0 + all engine GPUs. Blocks until
     joined.
@@ -273,37 +278,54 @@ def connect_rollout_engines_from_distributed(
         engine_gpu_counts = [args.rollout_num_gpus_per_engine] * len(rollout_engines)
 
     master_address = ray._private.services.get_node_ip_address()
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        master_port = sock.getsockname()[1]
     world_size = sum(engine_gpu_counts) + 1  # +1 for training rank 0
 
-    # Compute cumulative rank offsets: engine i starts at cumulative[i] + 1.
     cumulative = [0]
     for c in engine_gpu_counts:
         cumulative.append(cumulative[-1] + c)
 
-    refs = [
-        engine.init_weights_update_group.remote(
-            master_address,
-            master_port,
-            cumulative[i] + 1,
-            world_size,
-            group_name,
-            backend="nccl",
-        )
-        for i, engine in enumerate(rollout_engines)
-    ]
-    model_update_groups = init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{master_address}:{master_port}",
-        world_size=world_size,
-        rank=0,
-        group_name=group_name,
-        timeout=timedelta(minutes=args.distributed_timeout_minutes),
-    )
-    ray.get(refs)
-    return model_update_groups
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            master_port = sock.getsockname()[1]
+
+        refs = [
+            engine.init_weights_update_group.remote(
+                master_address,
+                master_port,
+                cumulative[i] + 1,
+                world_size,
+                group_name,
+                backend="nccl",
+            )
+            for i, engine in enumerate(rollout_engines)
+        ]
+        try:
+            model_update_groups = init_process_group(
+                backend="nccl",
+                init_method=f"tcp://{master_address}:{master_port}",
+                world_size=world_size,
+                rank=0,
+                group_name=group_name,
+                timeout=timedelta(minutes=args.distributed_timeout_minutes),
+            )
+            ray.get(refs)
+            return model_update_groups
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"Failed to connect rollout engines (attempt {attempt}/{max_retries}, port={master_port}): {e}",
+                exc_info=(attempt == max_retries),
+            )
+            try:
+                ray.get(refs, timeout=5)
+            except Exception:
+                pass
+            if attempt < max_retries:
+                time.sleep(5.0 * attempt)
+
+    raise RuntimeError(f"Failed to connect rollout engines after {max_retries} attempts") from last_error
 
 
 def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines):
@@ -311,6 +333,8 @@ def disconnect_rollout_engines_from_distributed(args, group_name, model_update_g
     refs = [engine.destroy_weights_update_group.remote(group_name) for engine in rollout_engines]
     dist.destroy_process_group(model_update_groups)
     ray.get(refs)
+    # Wait for NCCL socket ports to be released by the OS
+    time.sleep(2.0)
 
 
 def update_weights_from_distributed(
