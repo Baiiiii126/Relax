@@ -12,6 +12,7 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 from tqdm import tqdm
 
+from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.logging_utils import get_logger
 
@@ -214,7 +215,7 @@ class UpdateWeightFromDistributed:
         handles = []
         for i, (_name, param) in enumerate(named_tensors):
             params = [
-                torch.empty_like(param.data, device=torch.cuda.current_device())
+                torch.empty_like(param.data, device=device_utils.make_current_torch_device())
                 for _ in range(mpu.get_expert_model_parallel_world_size())
             ]
             handle = dist.all_gather(params, param.data, group=mpu.get_expert_model_parallel_group(), async_op=True)
@@ -285,6 +286,7 @@ def connect_rollout_engines_from_distributed(
         cumulative.append(cumulative[-1] + c)
 
     last_error = None
+    dist_backend = device_utils.get_dist_backend()
     for attempt in range(1, max_retries + 1):
         with socket.socket() as sock:
             sock.bind(("", 0))
@@ -297,13 +299,13 @@ def connect_rollout_engines_from_distributed(
                 cumulative[i] + 1,
                 world_size,
                 group_name,
-                backend="nccl",
+                backend=dist_backend,
             )
             for i, engine in enumerate(rollout_engines)
         ]
         try:
             model_update_groups = init_process_group(
-                backend="nccl",
+                backend=dist_backend,
                 init_method=f"tcp://{master_address}:{master_port}",
                 world_size=world_size,
                 rank=0,
