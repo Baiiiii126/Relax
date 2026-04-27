@@ -6,6 +6,7 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import available_memory, clear_memory, print_memory
 
@@ -191,7 +192,7 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
                 try:
                     group = old_new_group(
                         ranks=reloadable_group.group_info["ranks"],
-                        backend="nccl",
+                        backend=device_utils.get_dist_backend(),
                         timeout=timedelta(minutes=timeout_minutes),
                     )
                     reloadable_group.group = group
