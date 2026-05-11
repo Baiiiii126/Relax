@@ -134,13 +134,6 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-PARTIAL_ROLLOUT_ARGS=(
-    --partial-rollout
-    --over-sampling-batch-size 48
-    --mask-offpolicy-in-partial-rollout
-    --partial-rollout-max-aborted-count 3
-)
-
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
@@ -158,5 +151,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    "${PERF_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${PARTIAL_ROLLOUT_ARGS[@]}" \
    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-35B-A3B-GRPO-gpu16-sync-${now}.log
