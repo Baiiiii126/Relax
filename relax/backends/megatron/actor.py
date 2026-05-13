@@ -820,6 +820,14 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        if self.args.offload_train:
+            # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
+            # completed sleep() (and released GPU memory via tms.pause()) before
+            # SGLang's resume_memory_occupation tries to reclaim GPU memory.
+            # Without this, rank 0 may trigger SGLang resume while other ranks
+            # still hold GPU memory, causing cuMemCreate OOM in SGLang schedulers.
+            dist.barrier(group=get_gloo_group())
+
         if self.args.offload_rollout and dist.get_rank() == 0:
             # Onload genRM manager if exists (for colocated mode with shared GPU)
             if self.genrm_manager is not None:
