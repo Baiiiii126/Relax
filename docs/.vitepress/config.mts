@@ -259,6 +259,7 @@ export default defineConfig({
               text: 'Advanced',
               items: [
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
+                { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
@@ -358,6 +359,7 @@ export default defineConfig({
               text: '进阶指南',
               items: [
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
+                { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
