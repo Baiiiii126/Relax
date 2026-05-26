@@ -3,11 +3,12 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
+import json
 import os
 import pickle
 import re
 from contextlib import nullcontext
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -27,6 +28,50 @@ from relax.utils.misc import load_function
 
 
 logger = get_logger(__name__)
+
+
+def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, dict):
+        return {str(k): _make_json_safe(v, seen) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_make_json_safe(v, seen) for v in value]
+
+    obj_id = id(value)
+    if obj_id in seen:
+        return str(value)
+
+    if hasattr(value, "__dict__"):
+        seen.add(obj_id)
+        try:
+            return {str(k): _make_json_safe(v, seen) for k, v in vars(value).items()}
+        finally:
+            seen.remove(obj_id)
+
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _dump_provider_config(provider: Any, save_path: str) -> None:
+    os.makedirs(save_path, exist_ok=True)
+
+    pkl_path = os.path.join(save_path, "transformer_config.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(provider, f)
+    logger.info(f"Provider config saved to {pkl_path}")
+
+    json_path = os.path.join(save_path, "transformer_config.json")
+    with open(json_path, "w") as f:
+        json.dump(_make_json_safe(provider), f, indent=2, ensure_ascii=False)
+    logger.info(f"Provider config saved to {json_path}")
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -262,11 +307,7 @@ def get_model_provider_func(
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
         if not dist.is_initialized() or dist.get_rank() == 0:
             save_path = getattr(args, "save", None) or "/tmp/relax"
-            os.makedirs(save_path, exist_ok=True)
-            pkl_path = os.path.join(save_path, "transformer_config.pkl")
-            with open(pkl_path, "wb") as f:
-                pickle.dump(provider, f)
-            logger.info(f"Provider config saved to {pkl_path}")
+            _dump_provider_config(provider, save_path)
 
         original_provide = provider.provide
 
