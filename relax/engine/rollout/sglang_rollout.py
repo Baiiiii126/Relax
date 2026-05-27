@@ -800,10 +800,6 @@ async def generate_rollout_async(
             f"Total yielded: {total_transfer_samples - num_old_samples}/{target_data_size - num_old_samples} for step: {rollout_id}"
         )
 
-    if not args.fully_async:
-        state.prefetched_samples_ref = data_source.get_samples.remote(args.over_sampling_batch_size, args.fully_async)
-        logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
-
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
     if transfer_tasks:
@@ -1033,5 +1029,10 @@ def generate_rollout(
         return output
 
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
-    data_buffer.add_samples.remote(aborted_samples)
+    if aborted_samples:
+        ray.get(data_buffer.add_samples.remote(aborted_samples))
+    if not args.fully_async:
+        state = GenerateState(args)
+        state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size, args.fully_async)
+        logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
     return output
