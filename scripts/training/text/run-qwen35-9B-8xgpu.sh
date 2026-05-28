@@ -79,6 +79,8 @@ PERF_ARGS=(
    # --recompute-method uniform
    # --recompute-num-layers 1
 
+   --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather
+
    --use-dynamic-batch-size
    --max-tokens-per-gpu 10240
    --log-probs-max-tokens-per-gpu 40960
