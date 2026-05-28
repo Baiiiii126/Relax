@@ -109,6 +109,9 @@ Relax is designed for **omni-modal RL training** — text, vision, and audio in 
 | **Qwen3-VL**   | 4B, 30B-A3B       | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
 | **Qwen3.5**    | 30B-A3B           | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
 | **Qwen3-Omni** | 30B-A3B           | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
+| **Qwen3.6**    | 35B-A3B (MoE)     | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **GLM5**       | 744B-A40B (MoE)   | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
+| **Kimi K2.6**  | ~1T-A32B (MoE)    | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
 
 > 📖 New architectures are integrated via [Megatron Bridge](relax/backends/megatron/mbridge/) for automatic HF ↔ Megatron weight conversion.
 
@@ -253,6 +256,25 @@ ______________________________________________________________________
 ## 🤝 Contributing
 
 We welcome contributions of all kinds! Please read our [Contributing Guide](docs/en/guide/how-to-contribute.md) to get started.
+
+______________________________________________________________________
+
+## 🛠️ AI Coding Skills
+
+Relax ships a set of [Claude Code](https://claude.ai/code) slash-command skills under `skills/` to accelerate development and operations. Invoke them in Claude Code with `/skill-name`.
+
+| Skill                | Description                                                                                     |
+| :------------------- | :---------------------------------------------------------------------------------------------- |
+| `/code-review`       | Expert review of git changes — SOLID violations, security risks, ML/distributed training issues |
+| `/debug-hang`        | Automatically diagnose Ray distributed training hangs — collects call stacks and actor states   |
+| `/dev`               | Develop and debug Relax code; submit and monitor jobs on a remote Ray cluster                   |
+| `/doc-writer`        | Write and maintain bilingual (English + Chinese) VitePress documentation                        |
+| `/git-commit`        | Create Conventional Commits with rich markdown body and auto-run pre-commit hooks               |
+| `/model-integration` | Step-by-step guide for integrating new model architectures into the training pipeline           |
+| `/perf-doctor`       | Audit training launch scripts for performance and GPU memory misconfiguration                   |
+| `/ssh-ray-cluster`   | SSH into a remote Ray cluster head node to inspect status, logs, and debug jobs                 |
+| `/verl-to-relax`     | Migrate RL recipes from verl to Relax (rewards, tool envs, launch scripts)                      |
+| `/creating-skills`   | Guide for authoring new Claude Code skills following Anthropic best practices                   |
 
 ______________________________________________________________________
 
