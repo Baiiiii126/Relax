@@ -277,6 +277,27 @@ def get_model_provider_func(
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",
             "moe_layer_freq",
+            # Kimi K2 / MLA / MoE override surface — required because published K2 configs
+            # declare DeepseekV3ForCausalLM and route through DeepSeekV3Bridge, which has
+            # different defaults than what slime's K2 launch scripts assume.
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_head_dim",
+            "qk_pos_emb_head_dim",
+            "v_head_dim",
+            "rotary_scaling_factor",
+            "rotary_base",
+            "moe_router_pre_softmax",
+            "moe_router_enable_expert_bias",
+            "moe_permute_fusion",
+            "moe_grouped_gemm",
+            "moe_shared_expert_intermediate_size",
+            "moe_router_topk",
+            "moe_router_num_groups",
+            "moe_router_group_topk",
+            "moe_router_topk_scaling_factor",
+            "moe_router_score_function",
+            "moe_ffn_hidden_size",
         ]
 
         args_dict = vars(args)

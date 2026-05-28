@@ -358,6 +358,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sglang-hf-checkpoint",
+                type=str,
+                default=None,
+                help=(
+                    "Optional override for the HF checkpoint that SGLang loads. "
+                    "When set, SGLang's model_path uses this directory instead of "
+                    "args.hf_checkpoint, while training-side consumers (Megatron "
+                    "loader, AutoConfig, tokenizer) keep using args.hf_checkpoint. "
+                    "Used by INT4 QAT runs so SGLang loads the source compressed-"
+                    "tensors directory directly (registering weight_packed/scale/shape "
+                    "params) while training reads from a separately-prepared BF16 "
+                    "checkpoint."
+                ),
+            )
+            parser.add_argument(
                 "--model-name",
                 type=str,
                 default=None,
@@ -659,6 +674,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Number of consecutive health check failures before killing a rollout engine. "
                 "A single timeout (e.g. engine busy with a large batch) will not kill the engine. "
                 "Only after this many consecutive failures will the engine be killed.",
+            )
+            parser.add_argument(
+                "--rollout-engine-init-timeout",
+                type=float,
+                default=3600.0,
+                help="Total timeout in seconds to wait for ALL rollout engines to finish init() "
+                "(server launch + weight loading) at training startup. Acts as a soft barrier so "
+                "stragglers caused by storage/IO jitter on large clusters do not leak into "
+                "downstream NCCL collectives. Progress is logged every 60s while waiting.",
             )
             # Elastic rollout scale-out arguments
             parser.add_argument(

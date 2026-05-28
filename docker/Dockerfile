@@ -116,6 +116,12 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     rm sglang.patch; \
 fi
 
+# Build the INT4 fake-quant CUDA extension required by INT4 QAT rollout weight sync.
+COPY relax/backends/megatron/kernels/int4_qat /tmp/int4_qat
+RUN cd /tmp/int4_qat && \
+    pip install . --no-build-isolation && \
+    rm -rf /tmp/int4_qat
+
 # FROM relax as relax-release
 
 # WORKDIR /root/Relax
