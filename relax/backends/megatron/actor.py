@@ -184,6 +184,22 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
 
             update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+            # Push-side repack is decided by the HF config: an FP8 release auto-routes
+            # through quantize_params_fp8, a compressed-tensors release through
+            # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
+            # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
+            # controls the training-side forward STE in the megatron patch — it is
+            # independent of push routing (matches slime/backends/megatron_utils/actor.py).
+            # K2.6 INT4 release ships an ignore list that omits vision_tower /
+            # mm_projector — without augment_compressed_tensors_ignore the bridge
+            # would try to INT4-pack those BF16 tensors and SGLang would reject
+            # them with "weight_packed not found in params_dict".
+            from relax.utils.quant_cast import augment_compressed_tensors_ignore
+
+            push_quant_config = augment_compressed_tensors_ignore(
+                getattr(self.hf_config, "quantization_config", None),
+                args.hf_checkpoint,
+            )
             self.weight_updater = update_weight_cls(
                 self.args,
                 self.model,
@@ -191,7 +207,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 model_name=type(self.hf_config).__name__.lower()
                 if self.args.model_name is None
                 else self.args.model_name,
-                quantization_config=getattr(self.hf_config, "quantization_config", None),
+                quantization_config=push_quant_config,
             )
         else:
             is_pp_src_rank = (
@@ -217,6 +233,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 "master_address": master_address,
                 "master_port": master_port,
             }
+            from relax.utils.quant_cast import augment_compressed_tensors_ignore
+
+            push_quant_config = augment_compressed_tensors_ignore(
+                getattr(self.hf_config, "quantization_config", None),
+                args.hf_checkpoint,
+            )
             self.checkpoint_engine_client = run(
                 create_client(
                     args=self.args,
@@ -227,7 +249,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     model_name=type(self.hf_config).__name__.lower()
                     if self.args.model_name is None
                     else self.args.model_name,
-                    quantization_config=getattr(self.hf_config, "quantization_config", None),
+                    quantization_config=push_quant_config,
                     backend_type=self.args.checkpoint_engine_backend,
                     metadata=metadata,
                     lock=self.lock,

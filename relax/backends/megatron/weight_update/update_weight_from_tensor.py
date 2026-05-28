@@ -11,6 +11,7 @@ from megatron.core import mpu
 from ray import ObjectRef
 from ray.actor import ActorHandle
 
+from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
@@ -183,6 +184,11 @@ class UpdateWeightFromTensor:
             ray.get(prev_refs)
         del prev_long_lived_tensors
 
+        # All ranks must finish sending before rank 0 triggers Marlin repack,
+        # otherwise engines in slower gather groups may still be processing
+        # weight chunks when their parameters get reshaped by post_process.
+        dist.barrier(group=get_gloo_group())
+
         # int4/fp4 post_process
         if rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
@@ -192,6 +198,7 @@ class UpdateWeightFromTensor:
                     rollout_engines=self.rollout_engines,
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+        dist.barrier(group=get_gloo_group())
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
@@ -234,8 +241,19 @@ def _send_to_colocated_engine(
     if ipc_gather_group is None:
         return [], None
 
-    # TODO improve
     long_live_tensors = []
+
+    # Colocated IPC requires accelerator tensors (uses device IPC handles via
+    # shared memory). The bridge usually returns device tensors, but for K2.x
+    # multi-modal wrappers some text-backbone tensors leak through on cpu —
+    # coerce here so FlattenedTensorBucket's torch.cat doesn't see mixed
+    # devices. Synchronous copy: this runs on the weight-update path (not the
+    # rollout/train hot path) and FlattenedTensorBucket may flatten on a
+    # different stream — correctness over a few µs.
+    cur_device = make_current_torch_device()
+    hf_named_tensors = [
+        (name, tensor.to(cur_device) if tensor.device != cur_device else tensor) for name, tensor in hf_named_tensors
+    ]
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
