@@ -1006,3 +1006,48 @@ diff --git a/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py b/megatron/bri
                  scale_dtype = (
                      hf_state_dict[orig_scale_key].dtype if orig_scale_key in hf_state_dict else torch.bfloat16
                  )
+diff --git a/megatron/bridge/models/qwen/qwen3_moe_bridge.py b/megatron/bridge/models/qwen/qwen3_moe_bridge.py
+index 04afd67..a83cebf 100644
+--- a/megatron/bridge/models/qwen/qwen3_moe_bridge.py
++++ b/megatron/bridge/models/qwen/qwen3_moe_bridge.py
+@@ -69,6 +69,40 @@
+ 
+         return provider
+ 
++    def build_conversion_tasks(self, hf_pretrained, megatron_model):
++        """Inject virtual .weight keys so INT4 checkpoints (weight_packed/weight_scale/
++        weight_zero_point) pass the hf_keys validation in the base class.
++
++        When hf_checkpoint points to an INT4 compressed-tensors checkpoint, expert
++        weights are stored as weight_packed/weight_scale/weight_zero_point triplets
++        with no plain .weight key. The base build_conversion_tasks checks that each
++        mapped HF name exists in hf_keys and skips the param if not found, causing
++        all expert weights to be silently dropped. We patch get_all_keys() to return
++        synthetic .weight keys alongside the real packed keys so the check passes.
++        Downstream quantize_params in HfWeightIteratorBridge then converts the BF16
++        output back to INT4 before sending to the rollout engine.
++        """
++        if not (hasattr(hf_pretrained, "state") and hasattr(hf_pretrained.state, "source")):
++            return super().build_conversion_tasks(hf_pretrained, megatron_model)
++
++        original_get_all_keys = hf_pretrained.state.source.get_all_keys
++
++        def _get_all_keys_with_virtual():
++            keys = original_get_all_keys()
++            all_keys_set = set(keys)
++            virtual_keys = [
++                key[:-7]  # "...weight_packed" -> "...weight"
++                for key in keys
++                if key.endswith("_packed") and f"{key[:-7]}_scale" in all_keys_set
++            ]
++            return keys + virtual_keys
++
++        hf_pretrained.state.source.get_all_keys = _get_all_keys_with_virtual
++        try:
++            return super().build_conversion_tasks(hf_pretrained, megatron_model)
++        finally:
++            hf_pretrained.state.source.get_all_keys = original_get_all_keys
++
+     def mapping_registry(self) -> MegatronMappingRegistry:
+         # Return MegatronMappingRegistry containing parameter mappings from Megatron to HF format
+         # First create simple 1:1 parameter mappings using a dictionary for readability

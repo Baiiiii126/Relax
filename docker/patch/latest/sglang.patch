@@ -1210,7 +1210,25 @@ diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sgl
 index 8da7d8eef..4938ac5aa 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-@@ -691,6 +691,7 @@ class FusedMoE(torch.nn.Module):
+@@ -524,9 +524,14 @@ class FusedMoE(torch.nn.Module):
+             if not is_bias and not self.use_presharded_weights:
+                 if self.use_triton_kernels:
+                     loaded_weight = loaded_weight.transpose(-2, -1)
+-                loaded_weight = loaded_weight.narrow(
+-                    shard_dim, shard_size * tp_rank, shard_size
+-                )
++                # Only narrow when the loaded tensor is larger than the local shard.
++                # For quantization scales (e.g. compressed-tensors Marlin), the scale
++                # tensor is replicated across TP ranks (not sharded), so its size on
++                # shard_dim equals shard_size and no slicing is needed.
++                if loaded_weight.shape[shard_dim] > shard_size:
++                    loaded_weight = loaded_weight.narrow(
++                        shard_dim, shard_size * tp_rank, shard_size
++                    )
+ 
+         # w2, down_proj: Load into only logical weight of w2.
+         expert_data.copy_(loaded_weight)
+@@ -691,6 +696,7 @@ class FusedMoE(torch.nn.Module):
                      "CompressedTensorsWNA16TritonMoE",
                  ]
              )
@@ -1218,7 +1236,7 @@ index 8da7d8eef..4938ac5aa 100644
              else loaded_weight
          )
  
-@@ -815,13 +816,16 @@ class FusedMoE(torch.nn.Module):
+@@ -815,13 +821,16 @@ class FusedMoE(torch.nn.Module):
                  FusedMoeWeightScaleSupported.GROUP.value,
                  FusedMoeWeightScaleSupported.BLOCK.value,
              ]:
@@ -1242,7 +1260,7 @@ index 8da7d8eef..4938ac5aa 100644
              elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                  # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
                  if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
-@@ -910,6 +914,7 @@ class FusedMoE(torch.nn.Module):
+@@ -910,6 +919,7 @@ class FusedMoE(torch.nn.Module):
                      "CompressedTensorsWNA16TritonMoE",
                  ]
              )
