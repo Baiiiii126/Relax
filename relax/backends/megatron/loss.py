@@ -622,14 +622,20 @@ def vanilla_tis_function(
     rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
     old_log_probs = torch.cat(train_log_probs, dim=0)
 
-    tis = torch.exp(old_log_probs - rollout_log_probs)
-    tis_abs = (torch.exp(old_log_probs - rollout_log_probs) - 1).abs()
+    log_ratio = old_log_probs - rollout_log_probs
+    tis = torch.exp(log_ratio)
+    tis_abs = (tis - 1).abs()
     tis_weights = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
     tis_clipfrac = (tis_weights != tis).float()
+    # K3 KL ≈ E[exp(log_ratio) - log_ratio - 1]; direct KL = E[log π_rollout - log π_train].
+    mismatch_k3_kl = tis - log_ratio - 1
+    mismatch_kl = -log_ratio
     metrics = {
         "tis": tis.clone().detach(),
         "tis_clipfrac": tis_clipfrac.clone().detach(),
         "tis_abs": tis_abs.clone().detach(),
+        "mismatch_kl": mismatch_kl.clone().detach(),
+        "mismatch_k3_kl": mismatch_k3_kl.clone().detach(),
     }
     pg_loss = pg_loss * tis_weights
     return pg_loss, loss_masks, metrics
@@ -647,16 +653,21 @@ def icepop_function(
     rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
     old_log_probs = torch.cat(train_log_probs, dim=0)
 
-    ice_ratio = torch.exp(old_log_probs - rollout_log_probs)
-    ice_abs = (torch.exp(old_log_probs - rollout_log_probs) - 1).abs()
+    log_ratio = old_log_probs - rollout_log_probs
+    ice_ratio = torch.exp(log_ratio)
+    ice_abs = (ice_ratio - 1).abs()
     ice_weight = torch.where(
         (ice_ratio >= args.tis_clip_low) & (ice_ratio <= args.tis_clip), ice_ratio, torch.zeros_like(ice_ratio)
     )
     ice_clipfrac = (ice_weight != ice_ratio).float()
+    mismatch_k3_kl = ice_ratio - log_ratio - 1
+    mismatch_kl = -log_ratio
     metrics = {
         "tis": ice_ratio.clone().detach(),
         "tis_clipfrac": ice_clipfrac.clone().detach(),
         "tis_abs": ice_abs.clone().detach(),
+        "mismatch_kl": mismatch_kl.clone().detach(),
+        "mismatch_k3_kl": mismatch_k3_kl.clone().detach(),
     }
     pg_loss = pg_loss * ice_weight
     return pg_loss, loss_masks, metrics

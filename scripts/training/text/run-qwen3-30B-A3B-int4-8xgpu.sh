@@ -45,8 +45,8 @@ CKPT_ARGS=(
    # Megatron BF16 checkpoint
    --ref-load ${EXP_DIR}/Qwen3-30B-A3B
    --megatron-to-hf-mode bridge
-   --load ${EXP_DIR}/Qwen3-30B-A3B
-   --save ${EXP_DIR}/Qwen3-30B-A3B
+   --load ${EXP_DIR}/Qwen3-30B-A3B_dist
+   --save ${EXP_DIR}/Qwen3-30B-A3B_dist
    --save-interval 100
 )
 

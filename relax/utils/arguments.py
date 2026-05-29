@@ -1559,9 +1559,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             collection."""
             parser.add_argument(
                 "--use-metrics-service",
-                action="store_true",
-                default=False,
-                help="Enable metrics service for centralized metrics collection and reporting",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Enable metrics service for centralized metrics collection and reporting. "
+                    "Default: True. Use --no-use-metrics-service to disable."
+                ),
             )
             parser.add_argument(
                 "--timeline-dump-dir",

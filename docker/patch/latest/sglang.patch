@@ -97,7 +97,7 @@ index bc21f8882..87329e5a0 100644
                  dp_size=self.dp_size,
                  pp_size=self.pp_size,
 diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
-index 958cff1cd..845d32120 100644
+index 958cff1cd..102545ba8 100644
 --- a/python/sglang/srt/disaggregation/decode.py
 +++ b/python/sglang/srt/disaggregation/decode.py
 @@ -19,7 +19,8 @@ Life cycle of a request in the decode server
@@ -110,6 +110,15 @@ index 958cff1cd..845d32120 100644
  import logging
  from collections import deque
  from dataclasses import dataclass
+@@ -190,7 +191,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
+             mamba_size if mamba_size is not None else size
+         ) + pre_alloc_size
+         self._init_mamba_pool(
+-            size=effective_mamba_size,
++            mamba_size=effective_mamba_size,
+             mamba_spec_state_size=size + pre_alloc_size,
+             cache_params=cache_params,
+             device=device,
 @@ -342,6 +343,16 @@ class DecodePreallocQueue:
              self.is_mla_backend,
          )
@@ -2203,10 +2212,56 @@ index e614b7743..1de8b7dfb 100644
                      self._inc_hit_count(new_node, chunked)
                      total_prefix_length += prefix_len
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 16b1410c3..ca897fe10 100644
+index 16b1410c3..3604f963d 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
-@@ -1804,9 +1804,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
+@@ -470,7 +470,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
+         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
+         self.enable_memory_saver = enable_memory_saver
+         self._init_mamba_pool(
+-            size=mamba_size,
++            mamba_size=mamba_size,
+             mamba_spec_state_size=mamba_spec_state_size,
+             cache_params=cache_params,
+             device=device,
+@@ -480,7 +480,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
+ 
+     def _init_mamba_pool(
+         self,
+-        size: int,
++        mamba_size: int,
+         mamba_spec_state_size: int,
+         cache_params: BaseLinearStateParams,
+         device: str,
+@@ -488,7 +488,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
+         speculative_num_draft_tokens: int = None,
+     ):
+         self.mamba_pool = MambaPool(
+-            size=size,
++            size=mamba_size,
+             spec_state_size=mamba_spec_state_size,
+             cache_params=cache_params,
+             device=device,
+@@ -498,13 +498,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
+         self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
+ 
+         self.device = device
++        # Indexed by req_pool_idx, so size from the req pool buffer
++        # (self.req_to_token.shape[0]), not from the mamba state pool size.
++        req_pool_size = self.req_to_token.shape[0]
+         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
+-            size, dtype=torch.int32, device=self.device
++            req_pool_size, dtype=torch.int32, device=self.device
+         )
+         if enable_mamba_extra_buffer:
+             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
+                 torch.zeros(
+-                    (size, self.mamba_ping_pong_track_buffer_size),
++                    (req_pool_size, self.mamba_ping_pong_track_buffer_size),
+                     dtype=torch.int32,
+                     device=self.device,
+                 )
+@@ -1804,9 +1807,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
          else:
              assert self.page_size == 64
          with (
@@ -2222,7 +2277,7 @@ index 16b1410c3..ca897fe10 100644
          ):
              self.index_k_with_scale_buffer = [
                  torch.zeros(
-@@ -1828,6 +1831,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
+@@ -1828,6 +1834,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
                  )
                  for _ in range(layer_num)
              ]
@@ -2234,7 +2289,7 @@ index 16b1410c3..ca897fe10 100644
          self._finalize_allocation_log(size)
  
      def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-@@ -1902,6 +1910,50 @@ class NSATokenToKVPool(MLATokenToKVPool):
+@@ -1902,6 +1913,50 @@ class NSATokenToKVPool(MLATokenToKVPool):
              self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
          ]
          return data_ptrs, data_lens, item_lens
@@ -2991,6 +3046,27 @@ index 38a4767b0..644d7ed6c 100644
              hidden_states, residual = layer(
                  positions,
                  hidden_states,
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+index 4cc4cfb50..2a641bb00 100644
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -332,6 +332,7 @@ class BaseMultimodalProcessor(ABC):
+             else:
+                 kwargs["audios"] = audios
+ 
++        gpu_id = self.server_args.base_gpu_id
+         processor = self._processor
+         if (
+             hasattr(processor, "image_processor")
+@@ -343,7 +344,7 @@ class BaseMultimodalProcessor(ABC):
+             elif _is_xpu:
+                 kwargs["device"] = "xpu"
+             elif not _is_npu:
+-                kwargs["device"] = "cuda"
++                kwargs["device"] = f"cuda:{gpu_id}" if gpu_id is not None else "cuda:0"
+             elif processor.__class__.__name__ not in {
+                 "Qwen2_5_VLProcessor",
+                 "Qwen3VLProcessor",
 diff --git a/python/sglang/srt/multimodal/processors/glm4v.py b/python/sglang/srt/multimodal/processors/glm4v.py
 index 33cce6fe2..0970c4550 100644
 --- a/python/sglang/srt/multimodal/processors/glm4v.py
@@ -3396,23 +3472,3 @@ index 3be16446e..a0ef921da 100644
          assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
          assert (
              expect_should_compare == actual_should_compare
-diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
---- a/python/sglang/srt/multimodal/processors/base_processor.py
-+++ b/python/sglang/srt/multimodal/processors/base_processor.py
-@@ -332,6 +332,7 @@
-             else:
-                 kwargs["audios"] = audios
-
-+        gpu_id = self.server_args.base_gpu_id
-         processor = self._processor
-         if (
-             hasattr(processor, "image_processor")
-@@ -343,7 +344,7 @@
-             elif _is_xpu:
-                 kwargs["device"] = "xpu"
-             elif not _is_npu:
--                kwargs["device"] = "cuda"
-+                kwargs["device"] = f"cuda:{gpu_id}" if gpu_id is not None else "cuda:0"
-             elif processor.__class__.__name__ not in {
-                 "Qwen2_5_VLProcessor",
-                 "Qwen3VLProcessor",
