@@ -1131,7 +1131,7 @@ class MegatronTrainRayActor(TrainRayActor):
         ):
             print_memory("before update_weights")
             self.weight_updater.update_weights()
-            print_memory("after update_weights")
+            print_memory("after update_weights", clear_before_print=True)
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
@@ -1301,7 +1301,7 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("before update_weights")
         run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
         run(self.checkpoint_engine_client.recv_weight_fully_async())
-        print_memory("after update_weights")
+        print_memory("after update_weights", clear_before_print=True)
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune

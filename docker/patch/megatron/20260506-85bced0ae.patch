@@ -805,8 +805,198 @@ index 8df4df1e5..fa86be44d 100644
 +                qkv, gate, beta, alpha, batch, seq_len
 +            )
          nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
- 
+
          # Calculate g and beta
+@@ -800,7 +801,7 @@ def get_parameter_local_cp(
+     slices = [slice(None)] * param.dim()
+     dim_size = param.size(dim=dim)
+     slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
+-    param = param[slices]
++    param = param[tuple(slices)]
+     return param
+
+
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index c87ccd5ff..fd2d9d8f7 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -1,6 +1,6 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
+ from collections import defaultdict
+-from typing import Dict
++from typing import Dict, Tuple
+ 
+ import torch
+ 
+@@ -249,14 +249,82 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         return cpu_optimizers
+ 
+     def _get_sub_optimizer_param_groups(self, offload_fraction: float):
+-        params = []
++        # Batched/chunked implementation: the original per-parameter
++        # `.cpu().pin_memory()` + `.clone().float()` is O(num_params) Python
++        # calls and pins one buffer at a time. For MoE models that means tens
++        # of thousands of tiny pinned allocations and individual H2D copies,
++        # which dominates init time. Instead, we group params by their final
++        # (dtype, device), allocate one contiguous pinned/cuda buffer per
++        # bucket, and do a single batched D2H copy + dtype cast per bucket.
++        # The per-param "effective" tensor is a view into that buffer, which
++        # preserves storage-pinned semantics and remains a unique hashable
++        # Tensor object usable as a dict key, matching the original API.
++
++        # Phase 1: decide which params to offload using the original greedy
++        # iteration order so behavior matches exactly.
++        gpu_params_total_numel = 0
++        all_params = []
+         for group in self.param_groups:
+-            params.extend(group["params"])
+-        params_total_numel = sum([param.numel() for param in params])
+-        gpu_params_total_numel = sum([param.numel() for param in params if param.is_cuda])
+-        cpu_params_total_numel = params_total_numel - gpu_params_total_numel
++            for param in group["params"]:
++                all_params.append(param)
++                if param.is_cuda:
++                    gpu_params_total_numel += param.numel()
+         offload_threshold = gpu_params_total_numel * offload_fraction
++
++        offload_ids = set()
+         offload_params_numel = 0
++        for param in all_params:
++            if offload_params_numel < offload_threshold and param.is_cuda:
++                offload_ids.add(id(param))
++                offload_params_numel += param.numel()
++
++        fp32 = self.param_update_in_fp32
++
++        def _target_of(param):
++            """Return (target_dtype, target_device_key, needs_copy) per orig param.
++
++            target_device_key:
++              - "cpu_pinned" → offloaded copy on pinned host memory
++              - cuda device  → GPU-resident fp32 master copy
++              - None         → reuse orig param (no copy needed)
++            """
++            is_off = id(param) in offload_ids
++            cast_needed = fp32 and param.dtype != torch.float32
++            if is_off and cast_needed:
++                return torch.float32, "cpu_pinned", True
++            if is_off:
++                return param.dtype, "cpu_pinned", True
++            if cast_needed:
++                return torch.float32, param.device, True
++            return param.dtype, None, False
++
++        # Phase 2: bucket by (target_dtype, target_device) and batch-allocate.
++        buckets: Dict[Tuple[torch.dtype, object], list] = defaultdict(list)
++        targets: Dict[int, Tuple[torch.dtype, object, bool]] = {}
++        for param in all_params:
++            td, tdev, needs = _target_of(param)
++            targets[id(param)] = (td, tdev, needs)
++            if needs:
++                buckets[(td, tdev)].append(param)
++
++        effective_of: Dict[int, torch.Tensor] = {}
++        for (td, tdev), bucket_params in buckets.items():
++            total = sum(p.numel() for p in bucket_params)
++            if tdev == "cpu_pinned":
++                buf = torch.empty(total, dtype=td, pin_memory=True, device="cpu")
++            else:
++                buf = torch.empty(total, dtype=td, device=tdev)
++            offset = 0
++            for p in bucket_params:
++                n = p.numel()
++                view = buf.narrow(0, offset, n).view(p.shape)
++                # Single copy_ does D2H (if needed) AND dtype cast in one shot.
++                view.copy_(p.detach())
++                effective_of[id(p)] = view
++                offset += n
++
++        # Phase 3: assemble per-group outputs and bookkeeping dicts, preserving
++        # the original parameter order within each group.
+         cpu_param_groups = []
+         gpu_param_groups = []
+         gpu_params_map_cpu_copy = {}
+@@ -267,25 +335,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+             cpu_group = group.copy()
+             gpu_group["params"] = []
+             cpu_group["params"] = []
+-            for param in group["params"]:
+-                orig_param = param
+-                cpu_copy = False
+-                if offload_params_numel < offload_threshold and param.is_cuda:
+-                    param = param.detach().clone().cpu().pin_memory()
+-                    offload_params_numel += param.numel()
+-                    cpu_copy = True
+-                if self.param_update_in_fp32 and param.dtype != torch.float32:
+-                    param = param.detach().clone().float()
+-                    param_to_fp32_param[orig_param] = param
+-
+-                if cpu_copy:
+-                    gpu_params_map_cpu_copy[orig_param] = param
+-                    cpu_copys_map_gpu_param[param] = orig_param
+-
+-                if param.is_cuda:
+-                    gpu_group["params"].append(param)
++            for orig_param in group["params"]:
++                td, tdev, needs = targets[id(orig_param)]
++                effective = effective_of.get(id(orig_param), orig_param)
++
++                # Match original semantics: when both offloaded and cast,
++                # gpu_params_map_cpu_copy / cpu_copys_map_gpu_param point at
++                # the (single) fp32 CPU copy, not at an intermediate bf16 copy.
++                is_off = id(orig_param) in offload_ids
++                if is_off:
++                    gpu_params_map_cpu_copy[orig_param] = effective
++                    cpu_copys_map_gpu_param[effective] = orig_param
++                if fp32 and orig_param.dtype != torch.float32:
++                    param_to_fp32_param[orig_param] = effective
++
++                if effective.is_cuda:
++                    gpu_group["params"].append(effective)
+                 else:
+-                    cpu_group["params"].append(param)
++                    cpu_group["params"].append(effective)
+             if len(gpu_group["params"]) != 0:
+                 gpu_param_groups.append(gpu_group)
+             if len(cpu_group["params"]) != 0:
+@@ -377,8 +444,35 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         """
+         Update the fp32 parameters by the new parameters.
+         """
+-        for param, fp32_param in self.param_to_fp32_param.items():
+-            fp32_param.data.copy_(param)
++        # Batched: collapse N independent (fp32_param.data <- param) copies
++        # into `torch._foreach_copy_` dispatches. Replaces an O(num_params)
++        # Python loop (each issuing its own ATen kernel) with one fused
++        # multi-tensor op per (src_device, dst_device) bucket. Critical for
++        # MoE models with tens of thousands of expert weights, which would
++        # otherwise serialize tens of thousands of single-tensor copies.
++        if not self.param_to_fp32_param:
++            return
++        # Bucket by (src_device, dst_device); _foreach_copy_ requires the
++        # tensors in a single call to share a device.
++        buckets: Dict[Tuple[torch.device, torch.device], Tuple[list, list]] = defaultdict(
++            lambda: ([], [])
++        )
++        for src_param, fp32_param in self.param_to_fp32_param.items():
++            key = (src_param.device, fp32_param.device)
++            buckets[key][0].append(src_param)
++            buckets[key][1].append(fp32_param.data)
++        for (src_dev, dst_dev), (srcs, dsts) in buckets.items():
++            if src_dev == dst_dev:
++                torch._foreach_copy_(dsts, srcs)
++            else:
++                # Cross-device (e.g. GPU bf16 -> CPU pinned fp32). _foreach_copy_
++                # may not handle this everywhere, so issue a non-blocking copy
++                # per tensor and let the H2D/D2H engine batch internally; then
++                # synchronize once at the end to preserve completion semantics.
++                for dst, src in zip(dsts, srcs):
++                    dst.copy_(src, non_blocking=True)
++                if src_dev.type == "cuda":
++                    torch.cuda.synchronize(src_dev)
+ 
+     def _register_load_state_dict_hooks(self):
+         def pre_load_state_dict_hook(self, state_dict):
 --- a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
 +++ b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
 @@ -16,6 +16,8 @@

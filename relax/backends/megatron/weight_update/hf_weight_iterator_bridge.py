@@ -9,9 +9,13 @@ import torch.distributed as dist
 from megatron.core import mpu
 
 from relax.utils import device as device_utils
+from relax.utils import megatron_bridge_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import ParamInfo
 
+from ..misc_utils import strip_param_name_prefix
+from ..weight_conversion import postprocess_hf_param
+from ..weight_conversion.processors import quantize_params
 from .bridge_converter import BridgeConverter
 from .common import all_gather_param, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -29,19 +33,89 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._bridge_converter = BridgeConverter(
             args=self.args, model=self.model, quantization_config=self.quantization_config
         )
-        buckets_result = _build_param_info_buckets(self.args, self.model)
-        self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map = buckets_result
         self._quantize_experts_before_broadcast = (
             self.quantization_config is not None
             and self.quantization_config.get("quant_method") == "compressed-tensors"
             and mpu.get_expert_tensor_parallel_world_size() == 1
         )
+        # The bucketed PP/EP/TP broadcast path (``_iter_hf_params``) is only
+        # required for the INT4 quantize-before-broadcast optimization.  The
+        # BF16 path hung in colocate runs (Qwen3.6-35B-A3B with PP=4 EP=2);
+        # for that case we keep the upstream ``megatron-bridge`` path which is
+        # the proven implementation used before commit ec24de0a.
+        if self._quantize_experts_before_broadcast:
+            buckets_result = _build_param_info_buckets(self.args, self.model)
+            self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map = buckets_result
+            self._bridge = None
+        else:
+            from megatron.bridge import AutoBridge
+
+            self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+            self._expert_buckets = self._non_expert_buckets = self._vanilla_key_map = None
 
     def get_hf_weight_chunks(self, megatron_local_weights):
+        if self._quantize_experts_before_broadcast:
+            iterator = self._iter_hf_params(megatron_local_weights)
+        else:
+            iterator = self._iter_hf_params_via_upstream_bridge(megatron_local_weights)
         yield from _chunk_with_mla_pairing(
-            self._iter_hf_params(megatron_local_weights),
+            iterator,
             chunk_size=self.args.update_weight_buffer_size,
         )
+
+    def _iter_hf_params_via_upstream_bridge(self, megatron_local_weights):
+        """BF16 path: delegate PP broadcast / TP gather to ``megatron-bridge``.
+
+        Yields one ``(hf_name, tensor)`` at a time; the caller bundles them
+        into chunks via ``_chunk_with_mla_pairing``.
+        """
+        renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
+        with megatron_bridge_utils.patch_megatron_model(self.model):
+            conversion_tasks = self._bridge.get_conversion_tasks(self.model)
+            conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)
+
+            named_weights = self._bridge.export_hf_weights(self.model, cpu=False, conversion_tasks=conversion_tasks)
+
+            hf_to_megatron_mapping = None
+            for item in named_weights:
+                # Compatibility shim: old megatron-bridge yields 3-tuples
+                # ``(hf_param_name, weight, megatron_param_name)`` while the
+                # official bridge yields 2-tuples ``(hf_param_name, weight)``.
+                if len(item) == 3:
+                    hf_param_name, weight, megatron_param_name = item
+                elif len(item) == 2:
+                    hf_param_name, weight = item
+                    if hf_to_megatron_mapping is None:
+                        hf_to_megatron_mapping = _build_hf_to_megatron_mapping(conversion_tasks)
+                    # With PP > 1 ``export_hf_weights`` yields params from ALL
+                    # PP ranks but the mapping only covers this rank's tasks.
+                    # Fall back to ``hf_param_name`` for remote PP rank params
+                    # — safe because downstream regexes don't match HF names.
+                    megatron_param_name = hf_to_megatron_mapping.get(hf_param_name, hf_param_name)
+                else:
+                    raise ValueError(
+                        f"Unexpected named_weights tuple length {len(item)} from "
+                        f"megatron-bridge.export_hf_weights(); expected 2 (new) or 3 (old). "
+                        f"Item: {item!r}"
+                    )
+
+                processed_weight = postprocess_hf_param(
+                    args=self.args,
+                    megatron_param_name=megatron_param_name,
+                    hf_param_name=hf_param_name,
+                    param=weight,
+                )
+
+                converted_named_params = [(hf_param_name, processed_weight)]
+
+                quantized_batch = quantize_params(
+                    args=self.args,
+                    megatron_name=megatron_param_name,
+                    converted_named_params=converted_named_params,
+                    quantization_config=self.quantization_config,
+                )
+
+                yield from quantized_batch
 
     def _iter_hf_params(self, megatron_local_weights):
         """Load params from CPU backuper dict, broadcast across PP/EP, TP-
@@ -597,3 +671,70 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
 
     if bucket:
         yield bucket
+
+
+def _build_hf_to_megatron_mapping(conversion_tasks):
+    """Reconstruct ``hf_name -> megatron_name`` from a list of conversion
+    tasks.
+
+    Needed because the official ``megatron-bridge.export_hf_weights`` yields
+    2-tuples ``(hf_name, weight)`` and drops the megatron name.  We rebuild it
+    from ``task.mapping.hf_param`` — pure metadata, no collective ops.
+    """
+    hf_to_megatron_mapping = {}
+
+    for task in conversion_tasks:
+        megatron_param_name = task.param_name
+        hf_param = task.mapping.hf_param
+
+        if isinstance(hf_param, str):
+            hf_to_megatron_mapping[hf_param] = megatron_param_name
+        elif isinstance(hf_param, dict):
+            for hf_name in hf_param.values():
+                hf_to_megatron_mapping[hf_name] = megatron_param_name
+        else:
+            raise TypeError(
+                f"Unexpected mapping.hf_param type {type(hf_param).__name__} "
+                f"for megatron param '{megatron_param_name}': {hf_param!r}"
+            )
+
+    return hf_to_megatron_mapping
+
+
+def _process_conversion_tasks(vanilla_conversion_tasks, new_weight_dict):
+    """Splice the freshly-trained weights into each conversion task.
+
+    ``build_conversion_tasks`` may return ``None`` entries for global params
+    with no mapping; filter them so downstream consumers never see ``None``.
+    """
+
+    def _handle_one(task):
+        if task is None:
+            return None
+        if task.param_weight is None:
+            return task
+
+        weight_dict_key = f"vp_stages.{task.vp_stage}.{task.param_name}"
+        assert weight_dict_key in new_weight_dict, (
+            f"{weight_dict_key=} not in new_weight_dict ({task.vp_stage=}, {task.param_name=}, {list(new_weight_dict)=})"
+        )
+
+        new_param_weight = new_weight_dict[weight_dict_key]
+        new_param_weight = new_param_weight.cuda()
+        return dataclasses.replace(task, param_weight=new_param_weight)
+
+    valid_tasks = [t for t in vanilla_conversion_tasks if t is not None]
+    return _MapWithLen(_handle_one, valid_tasks)
+
+
+class _MapWithLen:
+    def __init__(self, fn, xs):
+        self.fn = fn
+        self.xs = xs
+
+    def __len__(self):
+        return len(self.xs)
+
+    def __iter__(self):
+        for x in self.xs:
+            yield self.fn(x)

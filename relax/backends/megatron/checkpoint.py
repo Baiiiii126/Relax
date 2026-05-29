@@ -345,7 +345,16 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
 
-    source_path = load_path or args.hf_checkpoint
+    # Prefer ref_load (if it's an HF dir) over hf_checkpoint on fallback. INT4 QAT
+    # runs set --hf-checkpoint to a compressed-tensors packed dir that the bridge
+    # cannot read; --ref-load points at the BF16 HF dir that it can. Mirrors the
+    # `args.load = args.ref_load or args.hf_checkpoint` remap in arguments.py.
+    if load_path is not None:
+        source_path = load_path
+    elif args.ref_load and _is_hf_checkpoint(args.ref_load):
+        source_path = args.ref_load
+    else:
+        source_path = args.hf_checkpoint
     logger.info(
         f"Load checkpoint from HuggingFace model into Megatron (requested_path={load_path}, source_path={source_path})"
     )
