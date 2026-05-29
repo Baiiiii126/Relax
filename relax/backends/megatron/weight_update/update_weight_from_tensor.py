@@ -87,12 +87,22 @@ class UpdateWeightFromTensor:
                 offset += c
 
         # Compute colocated engine count: engines whose GPUs fall within actor GPU range.
-        total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
-        colocate_engine_nums = 0
-        for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
-            if gpu_offset + gpu_count > total_actor_gpus:
-                break
-            colocate_engine_nums += 1
+        # Hybrid mode gives actor and rollout separate placement groups (see
+        # controller.py: actor_rollout_pgs is None when hybrid), so rollout
+        # engine_gpu_offsets are local to rollout's pg and start at 0. The
+        # numeric `gpu_offset < total_actor_gpus` check below would then
+        # mis-classify cross-node engines as colocated and route weights via
+        # CUDA IPC handles, which are not valid across nodes
+        # (cudaErrorMapBufferObjectFailed in _rebuild_cuda_tensor).
+        if self.args.hybrid:
+            colocate_engine_nums = 0
+        else:
+            total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
+            colocate_engine_nums = 0
+            for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
+                if gpu_offset + gpu_count > total_actor_gpus:
+                    break
+                colocate_engine_nums += 1
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
 
