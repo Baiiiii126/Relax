@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from relax.utils.types import ParamInfo
@@ -38,6 +39,8 @@ for _mod in _MEGATRON_MODULES:
     if _mod in sys.modules:
         _saved[_mod] = sys.modules[_mod]
     sys.modules[_mod] = MagicMock()
+
+pytest.importorskip("triton")
 
 from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (  # noqa: E402
     _broadcast_quantized_bucket,
