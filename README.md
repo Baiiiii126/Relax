@@ -253,6 +253,14 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## 🧩 Projects Built upon Relax
+
+| Project                                                  | Description                                                                                                                                                             |
+| :------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [HyperEyes](https://github.com/DeepExperience/HyperEyes) | A parallel multimodal search agent that uses Relax for efficient RL training, combining visual grounding and retrieval to search across multiple entities concurrently. |
+
+______________________________________________________________________
+
 ## 🤝 Contributing
 
 We welcome contributions of all kinds! Please read our [Contributing Guide](docs/en/guide/how-to-contribute.md) to get started.
