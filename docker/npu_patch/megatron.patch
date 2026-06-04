@@ -1,0 +1,13 @@
+diff --git a/megatron/core/dist_checkpointing/strategies/common.py b/megatron/core/dist_checkpointing/strategies/common.py
+index 41c21d93d..ef80f72d6 100644
+--- a/megatron/core/dist_checkpointing/strategies/common.py
++++ b/megatron/core/dist_checkpointing/strategies/common.py
+@@ -86,7 +86,7 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
+                 msc = MultiStorageClientFeature.import_package()
+                 return msc.torch.load(load_path, map_location='cpu')
+             else:
+-                return torch.load(load_path, map_location='cpu')
++                return torch.load(load_path, map_location='cpu', weights_only=False)
+         except FileNotFoundError as e:
+             err_msg = f'Common file {load_path} does not exist'
+             if MultiStorageClientFeature.is_enabled():

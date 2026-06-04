@@ -6,6 +6,7 @@ import socket
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+from relax.utils.device import ray_get_device_ids
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
 
@@ -42,10 +43,10 @@ def _get_head_node_id():
     return ray.get_runtime_context().get_node_id()
 
 
-@ray.remote(num_gpus=0.1)
+@ray.remote
 class InfoActor:
     def get_ip_and_gpu_id(self):
-        return ray.util.get_node_ip_address(), ray.get_gpu_ids()[0]
+        return ray.util.get_node_ip_address(), ray_get_device_ids()[0]
 
 
 def sort_key(x):
@@ -66,7 +67,7 @@ def sort_key(x):
             # representation that allows for sorting.
             node_ip_parts = [ord(c) for c in node_identifier]
 
-    return (node_ip_parts, gpu_id)
+    return (node_ip_parts, int(gpu_id))
 
 
 def allocate_train_group(args, num_gpus, pg, runtime_env=None):

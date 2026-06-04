@@ -16,6 +16,14 @@ import torch
 import torch.distributed as dist
 import transfer_queue as tq
 from megatron.core import mpu
+
+
+try:
+    # NPU patch
+    from mindspeed.megatron_adaptor import repatch
+except ImportError:
+    repatch = None
+
 from tensordict import TensorDict
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
@@ -104,6 +112,8 @@ class MegatronTrainRayActor(TrainRayActor):
         self.genrm_manager = None
 
         init(args)
+        if repatch is not None:
+            repatch(args)
         tq.init(args.tq_config)
         self.data_system_client = tq.get_client()
         if is_megatron_main_rank():
@@ -1278,7 +1288,7 @@ class MegatronTrainRayActor(TrainRayActor):
         flags = torch.tensor(
             [int(rollout_only), int(actor_fwd_only)],
             dtype=torch.int32,
-            device=device_utils.make_current_torch_device(),
+            device="cpu",
         )
         dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=get_gloo_group())
         rollout_only = bool(flags[0].item())

@@ -1,0 +1,67 @@
+#
+FROM quay.io/ascend/vllm-ascend:v0.18.0-a3
+
+COPY . /root/Relax
+WORKDIR /root
+ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+    build-essential patchelf tmux net-tools htop nano iputils-ping \
+    autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
+    libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox\
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync
+
+RUN apt-get install -y locales tzdata && \
+    locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip config set global.index-url ${PIP_INDEX_URL} && \
+    git config --global http.sslverify false && \
+    git config --global http.postBuffer 2147483648 && \
+    git clone https://gitcode.com/Ascend/MindSpeed.git /root/MindSpeed && \
+    git clone https://github.com/NVIDIA/Megatron-LM.git /root/Megatron-LM && \
+    git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /root/Megatron-Bridge && \
+    cd /root/MindSpeed && git checkout 07056df5 && pip install -r requirements.txt && pip install -e . && \
+    cd /root/Megatron-LM && git checkout 1d462bd37dac21 && pip install -e . && \
+    cd /root/Megatron-Bridge && git checkout 7cabf71 && \
+    git clone -b v0.5.9 https://github.com/sgl-project/sglang.git /root/sglang && \
+    cd /root/sglang/python && \
+    rm -rf pyproject.toml && \
+    mv pyproject_npu.toml pyproject.toml && \
+    pip install -v -e .[all_npu] && \
+    git clone https://github.com/sgl-project/sgl-kernel-npu.git /root/sgl-kernel-npu && \
+    cd /root/sgl-kernel-npu && \
+    git checkout 2026.04.15.rc4 && \
+    bash build.sh && \
+    pip install output/*.whl && \
+    cd /root/Relax && pip install -r requirements.txt && pip install -e .
+
+RUN pip install --no-cache-dir tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip install nvidia-modelopt && \
+    pip install setuptools==79.0.1 && \
+    pip install transformers==4.57.3 && \
+    cd /usr/local/python3.11.14/lib/python3.11/site-packages/ && \
+    ln -s deep_ep/deep_ep_cpp.cpython-311-aarch64-linux-gnu.so .
+
+RUN cd /root/MindSpeed && \
+    patch -p1 < /root/Relax/docker/npu_patch/mindspeed.patch && \
+    cd /root/Megatron-Bridge && \
+    patch -p1 < /root/Relax/docker/npu_patch/megatron-bridge.patch && \
+    cd /root/Megatron-LM && \
+    patch -p1 < /root/Relax/docker/npu_patch/megatron.patch
+ENV TOKENIZERS_PARALLELISM=true \
+    NCCL_DEBUG='WARN' \
+    PYTHONBUFFERED=16 \
+    CLEARML_SUPPRESS_UPDATE_MESSAGE=1 \
+    RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+
+CMD ["/bin/bash"]

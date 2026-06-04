@@ -20,6 +20,7 @@ class BackendType(str, Enum):
     GLOO = "gloo"
     NCCL = "nccl"
     TCP = "tcp"
+    HCCL = "hccl"
 
 
 class RoleInfo(BaseModel):

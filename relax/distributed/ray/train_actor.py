@@ -12,6 +12,7 @@ import torch.distributed as dist
 import relax.utils.training.eval_config
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
+from relax.utils.device import ray_get_device_ids
 from relax.utils.distributed_utils import init_gloo_group
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
@@ -22,10 +23,11 @@ logger = get_logger(__name__)
 
 def get_local_gpu_id():
     cvd = os.environ.get(device_utils.get_visible_devices_env_var(), None)
+    device_ids = ray_get_device_ids()
     if cvd is None:
-        return ray.get_gpu_ids()[0]
+        return device_ids[0]
     else:
-        return cvd.split(",").index(str(ray.get_gpu_ids()[0]))
+        return cvd.split(",").index(str(device_ids[0]))
 
 
 class TrainRayActor(RayActor):
@@ -66,7 +68,7 @@ class TrainRayActor(RayActor):
             backend=backend,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),
         )
-        init_gloo_group()
+        init_gloo_group(distributed_timeout_minutes=args.distributed_timeout_minutes)
 
         args.rank = dist.get_rank()
         args.world_size = dist.get_world_size()

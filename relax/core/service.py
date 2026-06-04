@@ -14,7 +14,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from relax.distributed.ray.placement_group import InfoActor, sort_key
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
-from relax.utils.utils import get_serve_url, recovery_load_path
+from relax.utils.utils import get_ray_accelerator_kwargs, get_serve_url, recovery_load_path
 
 
 logger = get_logger(__name__)
@@ -303,13 +303,15 @@ def create_placement_group(num_gpus):
     ray.get(pg.ready())
     # use info actor to get the GPU id
     info_actors = []
+    accelerator_kwargs = get_ray_accelerator_kwargs(1)
     for i in range(num_bundles):
         info_actors.append(
             InfoActor.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=i,
-                )
+                ),
+                **accelerator_kwargs,
             ).remote()
         )
     gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])

@@ -1,0 +1,20 @@
+diff --git a/src/megatron/bridge/models/conversion/utils.py b/src/megatron/bridge/models/conversion/utils.py
+index 5a66e719..3d411c17 100644
+--- a/src/megatron/bridge/models/conversion/utils.py
++++ b/src/megatron/bridge/models/conversion/utils.py
+@@ -203,6 +203,15 @@ def remove_non_pickleables(obj, max_depth: int = 3, current_depth: int = 0):
+ 
+             # Recursively clean attribute
+             cleaned_value = remove_non_pickleables(attr_value, max_depth, current_depth + 1)
++            if hasattr(cleaned_obj, '__setattr__'):
++                try:
++                    setattr(cleaned_obj, attr_name, cleaned_value)
++                except (ValueError, TypeError) as e:
++                    # 跳过 OmegaConf 不支持的类型
++                    if "Unions of containers" in str(e):
++                        print(f"Skipping attribute '{attr_name}' due to Union type")
++                        continue
++                    raise
+ 
+             # Set the cleaned value (or None if it was removed)
+             setattr(cleaned_obj, attr_name, cleaned_value)
