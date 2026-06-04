@@ -1,0 +1,95 @@
+diff --git a/mindspeed/arguments.py b/mindspeed/arguments.py
+index c624fd0a..cef668af 100644
+--- a/mindspeed/arguments.py
++++ b/mindspeed/arguments.py
+@@ -80,22 +80,26 @@ def _add_deepseek_args(parser):
+ 
+ 
+ def _add_profile_args(parser):
+-    group = parser.add_argument_group(title='profile')
+-    group.add_argument("--profile-level", type=str, default='level0',
++    try:
++        group = parser.add_argument_group(title='profile')
++        group.add_argument("--profile-level", type=str, default='level0',
+                        choices=['level0', 'level1', 'level2'],
+                        help="Profile level default level0.")
+-    group.add_argument("--profile-with-cpu", action='store_true', default=False,
++        group.add_argument("--profile-with-cpu", action='store_true', default=False,
+                        help="Profile with cpu info.")
+-    group.add_argument("--profile-with-stack", action='store_true', default=False,
++        group.add_argument("--profile-with-stack", action='store_true', default=False,
+                        help="Profile without stack info.")
+-    group.add_argument("--profile-with-memory", action='store_true', default=False,
++        group.add_argument("--profile-with-memory", action='store_true', default=False,
+                        help="Profile without memory info.")
+-    group.add_argument("--profile-record-shapes", action='store_true', default=False,
++        group.add_argument("--profile-record-shapes", action='store_true', default=False,
+                        help="Profile record shape info.")
+-    group.add_argument("--profile-save-path", type=str, default='./profile_dir',
++        group.add_argument("--profile-save-path", type=str, default='./profile_dir',
+                        help="Profile save path.")
+-    group.add_argument('--profile-ranks', nargs='+', type=int, default=[-1],
++        group.add_argument('--profile-ranks', nargs='+', type=int, default=[-1],
+                        help='Global ranks to profile.The default value of -1 means to profile all ranks')
++    except argparse.ArgumentError:
++        pass
++ 
+     return parser
+ 
+ 
+diff --git a/mindspeed/features_manager/functional/profile.py b/mindspeed/features_manager/functional/profile.py
+index 6450b41c..86584015 100644
+--- a/mindspeed/features_manager/functional/profile.py
++++ b/mindspeed/features_manager/functional/profile.py
+@@ -2,7 +2,7 @@
+ from argparse import ArgumentParser
+ 
+ from mindspeed.features_manager.feature import MindSpeedFeature
+-
++import argparse
+ 
+ class ProfileFeature(MindSpeedFeature):
+ 
+@@ -10,20 +10,23 @@ class ProfileFeature(MindSpeedFeature):
+         super().__init__('profile', optimization_level=2)
+ 
+     def register_args(self, parser: ArgumentParser):
+-        group = parser.add_argument_group(title=self.feature_name)
+-        group.add_argument("--profile-level", type=str, default='level0',
++        try:
++            group = parser.add_argument_group(title=self.feature_name)
++            group.add_argument("--profile-level", type=str, default='level0',
+                            choices=['level0', 'level1', 'level2'],
+                            help="Profile level default level0.")
+-        group.add_argument("--profile-with-cpu", action='store_true', default=False,
++            group.add_argument("--profile-with-cpu", action='store_true', default=False,
+                            help="Profile with cpu info.")
+-        group.add_argument("--profile-with-stack", action='store_true', default=False,
++            group.add_argument("--profile-with-stack", action='store_true', default=False,
+                            help="Profile with stack info.")
+-        group.add_argument("--profile-with-memory", action='store_true', default=False,
++            group.add_argument("--profile-with-memory", action='store_true', default=False,
+                            help="Profile with memory info.")
+-        group.add_argument("--profile-record-shapes", action='store_true', default=False,
++            group.add_argument("--profile-record-shapes", action='store_true', default=False,
+                            help="Profile record shape info.")
+-        group.add_argument("--profile-save-path", type=str, default='./profile_dir',
++            group.add_argument("--profile-save-path", type=str, default='./profile_dir',
+                            help="Profile save path.")
++        except argparse.ArgumentError:
++            pass
+ 
+     def register_patches(self, patch_manager, args):
+         from mindspeed.functional.profile.adaptor import train_wrapper, train_step_wrapper
+diff --git a/mindspeed/megatron_adaptor.py b/mindspeed/megatron_adaptor.py
+index f14b231d..881c7fdb 100644
+--- a/mindspeed/megatron_adaptor.py
++++ b/mindspeed/megatron_adaptor.py
+@@ -56,6 +56,7 @@ def delete_lock_file():
+ 
+ def repatch(args):
+     MindSpeedFeaturesManager.remove_patches()
++    args = vars(args)
+     full_args = get_full_args()
+     for k, v in args.items():
+         setattr(full_args, k, v)

@@ -11,6 +11,7 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from relax.utils.device import get_ray_accelerator_name
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
@@ -535,3 +536,13 @@ def compute_dp_size(config) -> int:
             f"Computed dp_size={dp_size} is invalid. actor_total_gpus={actor_total_gpus}, tp={tp}, pp={pp}, cp={cp}"
         )
     return dp_size
+
+
+def get_ray_accelerator_kwargs(num_accelerator: int | float) -> Dict:
+    accelerator_kwargs = {}
+    accelerator_name = get_ray_accelerator_name()
+    if accelerator_name == "GPU":
+        accelerator_kwargs["num_gpus"] = num_accelerator
+    else:
+        accelerator_kwargs["resources"] = {"NPU": num_accelerator}
+    return accelerator_kwargs

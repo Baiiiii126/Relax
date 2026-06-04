@@ -4,6 +4,11 @@ import logging
 
 
 try:
+    import mindspeed.megatron_adaptor  # noqa
+except ImportError:
+    pass
+
+try:
     import relax.models  # noqa
 except BaseException as e:
     print(f"failed to import relax.models, error={e}")

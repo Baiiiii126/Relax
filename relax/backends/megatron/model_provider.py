@@ -23,6 +23,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.utils.device import is_npu_available
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 
@@ -315,6 +316,11 @@ def get_model_provider_func(
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+
+        if is_npu_available:
+            for key, value in vars(args).items():
+                if not hasattr(provider, key):
+                    setattr(provider, key, value)
 
         if args.fp16:
             provider.fp16 = True
