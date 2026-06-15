@@ -2057,15 +2057,20 @@ class RuntimeDomain:
         client = self._ensure_service_client()
         return await client.prepare_group_status(scope_id=self.scope_id)
 
-    def raise_if_prepare_group_completed_before_ready(
+    def prepare_group_completed_before_ready(
         self,
         *,
         group_state: PrepareGroupState,
-        total_sessions: int,
-        ready_sessions: int,
-    ) -> None:
+    ) -> list[dict[str, str]]:
+        """Return the session requests in a still-warming prepare group whose
+        managed session task has already completed without producing a chat IR.
+
+        This is a pure query (no raise on detection). Callers decide whether a
+        completed-before-ready group is a hard error (train) or a droppable
+        sample (eval).
+        """
         if not group_state.request_handles:
-            return
+            return []
         runner_pool = self._session_runner_pool
         if runner_pool is None:
             raise RuntimeError("RuntimeDomain cannot validate prepare-owned managed sessions without a runner pool.")
@@ -2087,14 +2092,25 @@ class RuntimeDomain:
             handle_to_request[managed_handle] = (envelope.session_id, envelope.request_id)
         completed_handles = runner_pool.completed_session_handles(session_handles=list(handle_to_request))
         if not completed_handles:
-            return
-        completed_requests = [
+            return []
+        return [
             {
                 "session_id": handle_to_request[managed_handle][0],
                 "request_id": handle_to_request[managed_handle][1],
             }
             for managed_handle in completed_handles
         ]
+
+    def raise_if_prepare_group_completed_before_ready(
+        self,
+        *,
+        group_state: PrepareGroupState,
+        total_sessions: int,
+        ready_sessions: int,
+    ) -> None:
+        completed_requests = self.prepare_group_completed_before_ready(group_state=group_state)
+        if not completed_requests:
+            return
         raise RuntimeError(
             "Prepare-owned managed agent session completed before producing a chat IR: "
             f"group_id={group_state.group_id}, group_generation={group_state.group_generation}, "

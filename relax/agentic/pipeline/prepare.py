@@ -350,7 +350,7 @@ class PrepareDomain:
 
     # Refresh warming → ready
 
-    async def refresh_ready_groups(self, *, status_fetcher) -> int:
+    async def refresh_ready_groups(self, *, status_fetcher, drop_completed_before_ready: bool = False) -> int:
         self._raise_launch_error_if_any()
         if not self.warming_group_ids:
             return 0
@@ -385,11 +385,30 @@ class PrepareDomain:
                     self.ready_group_ids.append(group_id)
                 ready_count += 1
                 continue
-            runtime_driver.raise_if_prepare_group_completed_before_ready(
-                group_state=group_state,
-                total_sessions=total_sessions,
-                ready_sessions=ready_sessions,
-            )
+            if drop_completed_before_ready:
+                # Eval path: a managed session that finished without producing a
+                # chat IR (e.g. upstream LLM returned null content) must not crash
+                # the whole rollout service. Drop the group and keep going so the
+                # eval loop can converge — at worst eval loses a few samples.
+                completed_requests = runtime_driver.prepare_group_completed_before_ready(group_state=group_state)
+                if completed_requests:
+                    logger.warning(
+                        "Prepare-owned managed agent session completed before producing a chat IR; "
+                        "dropping group (eval): "
+                        f"group_id={group_state.group_id}, group_generation={group_state.group_generation}, "
+                        f"expected_sessions={expected_sessions}, total_sessions={total_sessions}, "
+                        f"ready_sessions={ready_sessions}, completed_requests={completed_requests[:8]}."
+                    )
+                    await runtime_driver.discard_prepare_group(group_state=group_state)
+                    self._forget_prepare_group(group_state)
+                    # Do NOT re-queue: leaving it warming would deadlock the eval loop.
+                    continue
+            else:
+                runtime_driver.raise_if_prepare_group_completed_before_ready(
+                    group_state=group_state,
+                    total_sessions=total_sessions,
+                    ready_sessions=ready_sessions,
+                )
             still_warming.append(group_id)
         # Re-insert still-warming ids at the front (before any newly appended
         # ids from the pump thread) so they are checked first next time.
@@ -445,7 +464,7 @@ class PrepareDomain:
         import ray
 
         # Resident agentic work stays inside the pipeline; data source fetches step input groups.
-        fetch_ref = self.data_source.get_samples.remote(requested_group_count, False)
+        fetch_ref = self.data_source.get_samples.remote(requested_group_count)
         sample_groups = await asyncio.to_thread(ray.get, fetch_ref)
         if not sample_groups:
             raise PrepareSourceExhaustedError("data source returned no sample groups")

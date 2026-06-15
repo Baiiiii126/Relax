@@ -831,6 +831,69 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
+    def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch) -> None:
+        """Run the ref/teacher/actor forward passes for a single hybrid sub-
+        batch in place.
+
+        Shared by the streaming and debug_train_only paths so both compute
+        identical log-probs before advantages are merged.
+        """
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, sub_batch)
+
+        if self.args.use_rollout_routing_replay:
+            self.fill_routing_replay(data_iterator, num_microbatches, sub_batch)
+
+        if self.args.compute_advantages_and_returns:
+            # Ref forward
+            if "ref" in self.weights_backuper.backup_tags:
+                if self.args.use_routing_replay:
+                    os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                self._switch_model("ref")
+                sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_"))
+
+            # Teacher forward for Megatron-based OPD
+            if "teacher" in self.weights_backuper.backup_tags:
+                if self.args.use_routing_replay:
+                    os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                self._switch_model("teacher")
+                sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix="teacher_"))
+
+            # Actor forward
+            self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
+            if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                if self.args.use_routing_replay:
+                    if self.args.use_rollout_routing_replay:
+                        os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                    else:
+                        os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
+                if self.args.use_rollout_routing_replay:
+                    RoutingReplay.clear_all_forward()
+
+    @staticmethod
+    def _split_rollout_batch(rollout_data: RolloutBatch, num_chunks: int) -> List[RolloutBatch]:
+        """Split a merged rollout batch (dict of per-sample lists) into at most
+        ``num_chunks`` roughly equal sub-batches along the sample dimension.
+
+        Keys whose value is not a per-sample list are copied into every chunk
+        unchanged. Used by the debug_train_only path to feed the collected-
+        sub-batch forward loop (one global batch per chunk).
+        """
+        num_samples = len(rollout_data["tokens"])
+        num_chunks = max(1, min(num_chunks, num_samples))
+        chunk_size = (num_samples + num_chunks - 1) // num_chunks
+        chunks: List[RolloutBatch] = []
+        for start in range(0, num_samples, chunk_size):
+            end = min(start + chunk_size, num_samples)
+            chunk: RolloutBatch = {}
+            for key, value in rollout_data.items():
+                if isinstance(value, list) and len(value) == num_samples:
+                    chunk[key] = value[start:end]
+                else:
+                    chunk[key] = value
+            chunks.append(chunk)
+        return chunks
+
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -851,86 +914,72 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
-        batch_index = 0
-        # Surface stuck-loop conditions: when the partition can never reach the
-        # requested batch_size (e.g. rollout dropped samples without refilling),
-        # `get_meta` keeps returning size=0 while `all_consumed` stays False,
-        # producing a silent infinite spin. Warn periodically so the failure mode
-        # is visible in logs instead of presenting as a totally silent hang.
-        loop_start = time.monotonic()
-        last_progress = loop_start
-        last_warn = loop_start
-        while not self.all_consumed("train", rollout_id):
-            data_fields = [
-                "tokens",
-                "total_lengths",
-                "response_lengths",
-                "loss_masks",
-                "rollout_log_probs",
-                "rewards",
-                "raw_reward",
-            ]
-            data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
-            if self.args.multimodal_keys is not None:
-                data_fields.append("multimodal_train_inputs")
-            if self.args.use_opd and self.args.opd_type == "sglang":
-                data_fields.append("teacher_log_probs")
-            with timer("train_get_data"):
-                sub_batch, batch_meta = self._get_data_from_transfer_queue(
-                    "train", rollout_id, data_fields, batch_size, batch_index
-                )
-            if sub_batch is None:
-                now = time.monotonic()
-                stalled = now - last_progress
-                if now - last_warn >= 60.0 and stalled >= 60.0:
-                    logger.warning(
-                        f"train_hybrid({rollout_id}) batch_index={batch_index} stalled for {stalled:.0f}s: "
-                        f"partition train_{rollout_id} has no data of size={batch_size} available but "
-                        f"all_consumed=False. Likely the rollout under-filled this partition."
+        if self.args.debug_train_only:
+            # Bypass the transfer queue and load the offline debug rollout dump
+            # directly (mirrors `train`'s debug_train_only path). The dump holds
+            # the full rollout (rollout_batch_size * n_samples_per_prompt) for
+            # this step, so load the whole per-rank slice and split it into
+            # one-global-batch chunks — matching how the streaming path drains
+            # the entire train partition per rollout step.
+            logger.info(f"start to get rollout_id: {rollout_id} data from debug rollout data for train_hybrid.")
+            total_samples = self.args.rollout_batch_size * self.args.n_samples_per_prompt
+            full_batch_size = total_samples // dp_size
+            num_chunks = total_samples // self.args.global_batch_size
+            debug_data = get_debug_data(self.args, rollout_id, full_batch_size, dp_rank=mpu.get_data_parallel_rank())
+            post_process_rollout_data(self.args, debug_data)
+            for sub_batch in self._split_rollout_batch(debug_data, num_chunks):
+                self._hybrid_forward_subbatch(sub_batch)
+                collected_batches.append(sub_batch)
+        else:
+            batch_index = 0
+            # Surface stuck-loop conditions: when the partition can never reach the
+            # requested batch_size (e.g. rollout dropped samples without refilling),
+            # `get_meta` keeps returning size=0 while `all_consumed` stays False,
+            # producing a silent infinite spin. Warn periodically so the failure mode
+            # is visible in logs instead of presenting as a totally silent hang.
+            loop_start = time.monotonic()
+            last_progress = loop_start
+            last_warn = loop_start
+            while not self.all_consumed("train", rollout_id):
+                data_fields = [
+                    "tokens",
+                    "total_lengths",
+                    "response_lengths",
+                    "loss_masks",
+                    "rollout_log_probs",
+                    "rewards",
+                    "raw_reward",
+                ]
+                data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
+                if self.args.multimodal_keys is not None:
+                    data_fields.append("multimodal_train_inputs")
+                if self.args.use_opd and self.args.opd_type == "sglang":
+                    data_fields.append("teacher_log_probs")
+                with timer("train_get_data"):
+                    sub_batch, batch_meta = self._get_data_from_transfer_queue(
+                        "train", rollout_id, data_fields, batch_size, batch_index
                     )
-                    last_warn = now
-                # Throttle the spin so the controller is not hammered with metadata
-                # polls while we wait for upstream data.
-                time.sleep(0.1)
-                continue
-            last_progress = time.monotonic()
-            last_warn = last_progress
-            batch_index += 1
+                if sub_batch is None:
+                    now = time.monotonic()
+                    stalled = now - last_progress
+                    if now - last_warn >= 60.0 and stalled >= 60.0:
+                        logger.warning(
+                            f"train_hybrid({rollout_id}) batch_index={batch_index} stalled for {stalled:.0f}s: "
+                            f"partition train_{rollout_id} has no data of size={batch_size} available but "
+                            f"all_consumed=False. Likely the rollout under-filled this partition."
+                        )
+                        last_warn = now
+                    # Throttle the spin so the controller is not hammered with metadata
+                    # polls while we wait for upstream data.
+                    time.sleep(0.1)
+                    continue
+                last_progress = time.monotonic()
+                last_warn = last_progress
+                batch_index += 1
 
-            # Forward passes on this sub-batch (small memory footprint)
-            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, sub_batch)
-
-            if self.args.use_rollout_routing_replay:
-                self.fill_routing_replay(data_iterator, num_microbatches, sub_batch)
-
-            if self.args.compute_advantages_and_returns:
-                # Ref forward
-                if "ref" in self.weights_backuper.backup_tags:
-                    if self.args.use_routing_replay:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                    self._switch_model("ref")
-                    sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_"))
-
-                # Teacher forward for Megatron-based OPD
-                if "teacher" in self.weights_backuper.backup_tags:
-                    if self.args.use_routing_replay:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                    self._switch_model("teacher")
-                    sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix="teacher_"))
-
-                # Actor forward
-                self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
-                    if self.args.use_routing_replay:
-                        if self.args.use_rollout_routing_replay:
-                            os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
-                        else:
-                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                    sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
-                    if self.args.use_rollout_routing_replay:
-                        RoutingReplay.clear_all_forward()
-
-            collected_batches.append(sub_batch)
+                # Forward passes on this sub-batch (small memory footprint)
+                self._hybrid_forward_subbatch(sub_batch)
+                collected_batches.append(sub_batch)
 
         if self._active_model_tag != "actor":
             self._switch_model("actor")
@@ -1023,6 +1072,13 @@ class MegatronTrainRayActor(TrainRayActor):
             and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
         ):
             self.save_model(rollout_id, force_sync=is_train_done)
+
+        if self.args.debug_train_only:
+            # In debug_train_only mode no rollout/eval services exist, so skip the
+            # weight-sync + eval coordination below (mirrors `train`'s debug path
+            # which never touches those services). Metrics are still flushed.
+            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+            return
 
         # Mirror train_async's pause/resume coordination so the rollout service
         # has a chance to finish its in-flight step (and refill any partition

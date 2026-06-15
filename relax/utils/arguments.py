@@ -1957,9 +1957,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=64,
                 help=(
-                    "Maximum number of concurrent reward computations. "
-                    "This controls the global asyncio.Semaphore that limits how many "
-                    "reward tasks can run at the same time. Default: 64."
+                    "Maximum number of concurrent reward computations (per sample; "
+                    "group_rm=False scores by sample). This controls the global "
+                    "asyncio.Semaphore that limits how many reward tasks run at once. "
+                    "Reward counts by sample, so over_sampling=N groups x n_samples = N*ns "
+                    "samples per step flow through this gate. Each sample fans out to several "
+                    "LLM judges, so when raising this keep it within the upstream judge "
+                    "endpoint concurrency (see reward_config *.yaml max_concurrency). "
+                    "Default 64; set explicitly on the launch command when over-sampling."
                 ),
             )
             parser.add_argument(
@@ -2817,6 +2822,21 @@ def slime_validate_args(args):
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
         f"rollout_batch_size {args.rollout_batch_size}"
     )
+
+    if (
+        args.over_sampling_batch_size > args.rollout_batch_size
+        and not getattr(args, "fully_async", False)
+        and not getattr(args, "partial_rollout", False)
+    ):
+        # Without fully_async/partial_rollout there is no next-step carry path for the
+        # over-sampled surplus, so the extra completed groups are discarded each step
+        # rather than reused. Surface this so it is not mistaken for free throughput.
+        logger.warning(
+            "over_sampling_batch_size (%s) > rollout_batch_size (%s) without fully_async/partial_rollout; "
+            "surplus over-sampled groups are discarded per-step instead of carried to the next step.",
+            args.over_sampling_batch_size,
+            args.rollout_batch_size,
+        )
 
     if args.num_epoch is None:
         assert args.num_rollout is not None, "Neither --num-rollout nor --num-epoch is set; please set at least one."

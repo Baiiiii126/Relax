@@ -71,7 +71,7 @@ class Controller:
         if self._metrics_service_enabled:
             self._deploy_metrics_service()
 
-        if self.config.use_agentic_rollout:
+        if self.config.use_agentic_rollout and not self.config.debug_train_only:
             deploy_agentic_chat_api_services(
                 config=self.config,
                 runtime_env=self.runtime_env,

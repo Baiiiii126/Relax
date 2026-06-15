@@ -112,7 +112,7 @@ class TransferDomain:
 
     @staticmethod
     def _compute_transfer_batch_group_count(args) -> int:
-        if not args.colocate:
+        if args.fully_async:
             return args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
         return args.rollout_batch_size
 

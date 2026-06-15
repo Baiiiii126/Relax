@@ -3721,7 +3721,7 @@ def _resolve_sglang_config(args) -> SglangConfig:
         assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
         return config
 
-    if args.prefill_num_servers is not None:
+    if getattr(args, "prefill_num_servers", None) is not None:
         return SglangConfig.from_prefill_num_servers(args)
 
     # Default: single regular group.
