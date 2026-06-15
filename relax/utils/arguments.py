@@ -1351,10 +1351,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "sft", "sft_loss", "sft-loss", "custom_loss"],
                 default="policy_loss",
                 help=(
-                    "Choose loss type, currently support ppo policy_loss or sft (or deprecated sft_loss), "
+                    "Choose loss type, currently support ppo policy_loss or sft (or deprecated sft_loss/sft-loss), "
                     "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
                 ),
             )
@@ -2360,7 +2360,7 @@ def slime_validate_args(args):
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
-    is_sft = args.loss_type in ("sft", "sft_loss")
+    is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
     if is_sft:
         # Force-disable RL-only state so SFT users don't have to pass
         # `--disable-compute-advantages-and-returns` and friends.
@@ -2621,9 +2621,9 @@ def slime_validate_args(args):
         )
         args.debug_train_only = True
 
-    if args.loss_type == "sft_loss":
+    if args.loss_type in ("sft_loss", "sft-loss"):
         warnings.warn(
-            "--loss-type sft_loss is deprecated; use --loss-type sft instead. "
+            f"--loss-type {args.loss_type} is deprecated; use --loss-type sft instead. "
             "This alias will be removed in the next minor release.",
             DeprecationWarning,
             stacklevel=2,

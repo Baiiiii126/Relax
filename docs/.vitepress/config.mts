@@ -272,7 +272,8 @@ export default defineConfig({
               text: 'Best Practices',
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
-                { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' }
+                { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
+                { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
               ]
             },
             {
@@ -375,7 +376,8 @@ export default defineConfig({
               text: '最佳实践',
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
-                { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' }
+                { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
+                { text: '外部模型接入', link: '/zh/guide/external-model-integration' }
               ]
             },
             {

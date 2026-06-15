@@ -23,6 +23,15 @@ except Exception as _e:
 
     get_logger(__name__).warning("Failed to import relax.models.glm_moe_dsa: %s", _e)
 
+# Register DotsOCR2 bridge. Importing the module triggers its
+# @MegatronModelBridge.register_bridge decorator.
+try:
+    from relax.models.dots_ocr import megatron as dots_ocr_megatron  # noqa: F401
+except Exception as _e:
+    import logging as _logging
+
+    _logging.getLogger(__name__).warning("Failed to import relax.models.dots_ocr.megatron: %s", _e)
+
 
 __all__ = [
     "Qwen3OmniMoEBridge",
