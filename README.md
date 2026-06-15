@@ -19,8 +19,11 @@
   <a href="https://redai-infra.github.io/Relax">
     <img src="https://img.shields.io/badge/docs-latest-brightgreen.svg" alt="Documentation">
   </a>
-  <a href="https://my.feishu.cn/wiki/ZcTQwrmwbiWRhvkgcMxciefHn7f" target="_blank">
+  <a href="https://github.com/redai-infra/Relax/discussions/48" target="_blank">
     <img src="https://img.shields.io/badge/WeChat-green?logo=wechat" alt="WeChat QR">
+  </a>
+  <a href="https://github.com/redai-infra/Relax/discussions/30" target="_blank">
+    <img src="https://img.shields.io/badge/Docker-Image-blue?logo=docker" alt="Docker Image">
   </a>
 </p>
 
