@@ -221,6 +221,11 @@ class AgenticResidentPipeline:
         self._step_get_samples_wait_started_at: float | None = None
         self._step_get_samples_times: list[float] = []
         self._active_step_handle: _AgenticStepHandle | None = None
+        # How many groups the most recent step left short of its transfer-queue target
+        # (rollout_batch_size - committed_current). The next step backfills exactly this
+        # many groups into its previous partition. 0 before the first step / when a step
+        # fully met its target. Only meaningful under fully_async.
+        self._last_step_current_deficit = 0
 
     def _dataflow_lock(self) -> asyncio.Lock:
         lock = self.resident_dataflow_lock
@@ -606,8 +611,16 @@ class AgenticResidentPipeline:
             )
             self._step_get_samples_wait_started_at = None
             self._step_get_samples_times = []
-            inflight_groups_at_open = self.resident_group_count
-            previous_partition_quota = inflight_groups_at_open if fully_async else 0
+            # Previous-partition backfill debt is exactly how many groups the previous
+            # step left short of its transfer-queue target (rollout_batch_size). With
+            # over-sampling (over_sampling_batch_size > rollout_batch_size) the previous
+            # step may finish completely (deficit 0) yet still hold surplus completed
+            # groups in the transfer ready buffer; those surplus groups are NOT debt —
+            # they re-commit toward this step's current_partition_quota on their own.
+            # Sizing the debt from the recorded current-partition deficit (set at the
+            # previous close_step) keeps the ledger self-consistent and lets over-sampling
+            # actually run. See _last_step_current_deficit.
+            previous_partition_quota = self._last_step_current_deficit if fully_async else 0
             transfer_domain.configure_transfer_quota(
                 previous_partition_quota=previous_partition_quota,
                 current_partition_quota=current_partition_quota,
@@ -813,6 +826,7 @@ class AgenticResidentPipeline:
             "transfer_previous_quota": transfer_snapshot["previous_partition_quota"],
             "finish_eligible_blocked_by": self._close_status(step_handle),
             "transfer_ready_groups": transfer_snapshot["ready_groups"],
+            "previous_step_current_deficit": self._last_step_current_deficit,
         }
 
     async def _wait_step_target(self, step_handle: "_AgenticStepHandle") -> None:
@@ -955,6 +969,12 @@ class AgenticResidentPipeline:
             self.transfer_domain.close_output_window()
             output = await self.transfer_domain.build_output(extra_metrics=None)
             end_snapshot = self.transfer_domain.accounting_snapshot()
+            # Record how many groups this step fell short of its current-partition target
+            # (rollout_batch_size). The next step backfills exactly this many into its
+            # previous partition. required_group_count == current_partition_quota.
+            self._last_step_current_deficit = max(
+                step_handle.required_group_count - end_snapshot["committed_current_groups"], 0
+            )
             committed_groups = self.transfer_domain.committed_transfer_groups_snapshot()
             progress_snapshot = step_handle.progress.snapshot() if step_handle.progress is not None else {}
             get_samples_times = list(self._step_get_samples_times)
@@ -1553,7 +1573,10 @@ async def _run_eval_samples(
                 return 0
             if wait_for_progress:
                 await asyncio.sleep(0.05)
-            return await prepare_domain.refresh_ready_groups(status_fetcher=runtime_domain.prepare_group_status)
+            return await prepare_domain.refresh_ready_groups(
+                status_fetcher=runtime_domain.prepare_group_status,
+                drop_completed_before_ready=True,
+            )
 
         async def fill_prepare_pool() -> int:
             nonlocal next_eval_group_idx

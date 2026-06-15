@@ -496,3 +496,90 @@ def test_transfer_fifo_routes_slots_by_arrival_ignoring_metadata(monkeypatch) ->
     assert len(released_groups) == 4
     asyncio.run(transfer.wait_for_pending_transfers())
     assert recorded == [(2, ["current-first", "old-second"]), (3, ["old-third", "current-fourth"])]
+
+
+def test_oversampling_surplus_retained_not_dropped(monkeypatch) -> None:
+    # When over_sampling_batch_size > rollout_batch_size, completed groups beyond the
+    # commit target (current_partition_quota) stay in ready_group_buffer (NOT dropped),
+    # so the next step's current partition can re-commit them. We do NOT account them
+    # separately — the next-step previous-partition debt is sized from the deficit, not
+    # from the buffer (see test_previous_quota_is_current_partition_deficit).
+    async def _fake_transfer(*args, **kwargs):
+        del args, kwargs
+
+    monkeypatch.setattr("relax.agentic.pipeline.transfer._transfer_batch_to_data_system", _fake_transfer)
+    args = _runtime_args(fully_async=True, rollout_batch_size=2, over_sampling_batch_size=4, n_samples_per_prompt=1)
+    transfer = TransferDomain(args=args, data_system_client=object())
+    transfer.rebind_step(rollout_id=3)
+    transfer.configure_transfer_quota(previous_partition_quota=0, current_partition_quota=2)
+    for idx in range(4):  # over-sample: 4 ready groups, commit target only 2
+        transfer.enqueue_ready_groups([_sample_group(f"g{idx}", group_index=idx, rollout_id=3)])
+    _released_groups, released_count = asyncio.run(transfer.drain_ready_group_payloads())
+
+    assert released_count == 2  # only current_partition_quota committed
+    assert len(transfer.ready_group_buffer) == 2  # surplus preserved, not dropped
+
+
+def test_previous_quota_is_current_partition_deficit() -> None:
+    # Core fix: previous_partition_quota (next-step backfill debt) equals how many groups
+    # the previous step left short of its current-partition target (rollout_batch_size),
+    # i.e. rollout_batch_size - committed_current. It is INDEPENDENT of any over-sampling
+    # surplus still resident in the transfer ready buffer.
+    args = _runtime_args(fully_async=True, rollout_batch_size=4, over_sampling_batch_size=6, n_samples_per_prompt=1)
+    pipeline = _pipeline_with_transfer(args)
+
+    # Case A: previous step met its target (committed_current == rollout_batch_size).
+    # Even with surplus left in the buffer, the deficit (and thus next-step debt) is 0.
+    pipeline.transfer_domain.rebind_step(rollout_id=0)
+    pipeline.transfer_domain.configure_transfer_quota(previous_partition_quota=0, current_partition_quota=4)
+    pipeline.transfer_domain._committed_current_group_count = 4
+    for idx in range(2):  # 2 surplus completed groups parked in the buffer
+        pipeline.transfer_domain.enqueue_ready_groups([_sample_group(f"s{idx}", group_index=idx, rollout_id=0)])
+    end_snapshot = dict(pipeline.transfer_domain.accounting_snapshot())
+    required = 4  # required_group_count == current_partition_quota
+    deficit = max(required - end_snapshot["committed_current_groups"], 0)
+    assert deficit == 0  # met target → no debt, regardless of the 2 buffered surplus groups
+
+    # Case B: previous step fell short by 1 (an aborted group never came back).
+    pipeline.transfer_domain.rebind_step(rollout_id=1)
+    pipeline.transfer_domain.configure_transfer_quota(previous_partition_quota=0, current_partition_quota=4)
+    pipeline.transfer_domain._committed_current_group_count = 3
+    end_snapshot = dict(pipeline.transfer_domain.accounting_snapshot())
+    deficit = max(required - end_snapshot["committed_current_groups"], 0)
+    assert deficit == 1  # short by exactly 1 → next step backfills 1
+
+
+def test_deficit_quota_keeps_admission_ledger_consistent() -> None:
+    # With the deficit-sized previous quota, the admission ledger stays self-consistent
+    # even when over-sampling surplus is resident: surplus is folded into the current
+    # window (resident_current_window_groups), not the previous debt, and no RuntimeError
+    # invariant fires in _current_window_admission_counts.
+    args = _runtime_args(fully_async=True, rollout_batch_size=4, over_sampling_batch_size=6, n_samples_per_prompt=1)
+    pipeline = _pipeline_with_transfer(args)
+    pipeline.transfer_domain.rebind_step(rollout_id=1)
+    pipeline.runtime_domain.rollout_id = 1
+
+    # Previous step left a deficit of 1; pipeline holds 1 aborted group (runtime) plus
+    # 2 over-sampling surplus groups (transfer ready buffer).
+    pipeline._last_step_current_deficit = 1
+    _set_runtime_resident_groups(pipeline, 1, rollout_id=0)
+    for idx in range(2):
+        pipeline.transfer_domain.enqueue_ready_groups([_sample_group(f"surplus{idx}", group_index=idx, rollout_id=1)])
+
+    previous_partition_quota = pipeline._last_step_current_deficit
+    pipeline.transfer_domain.configure_transfer_quota(
+        previous_partition_quota=previous_partition_quota, current_partition_quota=4
+    )
+    resident_group_count = pipeline.resident_group_count
+    assert resident_group_count == 3  # 1 abort + 2 surplus
+
+    snapshot = dict(pipeline.transfer_domain.accounting_snapshot())
+    remaining_previous_debt, resident_current_window_groups, _, current_window_slack = (
+        pipeline._current_window_admission_counts(
+            resident_group_count=resident_group_count, transfer_snapshot=snapshot
+        )
+    )
+    assert remaining_previous_debt == 1  # only the genuine deficit is debt
+    assert resident_current_window_groups == 2  # the 2 surplus folded into current window
+    assert current_window_slack >= 0
+    pipeline._assert_resident_group_count_invariant(context="test_deficit_ledger")

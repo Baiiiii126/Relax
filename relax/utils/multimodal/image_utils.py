@@ -166,7 +166,16 @@ def load_image_from_bytes(image: bytes, **kwargs: Any) -> Image.Image:
     Returns
     - A `PIL.Image` instance.
     """
-    return Image.open(BytesIO(image))
+    # Fully decode before the backing buffer goes out of scope. `Image.open`
+    # is lazy and keeps a reference to the underlying file object; if the
+    # `BytesIO` is garbage-collected (or the decode is deferred onto another
+    # thread, as the Qwen-VL processor does), a later `.load()` fails with
+    # truncated-stream errors ("assert self.png is not None" / OSError:
+    # unrecognized data stream contents).
+    with BytesIO(image) as bio:
+        image_obj = Image.open(bio)
+        image_obj.load()
+    return image_obj
 
 
 def decode_data_uri(uri: str) -> bytes:
