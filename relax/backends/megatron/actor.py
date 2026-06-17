@@ -557,8 +557,18 @@ class MegatronTrainRayActor(TrainRayActor):
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
-        # Create data iterator for log_probs and train.
+        # Create data iterator for actor forward + routing replay + train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        # Create a separate iterator with a larger token budget for ref/teacher log-probs
+        if self.args.use_dynamic_batch_size and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu:
+            data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
+                self.args,
+                self.model,
+                rollout_data,
+                max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
+            )
+        else:
+            data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
@@ -571,8 +581,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     self._switch_model("ref")
                     rollout_data.update(
                         self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
+                            data_iterator_logprobs,
+                            num_microbatches_logprobs,
                             store_prefix="ref_",
                         )
                     )
@@ -584,8 +594,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     self._switch_model("teacher")
                     rollout_data.update(
                         self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
+                            data_iterator_logprobs,
+                            num_microbatches_logprobs,
                             store_prefix="teacher_",
                             collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
                         )
@@ -777,7 +787,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 continue
             batch_index += 1
             logger.info(f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob")
-            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, data)
+            data_iterator, num_microbatches = get_data_iterator(
+                self.args,
+                self.model,
+                data,
+                max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
+            )
 
             output_dict = self.compute_log_prob(
                 data_iterator,
@@ -816,7 +831,12 @@ class MegatronTrainRayActor(TrainRayActor):
             logger.info(
                 f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob"
             )
-            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, data)
+            data_iterator, num_microbatches = get_data_iterator(
+                self.args,
+                self.model,
+                data,
+                max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
+            )
 
             output_dict = self.compute_log_prob(
                 data_iterator,
@@ -839,6 +859,16 @@ class MegatronTrainRayActor(TrainRayActor):
         identical log-probs before advantages are merged.
         """
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, sub_batch)
+        # Separate iterator with larger token budget for ref/teacher log-probs (fallthrough mode).
+        if self.args.use_dynamic_batch_size and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu:
+            data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
+                self.args,
+                self.model,
+                sub_batch,
+                max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
+            )
+        else:
+            data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, sub_batch)
@@ -849,14 +879,18 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self.args.use_routing_replay:
                     os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                 self._switch_model("ref")
-                sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_"))
+                sub_batch.update(
+                    self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="ref_")
+                )
 
             # Teacher forward for Megatron-based OPD
             if "teacher" in self.weights_backuper.backup_tags:
                 if self.args.use_routing_replay:
                     os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                 self._switch_model("teacher")
-                sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix="teacher_"))
+                sub_batch.update(
+                    self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="teacher_")
+                )
 
             # Actor forward
             self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
