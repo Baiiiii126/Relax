@@ -384,6 +384,28 @@ def _transport_status_from_finish_type(finish_type: str) -> str:
     return "completed"
 
 
+def _extend_token_id_set(token_ids: set[int], value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, int):
+        token_ids.add(int(value))
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _extend_token_id_set(token_ids, item)
+
+
+def _last_token_is_stop_token(*, token_ids: list[int], tokenizer: Any, sampling_params: dict[str, Any]) -> bool:
+    if not token_ids:
+        return False
+    stop_token_ids: set[int] = set()
+    _extend_token_id_set(stop_token_ids, getattr(tokenizer, "eos_token_id", None))
+    _extend_token_id_set(stop_token_ids, getattr(tokenizer, "eos_token_ids", None))
+    _extend_token_id_set(stop_token_ids, getattr(tokenizer, "additional_stop_token_ids", None))
+    _extend_token_id_set(stop_token_ids, sampling_params.get("stop_token_ids"))
+    return int(token_ids[-1]) in stop_token_ids
+
+
 def _message_multimodal_inputs(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
     from relax.utils.multimodal.image_utils import load_image
 
@@ -1589,17 +1611,26 @@ class AgenticSessionShard:
             profile = agentic_trace_events(ir.pending_export_metadata_patch)
             mark_agentic_event(profile, "generation_end_at")
             self._apply_generate_result(ir, result=result)
-            if result.finish_type == "abort":
+            finish_type = result.finish_type
+            # SGLang may process an abort after the decode step that produced EOS, returning
+            # finish_reason=abort while output_ids already end with a stop token.
+            if _last_token_is_stop_token(
+                token_ids=result.new_tokens,
+                tokenizer=self.backend.tokenizer,
+                sampling_params=ir.sampling_params,
+            ):
+                finish_type = "stop"
+                ir.pending_status = _transport_status_from_finish_type(finish_type)
+            if finish_type == "abort":
                 # SGLang aborts only the active backend generation request. The managed agent task remains
                 # resident, and its blocked chat call resumes after this IR is requeued.
                 if "max_new_tokens" in ir.sampling_params:
                     remaining = ir.sampling_params["max_new_tokens"] - len(result.new_tokens)
                     ir.sampling_params["max_new_tokens"] = remaining
-                ir.pending_loss_mask_delta = [0] * len(ir.pending_train_token_delta)
                 self._requeue_aborted_ir_locked(session_id=session_id, record=record, ir_id=ir_id, ir=ir)
                 self._maybe_start_next_ir_locked(session_id=session_id, record=record)
                 return
-            payload = self._terminal_response_locked(record=record, ir=ir, finish_type=result.finish_type)
+            payload = self._terminal_response_locked(record=record, ir=ir, finish_type=finish_type)
             self._complete_waiter_locked(record, ir_id, result=payload)
             self._release_ir_locked(record, ir_id)
             self._maybe_start_next_ir_locked(session_id=session_id, record=record)
