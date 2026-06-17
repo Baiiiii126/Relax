@@ -87,14 +87,15 @@ PERF_ARGS=(
    # --recompute-method uniform
    # --recompute-num-layers 1
 
-   --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather
+   --use-distributed-optimizer
+   --overlap-grad-reduce
+   --overlap-param-gather
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu 10240
    --log-probs-max-tokens-per-gpu 40960
 
    # --micro-batch-size 1 # avoid OOM
-
    --no-rope-fusion
 )
 
@@ -119,6 +120,8 @@ MTP_ARGS=(
    --mtp-num-layers ${MTP_NUM_LAYERS:-1}
    --enable-mtp-training
    --mtp-loss-scaling-factor ${MTP_LOSS_SCALING_FACTOR:-0.1}
+   --cross-entropy-loss-fusion
+   --cross-entropy-fusion-impl te
 )
 
 OPTIMIZER_ARGS=(

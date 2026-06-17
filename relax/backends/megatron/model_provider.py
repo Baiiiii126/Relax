@@ -278,6 +278,8 @@ def get_model_provider_func(
             "vision_dp_when_tp",
             "vision_dp_when_cp",
             "calculate_per_token_loss",
+            "cross_entropy_loss_fusion",
+            "cross_entropy_fusion_impl",
             "mtp_num_layers",
             "mtp_loss_scaling_factor",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass

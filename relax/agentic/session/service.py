@@ -2180,6 +2180,9 @@ def create_agentic_session_shards(config: Namespace):
         shard_handles.append(
             AgenticSessionShard.options(
                 num_cpus=0.25,
+                # Spread the shards across nodes. With the default (PACK) scheduling and a
+                # tiny num_cpus, Ray packs all shards onto a single node;
+                scheduling_strategy="SPREAD",
                 name=shard_name,
                 runtime_env={"env_vars": dict(_AGENTIC_SHARD_ALLOCATOR_ENV)},
             ).remote(

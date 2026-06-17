@@ -1102,9 +1102,9 @@ def create_managed_session_runner_pool(args: Any, *, total_requests: int) -> Man
         handles = []
         for runner_id, launch_capacity in enumerate(capacities):
             handle = ManagedSessionRunner.options(
-                num_cpus=0,
-                # Ray default scheduling avoids forcing every node to participate in local agent launch.
-                # scheduling_strategy="SPREAD",
+                # Require a *tiny* CPU reservation so runners cannot land on the head node
+                num_cpus=0.01,
+                scheduling_strategy="SPREAD",
             ).remote(runner_id=runner_id, launch_capacity=launch_capacity)
             handles.append(handle)
         return ManagedSessionRunnerPool(handles, capacities=capacities)
