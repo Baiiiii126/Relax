@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import ctypes
+import hashlib
+import json
 import threading
 import time
 import zlib
@@ -148,7 +150,7 @@ class IRReleaseDecision:
     blocked_reason: str | None = None
 
 
-class AgenticChatRequestError(RuntimeError):
+class AgenticChatRequestError(HTTPException):
     def __init__(
         self,
         message: str,
@@ -158,12 +160,22 @@ class AgenticChatRequestError(RuntimeError):
         status_code: int = 400,
         error_type: str = "invalid_request_error",
     ) -> None:
-        super().__init__(message)
+        super().__init__(status_code=status_code, detail=message)
         self.message = message
         self.code = code
         self.param = param
         self.status_code = int(status_code)
         self.error_type = error_type
+
+
+def _session_discarded_error(session_id: str) -> AgenticChatRequestError:
+    return AgenticChatRequestError(
+        f"Unknown or discarded agentic session {session_id!r}.",
+        code="session_discarded",
+        param="session_id",
+        status_code=404,
+        error_type="not_found_error",
+    )
 
 
 def _normalize_session_gate_reason(gate_reason: SessionGateReason | str | None) -> str | None:
@@ -205,10 +217,6 @@ def _count_gate_blocked_irs(record: _SessionRecord) -> tuple[int, int]:
     return 0, 0
 
 
-def _has_partial_resume_gate(record: _SessionRecord) -> bool:
-    return record.gate_reason == _GATE_REASON_PARTIAL_RESUME
-
-
 def _openai_error_result(
     message: str,
     *,
@@ -228,12 +236,58 @@ def _openai_error_result(
     }
 
 
+def _openai_error_from_exc(exc: AgenticChatRequestError) -> dict[str, Any]:
+    return _openai_error_result(
+        exc.message,
+        code=exc.code,
+        param=exc.param,
+        status_code=exc.status_code,
+        error_type=exc.error_type,
+    )
+
+
+def _openai_context_length_error_result(
+    *,
+    max_context_len: int | None,
+    prompt_tokens: int | None,
+    requested_completion_tokens: int | None = None,
+) -> dict[str, Any]:
+    if max_context_len is None:
+        message = "This model's maximum context length was exceeded. Please reduce the length of the messages."
+    elif prompt_tokens is None:
+        message = (
+            f"This model's maximum context length is {max_context_len} tokens. "
+            "Please reduce the length of the messages."
+        )
+    elif requested_completion_tokens is None:
+        message = (
+            f"This model's maximum context length is {max_context_len} tokens. "
+            f"However, your messages resulted in {prompt_tokens} tokens. "
+            "Please reduce the length of the messages."
+        )
+    else:
+        total_tokens = prompt_tokens + requested_completion_tokens
+        message = (
+            f"This model's maximum context length is {max_context_len} tokens. "
+            f"However, your messages resulted in {prompt_tokens} tokens and requested "
+            f"{requested_completion_tokens} completion tokens ({total_tokens} tokens total). "
+            "Please reduce the length of the messages or max_completion_tokens."
+        )
+    return _openai_error_result(
+        message,
+        code="context_length_exceeded",
+        param="messages",
+    )
+
+
 def _openai_error_response(result: dict[str, Any]) -> JSONResponse:
     status_code = int(result.get("_http_status") or 400)
     payload = {key: value for key, value in result.items() if key != "_http_status"}
     headers = {}
     error = result.get("error")
-    if isinstance(error, dict) and error.get("code") == "session_discarded":
+    if isinstance(error, dict) and (
+        error.get("type") == "internal_error" or error.get("code") in {"internal_error", "session_discarded"}
+    ):
         headers["x-should-retry"] = "false"
     return JSONResponse(payload, status_code=status_code, headers=headers)
 
@@ -277,67 +331,89 @@ def _shard_index_for_session(session_id: str, shard_count: int) -> int:
 def _session_id_from_request(*, request: Request) -> str:
     header = request.headers.get("Authorization")
     if not header:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+        raise AgenticChatRequestError(
+            "Missing Authorization header",
+            code="authentication_error",
+            status_code=401,
+            error_type="authentication_error",
+        )
     scheme, _, token = header.partition(" ")
     if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="Authorization header must be 'Bearer <token>'")
+        raise AgenticChatRequestError(
+            "Authorization header must be 'Bearer <token>'",
+            code="authentication_error",
+            status_code=401,
+            error_type="authentication_error",
+        )
     return token
 
 
 def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
+    def fail(
+        message: str,
+        *,
+        code: str = "invalid_request_error",
+        param: str | None = None,
+        status_code: int = 400,
+        error_type: str = "invalid_request_error",
+    ) -> None:
+        raise AgenticChatRequestError(
+            message,
+            code=code,
+            param=param,
+            status_code=status_code,
+            error_type=error_type,
+        )
+
     if "messages" not in payload:
-        raise HTTPException(status_code=400, detail="messages is required")
+        fail("messages is required", param="messages")
     messages = payload["messages"]
     if not isinstance(messages, list):
-        raise HTTPException(status_code=400, detail="messages must be a list")
+        fail("messages must be a list", param="messages")
 
     tools = payload.get("tools")
     if tools is not None:
         if not isinstance(tools, list):
-            raise HTTPException(status_code=400, detail="tools must be a list")
+            fail("tools must be a list", param="tools")
         if any(not isinstance(item, dict) for item in tools):
-            raise HTTPException(status_code=400, detail="tools entries must be JSON objects")
+            fail("tools entries must be JSON objects", param="tools")
     chat_template_kwargs = payload.get("chat_template_kwargs")
     if chat_template_kwargs is not None and not isinstance(chat_template_kwargs, dict):
-        raise HTTPException(status_code=400, detail="chat_template_kwargs must be a JSON object")
+        fail("chat_template_kwargs must be a JSON object", param="chat_template_kwargs")
     if chat_template_kwargs is not None:
         reserved_chat_template_kwargs = {"add_generation_prompt", "tokenize", "tools"}
         reserved = sorted(reserved_chat_template_kwargs.intersection(chat_template_kwargs))
         if reserved:
-            raise HTTPException(
-                status_code=400,
-                detail=f"chat_template_kwargs cannot set reserved keys: {', '.join(reserved)}",
+            fail(
+                f"chat_template_kwargs cannot set reserved keys: {', '.join(reserved)}",
+                param="chat_template_kwargs",
             )
 
     # TODO: support some of these following parameters
     if "stream" in payload and payload["stream"] not in {None, False}:
-        raise HTTPException(status_code=400, detail="stream is not supported")
+        fail("stream is not supported", param="stream")
     if "n" in payload and payload["n"] != 1:
-        raise HTTPException(status_code=400, detail="n must be 1")
+        fail("n must be 1", param="n")
     requested_logprobs = payload.get("logprobs", False)
     if requested_logprobs is None:
         logprobs = False
     elif isinstance(requested_logprobs, bool):
         logprobs = requested_logprobs
     else:
-        raise HTTPException(status_code=400, detail="logprobs must be a boolean")
+        fail("logprobs must be a boolean", param="logprobs")
     if "top_logprobs" in payload and payload["top_logprobs"] is not None:
-        raise HTTPException(status_code=400, detail="top_logprobs is not supported")
+        fail("top_logprobs is not supported", param="top_logprobs")
     if "functions" in payload and payload["functions"] not in (None, []):
-        raise HTTPException(status_code=400, detail="functions are not supported")
+        fail("functions are not supported", param="functions")
     if "function_call" in payload and payload["function_call"] not in (None, "none"):
-        raise HTTPException(status_code=400, detail="function_call is not supported")
-    if "tool_choice" in payload and payload["tool_choice"] not in (None, "none"):
-        raise HTTPException(status_code=400, detail="tool_choice is not supported")
-    if "parallel_tool_calls" in payload and payload["parallel_tool_calls"] not in (None, False):
-        raise HTTPException(status_code=400, detail="parallel_tool_calls is not supported")
+        fail("function_call is not supported", param="function_call")
     max_completion_tokens = payload.get("max_completion_tokens")
     if max_completion_tokens is not None and not (
         isinstance(max_completion_tokens, int)
         and not isinstance(max_completion_tokens, bool)
         and max_completion_tokens > 0
     ):
-        raise HTTPException(status_code=400, detail="max_completion_tokens must be a positive integer")
+        fail("max_completion_tokens must be a positive integer", param="max_completion_tokens")
 
     stop = payload.get("stop")
     if (
@@ -345,12 +421,12 @@ def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
         and stop is not None
         and not (isinstance(stop, str) or (isinstance(stop, list) and all(isinstance(item, str) for item in stop)))
     ):
-        raise HTTPException(status_code=400, detail="stop must be a string or list of strings")
+        fail("stop must be a string or list of strings", param="stop")
 
     try:
         normalized_messages = check_messages(messages)
     except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        fail(str(exc), param="messages")
 
     return {
         "messages": normalized_messages,
@@ -429,13 +505,135 @@ def _message_multimodal_inputs(messages: list[dict[str, Any]]) -> dict[str, Any]
     return _multimodal_inputs_from_messages(normalized_messages)
 
 
-def _decode_response_payload(*, tokenizer: Any, token_ids: list[int]) -> tuple[str, list[dict[str, Any]]]:
+def _stable_tool_call_id(*, parent_state_hash: str, token_ids: list[int], call_index: int) -> str:
+    payload = json.dumps(
+        {
+            "call_index": int(call_index),
+            "parent_state_hash": parent_state_hash,
+            "token_ids": list(token_ids),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"call_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _sglang_parser_tools(tools: list[dict[str, Any]]) -> list[Any]:
+    try:
+        from sglang.srt.entrypoints.openai.protocol import Tool
+    except Exception as exc:
+        raise AgenticChatRequestError(
+            f"Failed to import SGLang Tool protocol model: {exc}",
+            code="agentic_tool_call_parser_error",
+            status_code=500,
+            error_type="internal_error",
+        ) from exc
+
+    try:
+        return [Tool.model_validate(tool) for tool in tools]
+    except Exception as exc:
+        raise AgenticChatRequestError(
+            f"Invalid tools for agentic tool-call parser: {exc}",
+            code="invalid_tools",
+            param="tools",
+        ) from exc
+
+
+def _postprocess_assistant_message(
+    *,
+    args: Namespace,
+    text: str,
+    tools: list[dict[str, Any]],
+    parent_state_hash: str,
+    token_ids: list[int],
+) -> tuple[dict[str, Any], bool]:
+    reasoning_text = None
+    normal_text = text
+    reasoning_parser_name = getattr(args, "agentic_reasoning_parser", None)
+    if reasoning_parser_name:
+        try:
+            from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+            reasoning_parser = ReasoningParser(model_type=str(reasoning_parser_name), stream_reasoning=False)
+            parsed_reasoning, parsed_text = reasoning_parser.parse_non_stream(normal_text)
+        except Exception as exc:
+            raise AgenticChatRequestError(
+                f"Failed to parse reasoning content with parser {reasoning_parser_name!r}: {exc}",
+                code="agentic_reasoning_parser_error",
+                status_code=500,
+                error_type="internal_error",
+            ) from exc
+        reasoning_text = parsed_reasoning if isinstance(parsed_reasoning, str) and parsed_reasoning else None
+        normal_text = parsed_text if isinstance(parsed_text, str) else ""
+
+    tool_calls: list[dict[str, Any]] = []
+    tool_call_parser_name = getattr(args, "agentic_tool_call_parser", None)
+    if tool_call_parser_name and tools:
+        try:
+            from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+            parser_tools = _sglang_parser_tools(tools)
+            tool_call_parser = FunctionCallParser(parser_tools, str(tool_call_parser_name))
+            parsed_text, call_items = tool_call_parser.parse_non_stream(normal_text)
+        except AgenticChatRequestError:
+            raise
+        except Exception as exc:
+            raise AgenticChatRequestError(
+                f"Failed to parse tool calls with parser {tool_call_parser_name!r}: {exc}",
+                code="agentic_tool_call_parser_error",
+                status_code=500,
+                error_type="internal_error",
+            ) from exc
+        normal_text = parsed_text if isinstance(parsed_text, str) else ""
+        for call_index, call_item in enumerate(call_items):
+            tool_calls.append(
+                {
+                    "id": _stable_tool_call_id(
+                        parent_state_hash=parent_state_hash,
+                        token_ids=token_ids,
+                        call_index=call_index,
+                    ),
+                    "type": "function",
+                    "function": {
+                        "name": str(call_item.name or ""),
+                        "arguments": call_item.parameters,
+                    },
+                }
+            )
+
+    message: dict[str, Any] = {"role": "assistant", "content": normal_text}
+    if not normal_text and (reasoning_text or tool_calls):
+        message["content"] = None
+    if reasoning_text:
+        message["reasoning_content"] = reasoning_text
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message, bool(tool_calls)
+
+
+def _decode_response_payload(
+    *,
+    args: Namespace,
+    tokenizer: Any,
+    token_ids: list[int],
+    tools: list[dict[str, Any]],
+    parent_state_hash: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
     if not token_ids:
-        return "", []
+        response_message = {"role": "assistant", "content": ""}
+        return [], response_message, False
     text = str(tokenizer.decode(token_ids, skip_special_tokens=False))
     if not text:
-        return "", []
-    return text, [{"role": "assistant", "content": text}]
+        response_message = {"role": "assistant", "content": ""}
+        return [], response_message, False
+    response_message, has_tool_calls = _postprocess_assistant_message(
+        args=args,
+        text=text,
+        tools=tools,
+        parent_state_hash=parent_state_hash,
+        token_ids=token_ids,
+    )
+    return [response_message], response_message, has_tool_calls
 
 
 def _openai_token_logprobs_payload(
@@ -521,7 +719,10 @@ class AgenticSessionShard:
     async def acquire_sglang_request_permit(self) -> None:
         if self._sglang_request_semaphore is None:
             raise RuntimeError("SGLang request permit owner has no semaphore.")
-        await asyncio.to_thread(self._sglang_request_semaphore.acquire)
+        while True:
+            if self._sglang_request_semaphore.acquire(blocking=False):
+                return
+            await asyncio.sleep(0.01)
 
     @ray.method(concurrency_group="sglang_request_control")
     async def release_sglang_request_permit(self) -> None:
@@ -728,11 +929,7 @@ class AgenticSessionShard:
         compiler = getattr(self.backend, "compiler", None)
         return normalize_template_kwargs(getattr(compiler, "apply_chat_template_kwargs", None))
 
-    def _default_session_seed(
-        self,
-        *,
-        messages: list[dict[str, Any]],
-    ) -> dict[str, Any]:
+    def _default_session_seed(self) -> dict[str, Any]:
         return {
             "group_index": None,
             "index": None,
@@ -747,10 +944,9 @@ class AgenticSessionShard:
         self,
         *,
         seed: dict[str, Any] | None,
-        messages: list[dict[str, Any]],
     ) -> dict[str, Any]:
         if not isinstance(seed, dict):
-            return self._default_session_seed(messages=messages)
+            return self._default_session_seed()
         normalized = copy.deepcopy(seed)
         metadata = normalized.get("metadata")
         if not isinstance(metadata, dict):
@@ -910,16 +1106,9 @@ class AgenticSessionShard:
             if record.forest is not None:
                 return record, None
         if record is None:
-            raise AgenticChatRequestError(
-                f"Unknown or discarded agentic session {session_id!r}.",
-                code="session_discarded",
-                param="session_id",
-                status_code=400,
-                error_type="invalid_request_error",
-            )
+            raise _session_discarded_error(session_id)
         seed = self._normalized_session_seed(
             seed=record.session_seed,
-            messages=messages,
         )
         record.session_seed = seed
         if sampling_params is None and not record.session_sampling_params:
@@ -944,27 +1133,14 @@ class AgenticSessionShard:
     ) -> tuple[str | None, list[dict[str, Any]]]:
         normalized_messages = check_messages(messages)
         normalized_tools = normalize_tools(tools)
-        full_state_hash = messages_tools_template_state_hash(
-            normalized_messages,
-            normalized_tools,
-            chat_template_kwargs,
-        )
-        if full_state_hash in forest.nodes_by_hash:
-            return full_state_hash, []
-        assistant_indices = [
-            idx for idx, message in enumerate(normalized_messages) if message.get("role") == "assistant"
-        ]
-        for assistant_idx in reversed(assistant_indices):
-            prefix = normalized_messages[: assistant_idx + 1]
+        for prefix_len in range(len(normalized_messages), 0, -1):
             prefix_hash = messages_tools_template_state_hash(
-                prefix,
+                normalized_messages[:prefix_len],
                 normalized_tools,
                 chat_template_kwargs,
             )
-            prefix_node = forest.nodes_by_hash.get(prefix_hash)
-            if prefix_node is None or prefix_node.kind != "resp":
-                continue
-            return prefix_hash, normalized_messages[assistant_idx + 1 :]
+            if prefix_hash in forest.nodes_by_hash:
+                return prefix_hash, normalized_messages[prefix_len:]
         return None, normalized_messages
 
     async def _append_subtree_root_observation(
@@ -1103,9 +1279,7 @@ class AgenticSessionShard:
         while ir_id in record.ir_queue:
             record.ir_queue.remove(ir_id)
 
-    def _enqueue_ir_locked(
-        self, record: _SessionRecord, ir: InflightRequest, *, session_id: str | None = None
-    ) -> None:
+    def _enqueue_ir_locked(self, record: _SessionRecord, ir: InflightRequest) -> None:
         self._remove_ir_from_queue(record, ir.request_id)
         if record.protected_until_finalize:
             ir.kind = RequestKind.PROTECTED
@@ -1248,7 +1422,6 @@ class AgenticSessionShard:
     def _requeue_aborted_ir_locked(
         self,
         *,
-        session_id: str | None = None,
         record: _SessionRecord,
         ir_id: str,
         ir: InflightRequest,
@@ -1271,7 +1444,6 @@ class AgenticSessionShard:
             else _GATE_REASON_PARTIAL_RESUME
         )
         self._gate_active_ir_release_locked(
-            session_id=session_id,
             record=record,
             ir_id=ir_id,
             ir=ir,
@@ -1281,7 +1453,6 @@ class AgenticSessionShard:
     def _gate_active_ir_release_locked(
         self,
         *,
-        session_id: str | None = None,
         record: _SessionRecord,
         ir_id: str,
         ir: InflightRequest,
@@ -1296,12 +1467,9 @@ class AgenticSessionShard:
             )
         self._set_session_gate_locked(record=record, gate_reason=gate_reason)
         self._remove_ir_from_runnable_state_locked(record, ir_id)
-        if session_id is None:
-            self._enqueue_ir_locked(record, ir)
-        else:
-            self._enqueue_ir_locked(record, ir, session_id=session_id)
+        self._enqueue_ir_locked(record, ir)
 
-    def _should_requeue_active_ir_locked(self, *, record: _SessionRecord, ir: InflightRequest) -> bool:
+    def _should_requeue_active_ir_locked(self, *, record: _SessionRecord) -> bool:
         decision = _decide_ir_release(record=record)
         if decision.allow:
             return False
@@ -1334,10 +1502,9 @@ class AgenticSessionShard:
                 self._complete_waiter_locked(
                     record,
                     ir.request_id,
-                    result=_openai_error_result(
-                        "Input context exceeds rollout_max_context_len; no tokens are available for generation.",
-                        code="context_length_exceeded",
-                        param="messages",
+                    result=_openai_context_length_error_result(
+                        max_context_len=self.args.rollout_max_context_len,
+                        prompt_tokens=len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta),
                     ),
                 )
                 self._release_ir_locked(record, ir.request_id)
@@ -1447,9 +1614,12 @@ class AgenticSessionShard:
         ir.pending_export_metadata_patch["request_id"] = ir.request_id
         ir.pending_export_metadata_patch["request_kind"] = ir.kind.value
         ir.pending_export_metadata_patch["base_state_hash"] = ir.parent_state_hash
-        response_text, response_messages_delta = _decode_response_payload(
+        response_messages_delta, response_message, has_tool_calls = _decode_response_payload(
+            args=self.args,
             tokenizer=self.backend.tokenizer,
             token_ids=ir.pending_train_token_delta,
+            tools=record.forest.subtree_tools(ir.parent_state_hash),
+            parent_state_hash=ir.parent_state_hash,
         )
         resp_node = record.forest.append_resp(
             parent_state_hash=ir.parent_state_hash,
@@ -1478,11 +1648,13 @@ class AgenticSessionShard:
             "total_tokens": prompt_tokens + len(ir.pending_train_token_delta),
         }
         finish_reason = _openai_finish_reason("length" if ir.pending_status == "truncated" else finish_type)
+        if has_tool_calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
         chat_ended_at = time.time()
         mark_agentic_event(resp_profile, "chat_end_at", chat_ended_at)
         return {
             "request_id": ir.request_id,
-            "message": {"role": "assistant", "content": response_text},
+            "message": response_message,
             "logprobs": (
                 _openai_token_logprobs_payload(
                     tokenizer=self.backend.tokenizer,
@@ -1496,6 +1668,17 @@ class AgenticSessionShard:
             "usage": usage,
         }
 
+    async def _release_sglang_request_permit_after_cancel(self, *, limiter: Any, acquire_ref: Any) -> None:
+        try:
+            await acquire_ref
+        except Exception:
+            logger.exception("Cancelled SGLang permit acquire failed before taking a remote permit.")
+            return
+        try:
+            await limiter.release_sglang_request_permit.remote()
+        except Exception:
+            logger.exception("Failed to release remote SGLang permit acquired after cancellation.")
+
     async def _run_ir(self, *, session_id: str, ir_id: str, runner_epoch: int) -> None:
         lock = self._get_session_lock(session_id)
         if lock is None:
@@ -1507,8 +1690,8 @@ class AgenticSessionShard:
             ir = record.irs_by_id.get(ir_id)
             if ir is None or ir_id not in record.active_ir_runner_tasks or ir.runner_epoch != runner_epoch:
                 return
-            if self._should_requeue_active_ir_locked(record=record, ir=ir):
-                self._gate_active_ir_release_locked(session_id=session_id, record=record, ir_id=ir_id, ir=ir)
+            if self._should_requeue_active_ir_locked(record=record):
+                self._gate_active_ir_release_locked(record=record, ir_id=ir_id, ir=ir)
                 self._maybe_start_next_ir_locked(session_id=session_id, record=record)
                 return
             profile = agentic_trace_events(ir.pending_export_metadata_patch)
@@ -1517,10 +1700,23 @@ class AgenticSessionShard:
         generation_profile: dict[str, Any] | None = None
         try:
             if self._sglang_request_semaphore is not None:
-                await asyncio.to_thread(self._sglang_request_semaphore.acquire)
-                permit_acquired = True
+                while True:
+                    if self._sglang_request_semaphore.acquire(blocking=False):
+                        permit_acquired = True
+                        break
+                    await asyncio.sleep(0.01)
             elif self._sglang_request_limiter is not None:
-                await self._sglang_request_limiter.acquire_sglang_request_permit.remote()
+                acquire_ref = self._sglang_request_limiter.acquire_sglang_request_permit.remote()
+                try:
+                    await asyncio.shield(acquire_ref)
+                except asyncio.CancelledError:
+                    asyncio.create_task(
+                        self._release_sglang_request_permit_after_cancel(
+                            limiter=self._sglang_request_limiter,
+                            acquire_ref=acquire_ref,
+                        )
+                    )
+                    raise
                 permit_acquired = True
             lock = self._get_session_lock(session_id)
             if lock is None:
@@ -1532,8 +1728,8 @@ class AgenticSessionShard:
                 ir = record.irs_by_id.get(ir_id)
                 if ir is None or ir_id not in record.active_ir_runner_tasks or ir.runner_epoch != runner_epoch:
                     return
-                if self._should_requeue_active_ir_locked(record=record, ir=ir):
-                    self._gate_active_ir_release_locked(session_id=session_id, record=record, ir_id=ir_id, ir=ir)
+                if self._should_requeue_active_ir_locked(record=record):
+                    self._gate_active_ir_release_locked(record=record, ir_id=ir_id, ir=ir)
                     self._maybe_start_next_ir_locked(session_id=session_id, record=record)
                     return
                 ir.backend_started = True
@@ -1549,7 +1745,7 @@ class AgenticSessionShard:
                 video_data=ir.history_backend_video_data,
                 return_logprob=record.scope_id == "train" or ir.logprobs,
             )
-        except BackendContextLengthExceededError as exc:
+        except BackendContextLengthExceededError:
             lock = self._get_session_lock(session_id)
             if lock is None:
                 return
@@ -1560,10 +1756,10 @@ class AgenticSessionShard:
                 self._complete_waiter_locked(
                     record,
                     ir_id,
-                    result=_openai_error_result(
-                        str(exc),
-                        code="context_length_exceeded",
-                        param="messages",
+                    result=_openai_context_length_error_result(
+                        max_context_len=self.args.rollout_max_context_len,
+                        prompt_tokens=len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta),
+                        requested_completion_tokens=ir.sampling_params.get("max_new_tokens"),
                     ),
                 )
                 self._release_ir_locked(record, ir_id)
@@ -1582,10 +1778,10 @@ class AgenticSessionShard:
                 if (
                     ir is not None
                     and ir_id in record.active_ir_runner_tasks
-                    and self._should_requeue_active_ir_locked(record=record, ir=ir)
+                    and self._should_requeue_active_ir_locked(record=record)
                     and self._is_interrupt_backpressure_error(exc)
                 ):
-                    self._requeue_aborted_ir_locked(session_id=session_id, record=record, ir_id=ir_id, ir=ir)
+                    self._requeue_aborted_ir_locked(record=record, ir_id=ir_id, ir=ir)
                     self._maybe_start_next_ir_locked(session_id=session_id, record=record)
                     return
                 self._complete_waiter_locked(record, ir_id, exc=exc)
@@ -1627,10 +1823,45 @@ class AgenticSessionShard:
                 if "max_new_tokens" in ir.sampling_params:
                     remaining = ir.sampling_params["max_new_tokens"] - len(result.new_tokens)
                     ir.sampling_params["max_new_tokens"] = remaining
-                self._requeue_aborted_ir_locked(session_id=session_id, record=record, ir_id=ir_id, ir=ir)
+                self._requeue_aborted_ir_locked(record=record, ir_id=ir_id, ir=ir)
                 self._maybe_start_next_ir_locked(session_id=session_id, record=record)
                 return
-            payload = self._terminal_response_locked(record=record, ir=ir, finish_type=finish_type)
+            try:
+                payload = self._terminal_response_locked(record=record, ir=ir, finish_type=finish_type)
+            except AgenticChatRequestError as exc:
+                self._complete_waiter_locked(
+                    record,
+                    ir_id,
+                    result=_openai_error_result(
+                        exc.message,
+                        code=exc.code,
+                        param=exc.param,
+                        status_code=exc.status_code,
+                        error_type=exc.error_type,
+                    ),
+                )
+                self._release_ir_locked(record, ir_id)
+                self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+                return
+            except Exception:
+                logger.exception(
+                    "Failed to build terminal agentic chat response for session_id=%s request_id=%s",
+                    session_id,
+                    ir_id,
+                )
+                self._complete_waiter_locked(
+                    record,
+                    ir_id,
+                    result=_openai_error_result(
+                        "Internal error while building agentic chat response.",
+                        code="internal_error",
+                        status_code=500,
+                        error_type="internal_error",
+                    ),
+                )
+                self._release_ir_locked(record, ir_id)
+                self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+                return
             self._complete_waiter_locked(record, ir_id, result=payload)
             self._release_ir_locked(record, ir_id)
             self._maybe_start_next_ir_locked(session_id=session_id, record=record)
@@ -1653,7 +1884,7 @@ class AgenticSessionShard:
                 if self._is_non_train_session_record(current):
                     continue
                 current.rollout_id = rollout_id
-                if _has_partial_resume_gate(current):
+                if current.gate_reason == _GATE_REASON_PARTIAL_RESUME:
                     if self._activate_record_locked(
                         session_id=session_id,
                         record=current,
@@ -1708,7 +1939,6 @@ class AgenticSessionShard:
                     if ir.backend_started:
                         continue
                     self._gate_active_ir_release_locked(
-                        session_id=session_id,
                         record=current,
                         ir_id=ir_id,
                         ir=ir,
@@ -1788,36 +2018,36 @@ class AgenticSessionShard:
             "evaluating": self._evaluating,
         }
 
-    def _finalize_sample_from_terminal(
+    def _finalize_sample_from_leaf(
         self,
         *,
         record: _SessionRecord,
         reward: float | dict[str, Any] | None,
         metadata: dict[str, Any] | None,
     ):
-        terminal_hashes = record.forest.export_terminal_hashes()
-        if not terminal_hashes:
+        leaf_hashes = record.forest.export_leaf_hashes()
+        if not leaf_hashes:
             raise RuntimeError(f"Session {record.forest.session_id!r} has no committed response")
-        if len(terminal_hashes) != 1:
+        if len(leaf_hashes) != 1:
             raise RuntimeError(
                 f"Session {record.forest.session_id!r} currently supports exporting exactly one sample, "
-                f"got {len(terminal_hashes)}"
+                f"got {len(leaf_hashes)}"
             )
-        terminal_hash = terminal_hashes[0]
+        leaf_hash = leaf_hashes[0]
         metadata_patch = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
         finalize_started_at = time.time()
-        lineage = record.forest.lineage(terminal_hash)
+        lineage = record.forest.lineage(leaf_hash)
         if not any(node.kind == "resp" for node in lineage):
             raise RuntimeError(f"Session {record.forest.session_id!r} has no committed response")
-        terminal_node = record.forest.nodes_by_hash[terminal_hash]
-        terminal_profile = agentic_trace_events(terminal_node.export_metadata_patch)
-        mark_agentic_event(terminal_profile, "finalize_start_at", finalize_started_at)
+        leaf_node = record.forest.nodes_by_hash[leaf_hash]
+        leaf_profile = agentic_trace_events(leaf_node.export_metadata_patch)
+        mark_agentic_event(leaf_profile, "finalize_start_at", finalize_started_at)
         if reward is not None:
-            terminal_node.reward = copy.deepcopy(reward)
+            leaf_node.reward = copy.deepcopy(reward)
         if metadata_patch:
-            terminal_node.export_metadata_patch.update(metadata_patch)
+            leaf_node.export_metadata_patch.update(metadata_patch)
         sample = record.forest.build_sample(
-            leaf_state_hash=terminal_hash,
+            leaf_state_hash=leaf_hash,
             tokenizer=self.backend.tokenizer,
             # mask_offpolicy_in_partial_rollout=bool(
             #     self.args.partial_rollout and self.args.mask_offpolicy_in_partial_rollout
@@ -1827,13 +2057,13 @@ class AgenticSessionShard:
         mark_metadata_agentic_event(sample.metadata, "finalize_end_at", finalize_ended_at)
         return sample
 
-    def _record_has_exportable_terminal(self, record: _SessionRecord) -> bool:
+    def _record_has_exportable_leaf(self, record: _SessionRecord) -> bool:
         if record.forest is None:
             return False
-        terminal_hashes = record.forest.export_terminal_hashes()
-        if len(terminal_hashes) != 1:
+        leaf_hashes = record.forest.export_leaf_hashes()
+        if len(leaf_hashes) != 1:
             return False
-        lineage = record.forest.lineage(terminal_hashes[0])
+        lineage = record.forest.lineage(leaf_hashes[0])
         return any(node.kind == "resp" for node in lineage)
 
     @staticmethod
@@ -1866,13 +2096,7 @@ class AgenticSessionShard:
         try:
             lock = self._get_session_lock(session_id)
             if lock is None:
-                raise AgenticChatRequestError(
-                    f"Unknown or discarded agentic session {session_id!r}.",
-                    code="session_discarded",
-                    param="session_id",
-                    status_code=400,
-                    error_type="invalid_request_error",
-                )
+                raise _session_discarded_error(session_id)
             async with lock:
                 chat_lock_acquired_at = time.time()
                 normalized_messages = check_messages(messages)
@@ -1932,24 +2156,17 @@ class AgenticSessionShard:
                     self._complete_waiter_locked(
                         record,
                         ir.request_id,
-                        result=_openai_error_result(
-                            "This request exceeds the available context window before generation could begin.",
-                            code="context_length_exceeded",
-                            param="messages",
+                        result=_openai_context_length_error_result(
+                            max_context_len=self.args.rollout_max_context_len,
+                            prompt_tokens=len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta),
                         ),
                     )
                     self._release_ir_locked(record, ir.request_id)
                 else:
-                    self._enqueue_ir_locked(record, ir, session_id=session_id)
+                    self._enqueue_ir_locked(record, ir)
                     self._maybe_start_next_ir_locked(session_id=session_id, record=record)
         except AgenticChatRequestError as exc:
-            return _openai_error_result(
-                exc.message,
-                code=exc.code,
-                param=exc.param,
-                status_code=exc.status_code,
-                error_type=exc.error_type,
-            )
+            return _openai_error_from_exc(exc)
         del (
             messages,
             tools,
@@ -1969,12 +2186,14 @@ class AgenticSessionShard:
         try:
             return await waiter
         except AgenticChatRequestError as exc:
+            return _openai_error_from_exc(exc)
+        except Exception:
+            logger.exception("Agentic chat waiter failed for session_id=%s", session_id)
             return _openai_error_result(
-                exc.message,
-                code=exc.code,
-                param=exc.param,
-                status_code=exc.status_code,
-                error_type=exc.error_type,
+                "Internal error while handling agentic chat request.",
+                code="internal_error",
+                status_code=500,
+                error_type="internal_error",
             )
 
     async def _abort_backend_request_ids(self, request_ids: list[str]) -> None:
@@ -2002,11 +2221,7 @@ class AgenticSessionShard:
         active_tasks: list[asyncio.Task[Any]],
         backend_request_ids: list[str],
         waiters: list[asyncio.Future[Any]],
-        session_locks: dict[str, asyncio.Lock],
-        session_records: dict[str, _SessionRecord],
-        logger,
         stats: dict[str, int] | None,
-        active_session_count: int,
     ) -> bool:
         def _log_discarded_runner_result(task: asyncio.Task[Any]) -> None:
             try:
@@ -2029,23 +2244,19 @@ class AgenticSessionShard:
         for waiter in waiters:
             if waiter.done():
                 continue
-            # Session cleanup is a protocol event for the managed agent. Return an error to the blocked
-            # chat call so user code can run its own cleanup instead of being killed by the framework.
             waiter.set_result(
-                {
-                    "error": {
-                        "message": f"Agentic session {session_id!r} was discarded.",
-                        "type": "invalid_request_error",
-                        "param": "session_id",
-                        "code": "session_discarded",
-                    },
-                    "_http_status": 400,
-                }
+                _openai_error_result(
+                    f"Agentic session {session_id!r} was discarded.",
+                    code="session_discarded",
+                    param="session_id",
+                    status_code=404,
+                    error_type="not_found_error",
+                )
             )
         async with lock:
-            current_lock = session_locks.get(session_id)
-            if current_lock is lock and session_id not in session_records:
-                session_locks.pop(session_id, None)
+            current_lock = self._session_locks.get(session_id)
+            if current_lock is lock and session_id not in self._session_records:
+                self._session_locks.pop(session_id, None)
         if removed is not None:
             logger.debug(
                 "Discarded agentic session session_id=%s rollout_id=%s node_count=%s request_count=%s active_sessions=%s active_locks=%s",
@@ -2053,8 +2264,8 @@ class AgenticSessionShard:
                 removed.rollout_id,
                 stats["node_count"] if stats is not None else 0,
                 stats["request_count"] if stats is not None else 0,
-                active_session_count,
-                len(session_locks),
+                len(self._session_records),
+                len(self._session_locks),
             )
         return removed is not None
 
@@ -2106,20 +2317,20 @@ class AgenticSessionShard:
                     status="discarded",
                     metadata={"discard_reason": "already_discarded"},
                 )
-            if not self._record_has_exportable_terminal(record):
+            if not self._record_has_exportable_leaf(record):
                 transport = FinalizedResultTransport(
                     status="non_finalizable",
                     metadata={"discard_reason": "no_committed_response"},
                 )
             else:
-                terminal_hashes = record.forest.export_terminal_hashes()
-                terminal_hash = terminal_hashes[0]
-                terminal_node = record.forest.nodes_by_hash.get(terminal_hash)
-                if terminal_node is not None:
-                    profile = agentic_trace_events(terminal_node.export_metadata_patch)
+                leaf_hashes = record.forest.export_leaf_hashes()
+                leaf_hash = leaf_hashes[0]
+                leaf_node = record.forest.nodes_by_hash.get(leaf_hash)
+                if leaf_node is not None:
+                    profile = agentic_trace_events(leaf_node.export_metadata_patch)
                     mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
                     mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
-                sample = self._finalize_sample_from_terminal(record=record, reward=reward, metadata=metadata)
+                sample = self._finalize_sample_from_leaf(record=record, reward=reward, metadata=metadata)
                 transport = self._build_transport_from_sample(sample)
             removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
                 session_id=session_id
@@ -2131,11 +2342,7 @@ class AgenticSessionShard:
             active_tasks=active_tasks,
             backend_request_ids=backend_request_ids,
             waiters=waiters,
-            session_locks=self._session_locks,
-            session_records=self._session_records,
-            logger=logger,
             stats=stats,
-            active_session_count=len(self._session_records),
         )
         return transport
 
@@ -2158,11 +2365,7 @@ class AgenticSessionShard:
             active_tasks=active_tasks,
             backend_request_ids=backend_request_ids,
             waiters=waiters,
-            session_locks=self._session_locks,
-            session_records=self._session_records,
-            logger=logger,
             stats=stats,
-            active_session_count=len(self._session_records),
         )
 
 
@@ -2462,22 +2665,23 @@ class AgenticChatAPIService:
                 },
                 status_code=499,
             )
+        except ValueError as exc:
+            return _openai_error_response(
+                _openai_error_result(
+                    f"Invalid request body: {exc}",
+                    param="body",
+                    status_code=400,
+                    error_type="invalid_request_error",
+                )
+            )
         request_json_done_at = time.time()
         try:
             if not isinstance(payload, dict):
-                raise HTTPException(status_code=400, detail="request body must be a JSON object")
+                raise AgenticChatRequestError("request body must be a JSON object", param="body")
             request_payload = _normalized_chat_request(payload)
             session_id = _session_id_from_request(request=request)
-        except HTTPException as exc:
-            error_type = "authentication_error" if int(exc.status_code) == 401 else "invalid_request_error"
-            return _openai_error_response(
-                _openai_error_result(
-                    str(exc.detail),
-                    code=error_type,
-                    status_code=int(exc.status_code),
-                    error_type=error_type,
-                )
-            )
+        except AgenticChatRequestError as exc:
+            return _openai_error_response(_openai_error_from_exc(exc))
         request_ready_at = time.time()
         shard_dispatch_at = time.time()
         try:

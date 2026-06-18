@@ -106,15 +106,23 @@ def _forest_with_initial_obs(
     return forest, initial_obs
 
 
-def _make_chat_test_shard(*, session_sampling_params: dict | None = None):
+def _make_chat_test_shard(
+    *,
+    session_sampling_params: dict | None = None,
+):
     shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
     shard = object.__new__(shard_cls)
     shard.args = SimpleNamespace(
         partial_rollout=True,
         partial_rollout_max_aborted_count=2,
         fully_async=False,
+        agentic_reasoning_parser=None,
+        agentic_tool_call_parser=None,
         rollout_max_response_len=8,
         rollout_max_context_len=64,
+        rollout_skip_special_tokens=False,
+        sglang_enable_deterministic_inference=False,
+        rollout_seed=1,
     )
     shard.backend = SimpleNamespace(tokenizer=_FakeTokenizer())
     shard._session_records = {}
@@ -123,7 +131,6 @@ def _make_chat_test_shard(*, session_sampling_params: dict | None = None):
     shard._terminal_ir_gate_closed = False
     shard._sglang_request_semaphore = None
     shard._sglang_request_limiter = None
-    shard._worker_urls = lambda: asyncio.sleep(0, result=["http://worker-a"])
     forest, initial_obs = _forest_with_initial_obs(
         session_id="sess-chat",
         messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
@@ -148,9 +155,6 @@ def _make_chat_test_shard(*, session_sampling_params: dict | None = None):
         pending_chat_waiters={},
         gate_reason=None,
         protected_until_finalize=False,
-        chat_service_remote_return_at=None,
-        chat_service_response_ready_at=None,
-        chat_service_http_return_at=None,
     )
     shard._session_records["sess-chat"] = record
     shard._session_locks["sess-chat"] = asyncio.Lock()
@@ -244,18 +248,22 @@ def test_session_forest_build_sample_and_request_envelope() -> None:
         train_metadata={"loss": "grpo"},
         metadata={"seed_stage": "bootstrap"},
     )
-    leaf = forest.append_resp(
-        parent_state_hash=initial_obs.state_hash,
-        rollout_id=11,
-        abort_count=0,
-        messages_delta=[{"role": "assistant", "content": [{"type": "text", "text": "ok"}]}],
-        train_token_delta=_chars("ok"),
-        rollout_token_delta=_chars("ok"),
-        logprob_delta=[-0.1, -0.2],
-        status="completed",
-        reward={"score": 0.5},
-        export_metadata_patch={"request_id": "req-build", "base_state_hash": initial_obs.state_hash},
-    )
+    response_kwargs = {
+        "parent_state_hash": initial_obs.state_hash,
+        "rollout_id": 11,
+        "abort_count": 0,
+        "messages_delta": [{"role": "assistant", "content": [{"type": "text", "text": "ok"}]}],
+        "train_token_delta": _chars("ok"),
+        "rollout_token_delta": _chars("ok"),
+        "logprob_delta": [-0.1, -0.2],
+        "status": "completed",
+        "reward": {"score": 0.5},
+        "export_metadata_patch": {"request_id": "req-build", "base_state_hash": initial_obs.state_hash},
+    }
+    leaf = forest.append_resp(**response_kwargs)
+    duplicate_leaf = forest.append_resp(**response_kwargs)
+    assert duplicate_leaf.state_hash == leaf.state_hash
+    assert forest.export_leaf_hashes() == [leaf.state_hash]
     sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
     assert (sample.prompt, sample.response, sample.group_index, sample.index) == ("hello", "ok", 3, 7)
     assert sample.train_metadata == {"loss": "grpo"}
@@ -429,7 +437,7 @@ def test_admission_quota_prepare_isolation_and_resident_tail_carry() -> None:
     snapshot = dict(pipeline.transfer_domain.accounting_snapshot())
     _set_runtime_resident_groups(pipeline, 16)
     step_handle = _AgenticStepHandle(rollout_id=1, required_group_count=32, terminal_step=False)
-    assert pipeline._finish_eligible(step_handle) is True
+    assert pipeline._close_status(step_handle) is None
     assert pipeline._current_window_admission_counts(
         resident_group_count=pipeline.resident_group_count, transfer_snapshot=snapshot
     )[1:] == (16, 48, 0)
@@ -469,8 +477,8 @@ def test_finish_eligibility_interrupted_current_policy(
     pipeline.transfer_domain.configure_transfer_quota(previous_partition_quota=0, current_partition_quota=2)
     pipeline.runtime_domain.interrupted_current_groups = interrupted_current
     step_handle = _AgenticStepHandle(rollout_id=3, required_group_count=2, terminal_step=terminal_step)
-    assert pipeline._finish_eligible(step_handle) is expected_finish
     assert pipeline._close_status(step_handle) == status
+    assert (status is None) is expected_finish
 
 
 def test_transfer_fifo_routes_slots_by_arrival_ignoring_metadata(monkeypatch) -> None:

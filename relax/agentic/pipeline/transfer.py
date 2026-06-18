@@ -79,15 +79,20 @@ class TransferDomain:
         self.rollout_batch_size = args.rollout_batch_size
         self.over_sampling_batch_size = args.over_sampling_batch_size
         self.n_samples_per_prompt = args.n_samples_per_prompt
-        self.transfer_batch_group_count = self._compute_transfer_batch_group_count(args)
+        self.transfer_batch_group_count = (
+            args.rollout_batch_size
+            if args.colocate
+            else args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
+        )
         self._transfer_buffer: deque[list] = deque()
         self._transfer_tasks: list[asyncio.Task] = []
+        self._reset_step_partition_state()
+
+    def _reset_step_partition_state(self) -> None:
         self._step_output_groups: list[list] = []
         self._previous_partition_quota = 0
         self._current_partition_quota = self.rollout_batch_size
         self._output_window_closed = False
-        if self._current_partition_quota < 0:
-            raise RuntimeError(f"rollout_batch_size must be non-negative, got {self._current_partition_quota}.")
         self._committed_previous_group_count = 0
         self._committed_current_group_count = 0
         self._dispatched_previous_group_count = 0
@@ -98,34 +103,29 @@ class TransferDomain:
         *,
         rollout_id: int,
     ) -> None:
+        self._reap_completed_transfer_tasks()
+        if self._transfer_buffer or self._transfer_tasks:
+            raise RuntimeError(
+                "TransferDomain cannot rebind step with pending transfer state: "
+                f"rollout_id={self.rollout_id}, next_rollout_id={rollout_id}, "
+                f"buffer_groups={len(self._transfer_buffer)}, pending_tasks={len(self._transfer_tasks)}."
+            )
         self.rollout_id = rollout_id
-        self._step_output_groups = []
-        self._previous_partition_quota = 0
-        self._current_partition_quota = self.rollout_batch_size
-        self._output_window_closed = False
-        if self._current_partition_quota < 0:
-            raise RuntimeError(f"rollout_batch_size must be non-negative, got {self._current_partition_quota}.")
-        self._committed_previous_group_count = 0
-        self._committed_current_group_count = 0
-        self._dispatched_previous_group_count = 0
-        self._dispatched_current_group_count = 0
-
-    @staticmethod
-    def _compute_transfer_batch_group_count(args) -> int:
-        if args.fully_async:
-            return args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
-        return args.rollout_batch_size
+        self._reset_step_partition_state()
 
     def _reap_completed_transfer_tasks(self) -> None:
         if not self._transfer_tasks:
             return
+        completed_tasks: list[asyncio.Task] = []
         pending_tasks: list[asyncio.Task] = []
         for task in self._transfer_tasks:
             if task.done():
-                task.result()
+                completed_tasks.append(task)
             else:
                 pending_tasks.append(task)
         self._transfer_tasks = pending_tasks
+        for task in completed_tasks:
+            task.result()
 
     def _buffer_transfer_group(self, group) -> None:
         buffered_at = time.time()
@@ -202,11 +202,6 @@ class TransferDomain:
             spawned_group_count += spawned
         return spawned_group_count
 
-    def _enqueue_transfer_groups(self, groups: list[list]) -> None:
-        for group in groups:
-            self._buffer_transfer_group(group)
-        self._spawn_ready_transfers()
-
     def configure_transfer_quota(
         self,
         *,
@@ -214,11 +209,7 @@ class TransferDomain:
         current_partition_quota: int,
     ) -> None:
         self._previous_partition_quota = previous_partition_quota
-        if self._previous_partition_quota < 0:
-            raise RuntimeError(f"previous_partition_quota must be non-negative, got {self._previous_partition_quota}.")
         self._current_partition_quota = current_partition_quota
-        if self._current_partition_quota < 0:
-            raise RuntimeError(f"current_partition_quota must be non-negative, got {self._current_partition_quota}.")
 
     def close_output_window(self) -> None:
         if self.ready_group_buffer:
@@ -249,6 +240,8 @@ class TransferDomain:
         return {
             "group_size": group_size,
             "ready_groups": len(self.ready_group_buffer),
+            "transfer_buffer_groups": len(self._transfer_buffer),
+            "transfer_tasks": len(self._transfer_tasks),
             "committed_previous_groups": self._committed_previous_group_count,
             "committed_current_groups": self._committed_current_group_count,
             "previous_partition_quota": self._previous_partition_quota,
@@ -277,7 +270,21 @@ class TransferDomain:
         self.ready_group_buffer.clear()
         return dropped_count
 
-    async def _release_ready_groups(self) -> tuple[list[list], int]:
+    async def discard_pending_transfers(self) -> tuple[int, int]:
+        dropped_buffer_groups = len(self._transfer_buffer)
+        self._transfer_buffer.clear()
+        tasks = list(self._transfer_tasks)
+        self._transfer_tasks.clear()
+        cancelled_tasks = 0
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+                cancelled_tasks += 1
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return dropped_buffer_groups, cancelled_tasks
+
+    async def drain_ready_group_payloads(self) -> tuple[list[list], int]:
         if self._output_window_closed or not self.ready_group_buffer:
             return [], 0
         released_groups: list[list] = []
@@ -308,27 +315,30 @@ class TransferDomain:
         self._step_output_groups.extend(released_groups)
         self._committed_previous_group_count = next_previous_count
         self._committed_current_group_count = next_current_count
-        self._enqueue_transfer_groups(released_groups)
+        for group in released_groups:
+            self._buffer_transfer_group(group)
+        self._spawn_ready_transfers()
         return released_groups, len(released_groups)
 
-    async def drain_ready_group_payloads(self) -> tuple[list[list], int]:
-        return await self._release_ready_groups()
-
-    async def build_output(
-        self,
-        *,
-        extra_metrics: dict[str, int] | None = None,
-    ):
+    async def build_output(self):
         export_groups = list(self._step_output_groups)
-        metrics = dict(extra_metrics or {})
         return RolloutFnTrainOutput(
             samples=export_groups,
-            metrics=metrics,
+            metrics={},
         )
 
     async def wait_for_pending_transfers(self) -> None:
         while self._transfer_buffer:
-            self._spawn_transfer(force=True)
+            spawned = self._spawn_transfer(force=True)
+            if spawned <= 0:
+                raise RuntimeError(
+                    "TransferDomain cannot drain transfer buffer without dispatch progress: "
+                    f"rollout_id={self.rollout_id}, buffer_groups={len(self._transfer_buffer)}, "
+                    f"committed_previous={self._committed_previous_group_count}, "
+                    f"dispatched_previous={self._dispatched_previous_group_count}, "
+                    f"committed_current={self._committed_current_group_count}, "
+                    f"dispatched_current={self._dispatched_current_group_count}."
+                )
         self._reap_completed_transfer_tasks()
         if not self._transfer_tasks:
             return

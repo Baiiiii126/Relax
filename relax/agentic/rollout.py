@@ -14,10 +14,8 @@ import numpy as np
 from tqdm import tqdm
 
 from relax.agentic import format_agentic_event
-from relax.agentic.pipeline import GroupKey
 from relax.agentic.pipeline.runtime import (
     RuntimeDomain,
-    agentic_prepare_pool_target_from_args,
     get_agentic_runtime_resources,
 )
 from relax.agentic.profile import TRACE_KEY
@@ -145,11 +143,8 @@ class RolloutProgress:
         )
         self._set_bar_postfix(refresh=True)
 
-    def _postfix_str(self) -> str:
-        return f"scored={self._scored_samples}"
-
     def _set_bar_postfix(self, *, refresh: bool) -> None:
-        self._bar.set_postfix_str(self._postfix_str(), refresh=refresh)
+        self._bar.set_postfix_str(f"scored={self._scored_samples}", refresh=refresh)
 
     def update_counts(
         self,
@@ -168,10 +163,6 @@ class RolloutProgress:
                 "RolloutProgress committed session count regressed: "
                 f"{committed_sessions} < {self._committed_sessions}."
             )
-        if scored_samples < self._scored_samples:
-            raise RuntimeError(
-                f"RolloutProgress scored sample count regressed: {scored_samples} < {self._scored_samples}."
-            )
         if (
             materialized_sessions == self._materialized_sessions
             and committed_sessions == self._committed_sessions
@@ -188,8 +179,6 @@ class RolloutProgress:
         self._set_bar_postfix(refresh=True)
 
     def update_total_sessions(self, total_sessions: int) -> None:
-        if total_sessions < 0:
-            raise RuntimeError(f"RolloutProgress total session count must be non-negative, got {total_sessions}.")
         if total_sessions == self.total_sessions:
             return
         self.total_sessions = total_sessions
@@ -375,10 +364,7 @@ class AgenticResidentPipeline:
                 progressed = True
         discarded_group_keys = runtime_domain.drain_discarded_group_keys()
         if discarded_group_keys:
-            await self._discard_terminal_runtime_groups(
-                reward_domain=reward_domain,
-                discarded_group_keys=discarded_group_keys,
-            )
+            await reward_domain.drop_waiting_groups_by_key(discarded_group_keys)
             progressed = True
         runtime_dispatch = runtime_domain.drain_ready_execution()
         if runtime_dispatch.materialized_batches:
@@ -389,18 +375,6 @@ class AgenticResidentPipeline:
             await reward_domain.ingest_groups([group])
             progressed = True
         return progressed
-
-    async def _discard_terminal_runtime_groups(
-        self,
-        *,
-        reward_domain: RewardDomain,
-        discarded_group_keys: set[GroupKey],
-    ) -> int:
-        discarded_group_count = len(discarded_group_keys)
-        if discarded_group_count == 0:
-            return 0
-        await reward_domain.drop_waiting_groups_by_key(discarded_group_keys)
-        return discarded_group_count
 
     async def _pump_reward_to_transfer_once(self) -> bool:
         reward_domain = self.reward_domain
@@ -534,7 +508,7 @@ class AgenticResidentPipeline:
         data_source,
         data_system_client,
     ) -> None:
-        pool_target_group_count = agentic_prepare_pool_target_from_args(args)
+        pool_target_group_count = args.agentic_prepare_pool_size or args.over_sampling_batch_size
         async with self._dataflow_lock():
             prepare_domain = self.prepare_domain
             if prepare_domain is None:
@@ -545,10 +519,10 @@ class AgenticResidentPipeline:
                     pool_target_group_count=pool_target_group_count,
                 )
                 self.prepare_domain = prepare_domain
-            elif prepare_domain.configured_pool_target_group_count != pool_target_group_count:
+            elif prepare_domain.pool_target_group_count != pool_target_group_count:
                 raise RuntimeError(
                     "PrepareDomain configuration changed after initialization: "
-                    f"pool_target_group_count {prepare_domain.configured_pool_target_group_count} "
+                    f"pool_target_group_count {prepare_domain.pool_target_group_count} "
                     f"-> {pool_target_group_count}."
                 )
             runtime_domain = self.runtime_domain
@@ -585,8 +559,6 @@ class AgenticResidentPipeline:
         current_partition_quota = args.rollout_batch_size
         num_rollout = getattr(args, "num_rollout", None)
         terminal_step = num_rollout is not None and rollout_id + 1 >= num_rollout
-        prepare_pool_target = agentic_prepare_pool_target_from_args(args)
-        runtime_resources = get_agentic_runtime_resources(args)
         async with self._dataflow_lock():
             prepare_domain = self.prepare_domain
             runtime_domain = self.runtime_domain
@@ -594,11 +566,6 @@ class AgenticResidentPipeline:
             transfer_domain = self.transfer_domain
             if None in (prepare_domain, runtime_domain, reward_domain, transfer_domain):
                 raise RuntimeError("Agentic resident pipeline must be initialized before opening a rollout step.")
-            if prepare_domain.configured_pool_target_group_count != prepare_pool_target:
-                raise RuntimeError(
-                    f"PrepareDomain pool target changed: "
-                    f"{prepare_domain.configured_pool_target_group_count} -> {prepare_pool_target}."
-                )
             runtime_domain.rebind_step(
                 args=args,
                 rollout_id=rollout_id,
@@ -626,11 +593,6 @@ class AgenticResidentPipeline:
                 current_partition_quota=current_partition_quota,
             )
             self.step_admission_closed = False
-            runtime_domain.ensure_session_runner_pool(total_requests=runtime_resources.step_session_capacity())
-            prepare_domain.configure(
-                runtime_driver=runtime_domain,
-                pool_target_group_count=prepare_pool_target,
-            )
             await runtime_domain.release_partial_resume_gate()
             transfer_start_snapshot = transfer_domain.accounting_snapshot()
         progress = RolloutProgress(
@@ -733,9 +695,6 @@ class AgenticResidentPipeline:
             return "committed_target"
         return None
 
-    def _finish_eligible(self, step_handle: "_AgenticStepHandle") -> bool:
-        return self._close_status(step_handle) is None
-
     def _refresh_progress(self, step_handle: "_AgenticStepHandle") -> None:
         progress = step_handle.progress
         if progress is None:
@@ -836,7 +795,7 @@ class AgenticResidentPipeline:
                 await self._refresh_close_accounting()
             self._refresh_progress(step_handle)
             async with self._dataflow_lock():
-                if self._finish_eligible(step_handle):
+                if self._close_status(step_handle) is None:
                     self.step_admission_closed = True
                     self._refresh_progress(step_handle)
                     return
@@ -905,10 +864,6 @@ class AgenticResidentPipeline:
                     return counts
             await self._wait_for_step_event()
 
-    def _drop_completed_surplus_groups_locked(self) -> int:
-        dropped_completed_groups = self.reward_domain.drop_completed_groups()
-        return dropped_completed_groups
-
     async def _seal_step(
         self,
         step_handle: "_AgenticStepHandle",
@@ -944,7 +899,15 @@ class AgenticResidentPipeline:
         async with self._dataflow_lock():
             await self.runtime_domain.drop_resident_results()
             await self.reward_domain.drop_resident_groups()
-            self.transfer_domain.drop_ready_groups()
+            dropped_ready_groups = self.transfer_domain.drop_ready_groups()
+            dropped_transfer_groups, cancelled_transfer_tasks = await self.transfer_domain.discard_pending_transfers()
+            if dropped_ready_groups or dropped_transfer_groups or cancelled_transfer_tasks:
+                logger.info(
+                    "Agentic discarded resident transfer tail: ready_groups=%s transfer_groups=%s transfer_tasks=%s",
+                    dropped_ready_groups,
+                    dropped_transfer_groups,
+                    cancelled_transfer_tasks,
+                )
 
     async def close_step(
         self,
@@ -967,7 +930,7 @@ class AgenticResidentPipeline:
         await self._wait_step_target(step_handle)
         async with self._dataflow_lock():
             self.transfer_domain.close_output_window()
-            output = await self.transfer_domain.build_output(extra_metrics=None)
+            output = await self.transfer_domain.build_output()
             end_snapshot = self.transfer_domain.accounting_snapshot()
             # Record how many groups this step fell short of its current-partition target
             # (rollout_batch_size). The next step backfills exactly this many into its
@@ -978,7 +941,7 @@ class AgenticResidentPipeline:
             committed_groups = self.transfer_domain.committed_transfer_groups_snapshot()
             progress_snapshot = step_handle.progress.snapshot() if step_handle.progress is not None else {}
             get_samples_times = list(self._step_get_samples_times)
-            self._drop_completed_surplus_groups_locked()
+            self.reward_domain.drop_completed_groups()
             self.transfer_domain.release_step_output_payloads()
             if step_handle.progress is not None:
                 step_handle.progress.close()
@@ -1457,9 +1420,15 @@ async def _advance_eval_outputs(
     completed_samples: list[Sample],
     pbar,
     do_print: bool,
-) -> tuple[bool, bool, int]:
+) -> tuple[bool, bool, int, int]:
     progressed = False
     runtime_materialized_group_count = 0
+    runtime_dropped_group_count = 0
+    discarded_group_keys = runtime_domain.drain_discarded_group_keys()
+    if discarded_group_keys:
+        runtime_dropped_group_count = len(discarded_group_keys)
+        await reward_domain.drop_waiting_groups_by_key(discarded_group_keys)
+        progressed = True
     runtime_dispatch = runtime_domain.drain_ready_execution()
     if runtime_dispatch.materialized_batches or runtime_dispatch.ready_groups:
         if runtime_dispatch.materialized_batches and not reward_domain.group_rm:
@@ -1488,7 +1457,7 @@ async def _advance_eval_outputs(
             completed_samples.extend(group)
             pbar.update(len(group))
         progressed = True
-    return progressed, do_print, runtime_materialized_group_count
+    return progressed, do_print, runtime_materialized_group_count, runtime_dropped_group_count
 
 
 async def _run_eval_samples(
@@ -1512,12 +1481,14 @@ async def _run_eval_samples(
         eval_prepare_groups = [[sample] for sample in eval_samples]
     total_group_count = len(eval_prepare_groups)
     eval_group_size = dataset_cfg.n_samples_per_eval_prompt if args.group_rm else 1
-    train_prepare_pool_target_group_count = agentic_prepare_pool_target_from_args(args)
-    train_prepare_pool_target_session_count = train_prepare_pool_target_group_count * args.n_samples_per_prompt
-    eval_prepare_pool_target_group_count = min(
-        total_group_count,
-        (train_prepare_pool_target_session_count + eval_group_size - 1) // eval_group_size,
-    )
+    eval_prepare_pool_target_group_count = args.agentic_eval_prepare_pool_size
+    if eval_prepare_pool_target_group_count is None:
+        train_prepare_pool_target_group_count = args.agentic_prepare_pool_size or args.over_sampling_batch_size
+        train_prepare_pool_target_session_count = train_prepare_pool_target_group_count * args.n_samples_per_prompt
+        eval_prepare_pool_target_group_count = (
+            train_prepare_pool_target_session_count + eval_group_size - 1
+        ) // eval_group_size
+    eval_prepare_pool_target_group_count = min(total_group_count, eval_prepare_pool_target_group_count)
     eval_runtime_admission_group_count = total_group_count
     pbar = tqdm(total=eval_sample_count, desc=f"Eval {dataset_cfg.name}", unit="sample")
     logger.info(
@@ -1564,9 +1535,10 @@ async def _run_eval_samples(
         next_eval_group_idx = 0
         started_group_count = 0
         runtime_materialized_group_count = 0
+        runtime_dropped_group_count = 0
 
         def runtime_resident_group_count() -> int:
-            return started_group_count - runtime_materialized_group_count
+            return started_group_count - runtime_materialized_group_count - runtime_dropped_group_count
 
         async def refresh_eval_ready_groups(*, wait_for_progress: bool) -> int:
             if not prepare_domain.has_warming_groups():
@@ -1602,7 +1574,6 @@ async def _run_eval_samples(
             await prepare_domain.accept_prepare(selected_groups)
             return len(selected_groups)
 
-        prepare_domain.set_pool_target(eval_prepare_pool_target_group_count)
         await fill_prepare_pool()
         while True:
             launched_count = await prepare_domain.launch_pending()
@@ -1626,6 +1597,7 @@ async def _run_eval_samples(
                         _progressed_after_start,
                         do_print,
                         materialized_groups,
+                        dropped_groups,
                     ) = await _advance_eval_outputs(
                         runtime_domain=runtime_domain,
                         reward_domain=reward_domain,
@@ -1634,11 +1606,12 @@ async def _run_eval_samples(
                         do_print=do_print,
                     )
                     runtime_materialized_group_count += materialized_groups
+                    runtime_dropped_group_count += dropped_groups
                     if _progressed_after_start:
                         await fill_prepare_pool()
                     continue
 
-            progressed, do_print, materialized_groups = await _advance_eval_outputs(
+            progressed, do_print, materialized_groups, dropped_groups = await _advance_eval_outputs(
                 runtime_domain=runtime_domain,
                 reward_domain=reward_domain,
                 completed_samples=completed_samples,
@@ -1646,6 +1619,7 @@ async def _run_eval_samples(
                 do_print=do_print,
             )
             runtime_materialized_group_count += materialized_groups
+            runtime_dropped_group_count += dropped_groups
             if progressed:
                 await fill_prepare_pool()
                 continue
@@ -1656,6 +1630,7 @@ async def _run_eval_samples(
                         _progressed_after_wait,
                         do_print,
                         materialized_groups,
+                        dropped_groups,
                     ) = await _advance_eval_outputs(
                         runtime_domain=runtime_domain,
                         reward_domain=reward_domain,
@@ -1664,6 +1639,7 @@ async def _run_eval_samples(
                         do_print=do_print,
                     )
                     runtime_materialized_group_count += materialized_groups
+                    runtime_dropped_group_count += dropped_groups
                     await fill_prepare_pool()
                     continue
             elif reward_domain.has_inflight_work():

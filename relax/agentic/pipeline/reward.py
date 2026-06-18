@@ -129,7 +129,9 @@ class RewardDomain:
             waiting_group = self._waiting_groups.pop(key, None)
             if waiting_group is None:
                 continue
-            cancelled_tasks.extend(self._release_group_sample_reward_cache(waiting_group.materialized_group()))
+            materialized_group = waiting_group.materialized_group()
+            self._drop_scored_progress_for_group(materialized_group)
+            cancelled_tasks.extend(self._release_group_sample_reward_cache(materialized_group))
             dropped_group_keys.add(key)
         await self._drain_cancelled_tasks(cancelled_tasks)
         return len(dropped_group_keys)
@@ -183,8 +185,16 @@ class RewardDomain:
                 task.cancel()
                 cancelled_tasks.append(task)
             self._completed_samples.pop(key, None)
-            self._progress_counted_samples.discard(key)
         return cancelled_tasks
+
+    def _drop_scored_progress_for_group(self, group) -> None:
+        if self.group_rm:
+            return
+        for sample in group:
+            key = sample_key(sample)
+            if key in self._progress_counted_samples:
+                self._progress_counted_samples.remove(key)
+                self._ready_scored_sample_count -= 1
 
     def accept_session_materializations(self, outputs) -> None:
         for batch in outputs:
@@ -300,11 +310,7 @@ class RewardDomain:
 
     def _all_group_rewards_ready(self, group) -> bool:
         for sample in group:
-            rewarded = self._rewarded_sample(sample)
-            if rewarded is not None and rewarded is not sample:
-                sample.reward = copy.deepcopy(getattr(rewarded, "reward", None))
-                if getattr(rewarded, "metadata", None):
-                    sample.metadata.update(copy.deepcopy(rewarded.metadata))
+            self._rewarded_sample(sample)
             if _sample_needs_reward(sample):
                 return False
         return True
@@ -364,6 +370,7 @@ class RewardDomain:
         if self.group_filter is not None and not self.group_filter(group):
             for sample in group:
                 mark_metadata_agentic_event(sample.metadata, "group_finalize_end_at")
+            self._drop_scored_progress_for_group(group)
             self._release_group_sample_reward_cache(group)
             return
         self._ready_dispatches.append(group)
@@ -406,15 +413,11 @@ class RewardDomain:
             self._ready_dispatches.appendleft(item)
         return ready_groups
 
-    def _drop_ready_dispatches(self) -> int:
+    def drop_completed_groups(self) -> int:
         dropped_groups = 0
         while self._ready_dispatches:
             self._ready_dispatches.popleft()
             dropped_groups += 1
-        return dropped_groups
-
-    def drop_completed_groups(self) -> int:
-        dropped_groups = self._drop_ready_dispatches()
         for key, completed_group in list(self._completed_group_results.items()):
             self._completed_group_results.pop(key, None)
             self._release_group_sample_reward_cache(completed_group)
@@ -427,7 +430,9 @@ class RewardDomain:
         dropped_groups += len(cancelled_tasks)
         for key, waiting_group in list(self._waiting_groups.items()):
             self._waiting_groups.pop(key, None)
-            cancelled_tasks.extend(self._release_group_sample_reward_cache(waiting_group.materialized_group()))
+            materialized_group = waiting_group.materialized_group()
+            self._drop_scored_progress_for_group(materialized_group)
+            cancelled_tasks.extend(self._release_group_sample_reward_cache(materialized_group))
             dropped_groups += 1
         await self._drain_cancelled_tasks(cancelled_tasks)
         return dropped_groups

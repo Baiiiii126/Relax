@@ -72,7 +72,6 @@ class RuntimeSlotState(str, Enum):
     RUNNING_APP = "running_app"
     MATERIALIZING = "materializing"
     MATERIALIZED = "materialized"
-    DISCARDED = "discarded"
 
 
 @dataclass
@@ -139,7 +138,6 @@ class _MaterializationDrop:
 
 
 RewardValue = float | dict[str, Any] | None
-_RESERVED_AGENT_ENV_PREFIXES = ("RELAX_",)
 
 
 class AgentExecutionError(RuntimeError):
@@ -194,34 +192,17 @@ class ManagedSessionHandle:
 
 
 def _parse_agent_env_items(raw_items: Any) -> dict[str, str]:
-    if raw_items is None or raw_items == "":
-        return {}
-    if not isinstance(raw_items, list) or not all(isinstance(item, str) for item in raw_items):
-        raise TypeError("--agent-env must be provided as a list of KEY=VALUE strings.")
     parsed_env: dict[str, str] = {}
     for item in raw_items:
-        if "=" not in item:
-            raise ValueError(f"--agent-env entry must be KEY=VALUE, got {item!r}.")
         key, value = item.split("=", 1)
-        key = key.strip()
-        if not key:
-            raise ValueError(f"--agent-env entry must include a non-empty key, got {item!r}.")
-        if any(key.startswith(prefix) for prefix in _RESERVED_AGENT_ENV_PREFIXES):
-            raise ValueError(f"--agent-env does not allow reserved key {key!r}.")
-        parsed_env[key] = value
+        parsed_env[key.strip()] = value
     return parsed_env
 
 
 def load_agent_app_spec_from_args(args: Any) -> ManagedCommandAppSpec:
     command = args.agent_command
-    if not isinstance(command, str) or not command.strip():
-        raise RuntimeError("--agent-command is required for the agentic runtime.")
     cwd = args.agent_cwd
-    if not isinstance(cwd, str) or not cwd.strip():
-        raise RuntimeError("--agent-cwd is required for the agentic runtime.")
     cwd_path = Path(cwd).expanduser()
-    if not cwd_path.is_dir():
-        raise RuntimeError(f"--agent-cwd must point to an existing directory, got {cwd!r}.")
     agent_env = _parse_agent_env_items(args.agent_env)
     return ManagedCommandAppSpec(
         command=command.strip(),
@@ -722,8 +703,7 @@ class ManagedSessionRunner:
             if requested_handles is not None and session_handle not in requested_handles:
                 retained.append(session_handle)
                 continue
-            if task is not None and task.done():
-                ready.append(session_handle)
+            ready.append(session_handle)
         if retained:
             retained.extend(self._completed_session_handles)
             self._completed_session_handles = retained
@@ -811,10 +791,6 @@ class ManagedSessionRunner:
             "waiting_launch_samples": waiting_launch_samples,
             "recent_completed_session_samples": list(self._recent_completed_session_ids)[-sample_limit:],
         }
-
-    async def warm_up(self) -> bool:
-        await self._launcher_client.ping()
-        return True
 
     async def shutdown(self) -> bool:
         self._shutdown_requested = True
@@ -1055,15 +1031,6 @@ class ManagedSessionRunnerPool:
                 f"released={released_count}, active={self._active_session_count}."
             )
 
-    def warm_up(self) -> list[Any]:
-        refs = []
-        for handle in self._handles:
-            try:
-                refs.append(handle.warm_up.remote())
-            except Exception:
-                continue
-        return refs
-
     def shutdown(self) -> None:
         shutdown_refs = []
         for handle in self._handles:
@@ -1143,11 +1110,26 @@ def _sample_metadata(sample: Sample) -> dict[str, Any]:
 
 
 def _normalize_prompt(prompt: Any) -> list[dict[str, Any]]:
+    if prompt is None or (isinstance(prompt, (dict, list)) and not prompt):
+        return []
     if isinstance(prompt, str):
+        if not prompt.strip():
+            return []
         return check_messages([{"role": "user", "content": prompt}])
     if isinstance(prompt, dict):
-        prompt = [prompt]
-    return check_messages(prompt or [])
+        messages = [prompt]
+    elif isinstance(prompt, list):
+        messages = prompt
+    else:
+        raise TypeError(f"prompt must be a string, dict, list, or None, got {type(prompt)}")
+    if len(messages) == 1 and isinstance(messages[0], dict):
+        message = messages[0]
+        content = message.get("content")
+        if message.get("role") == "user" and (
+            content in (None, []) or (isinstance(content, str) and not content.strip())
+        ):
+            return []
+    return check_messages(messages)
 
 
 def _transport_image_payload(payload: Any) -> str:
@@ -1200,8 +1182,6 @@ def _sample_messages(sample: Sample) -> list[dict[str, Any]]:
 def _request_envelope_from_sample(
     sample: Sample,
     *,
-    session_id: str | None = None,
-    request_id: str | None = None,
     rollout_id: int | None = None,
     sampling_params: dict[str, Any] | None = None,
     shared_messages: list[dict[str, Any]] | None = None,
@@ -1210,7 +1190,6 @@ def _request_envelope_from_sample(
     metadata = _sample_metadata(sample)
     if rollout_id is not None and sample.group_index is None:
         raise ValueError("sample.group_index is required for rollout-managed request envelopes")
-    effective_session_id = session_id if isinstance(session_id, str) and session_id else sample.session_id
     messages: list[dict[str, Any]] = []
     input_payload: dict[str, Any] = {}
     if include_input_payload:
@@ -1218,17 +1197,13 @@ def _request_envelope_from_sample(
         input_payload["messages"] = messages
         if metadata:
             input_payload["metadata"] = metadata
-    effective_sampling_params = sampling_params
-    if effective_sampling_params is None:
-        sample_sampling_params = getattr(sample, "sampling_params", None)
-        if isinstance(sample_sampling_params, dict):
-            effective_sampling_params = sample_sampling_params
+    if sampling_params is None:
+        sampling_params = getattr(sample, "sampling_params", None)
     return RequestEnvelope(
         metadata=metadata,
         input_payload=input_payload,
-        sampling_params=copy.deepcopy(effective_sampling_params) if effective_sampling_params is not None else None,
-        session_id=effective_session_id,
-        request_id=request_id,
+        sampling_params=copy.deepcopy(sampling_params) if sampling_params is not None else None,
+        session_id=sample.session_id,
         rollout_id=rollout_id,
         seed=SampleSeedInfo(
             group_index=sample.group_index,
@@ -1456,8 +1431,7 @@ class RuntimeDomain:
         self._rollout_mode = "train"
         self._runtime_resources = get_agentic_runtime_resources(args)
         self._session_runner_pool_lock = threading.Lock()
-        self._session_runner_pool_warm_task: asyncio.Task[Any] | None = None
-        self._session_runner_pool_total_requests = self._runtime_resources.step_session_capacity()
+        self._session_runner_pool_total_requests = self._runtime_resources.target_session_count
 
         self._session_runner_pool: ManagedSessionRunnerPool | None = None
         self._service_client = None
@@ -1466,9 +1440,9 @@ class RuntimeDomain:
             try:
                 create_agentic_service_client()
             except Exception:
-                logger.debug("Agentic service handles are not ready for warm-init yet.", exc_info=True)
+                logger.debug("Agentic service handles are not ready yet.", exc_info=True)
             self._service_client = _AGENTIC_SERVICE_CLIENT
-            self._prewarm_session_runner_pool(total_requests=self._session_runner_pool_total_requests)
+            self.ensure_session_runner_pool(total_requests=self._session_runner_pool_total_requests)
 
     def rebind_step(
         self,
@@ -1483,7 +1457,7 @@ class RuntimeDomain:
         self._runtime_resources = get_agentic_runtime_resources(args)
         self._session_runner_pool_total_requests = max(
             self._session_runner_pool_total_requests,
-            self._runtime_resources.step_session_capacity(),
+            self._runtime_resources.target_session_count,
         )
         self._interrupted_close_accounting_last_refresh_at = 0.0
 
@@ -2012,28 +1986,6 @@ class RuntimeDomain:
                 self._session_runner_pool_total_requests = target_total_requests
         return runner_pool
 
-    def _prewarm_session_runner_pool(self, *, total_requests: int) -> None:
-        if not ray.is_initialized():
-            return
-        runner_pool = self.ensure_session_runner_pool(total_requests=total_requests)
-        warm_refs = runner_pool.warm_up()
-        if not warm_refs:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        if self._session_runner_pool_warm_task is not None and not self._session_runner_pool_warm_task.done():
-            return
-
-        async def _wait_warm_refs() -> None:
-            warm_results = await asyncio.gather(*warm_refs, return_exceptions=True)
-            for result in warm_results:
-                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-                    raise RuntimeError("Managed session runner pool warmup failed") from result
-
-        self._session_runner_pool_warm_task = loop.create_task(_wait_warm_refs())
-
     def _ensure_service_client(self):
         if self._service_client is None:
             self._service_client = create_agentic_service_client()
@@ -2392,9 +2344,6 @@ class RuntimeDomain:
         materialized_session_count = self._ready_materialized_session_count
         self._ready_materialized_session_count = 0
         self._drained_materialized_session_count_total += materialized_session_count
-        return self.drain_ready_dispatch()
-
-    def drain_ready_dispatch(self) -> ExecutionDispatch:
         materialized_batches = list(self._ready_materialized_batches)
         self._ready_materialized_batches.clear()
         ready_groups = list(self._ready_materialized_groups)
@@ -2480,16 +2429,12 @@ class RuntimeDomain:
             "started_sessions": started_sessions,
         }
 
-    @staticmethod
-    def _leased_group_states_from_input(batch_input: ExecutionBatchInput) -> list[PrepareGroupState]:
-        return list(batch_input.leased_group_states)
-
     @classmethod
     def _leased_request_views(
         cls, batch_input: ExecutionBatchInput
     ) -> list[tuple[PrepareGroupState, PrepareRequestHandle, RequestEnvelope, Sample]]:
         views: list[tuple[PrepareGroupState, PrepareRequestHandle, RequestEnvelope, Sample]] = []
-        for group_state in cls._leased_group_states_from_input(batch_input):
+        for group_state in batch_input.leased_group_states:
             for handle in group_state.request_handles:
                 slot_idx = handle.slot_idx
                 try:
@@ -2502,26 +2447,10 @@ class RuntimeDomain:
                 views.append((group_state, handle, envelope, seed_sample))
         return views
 
-    @classmethod
-    def _refresh_batch_debug_from_input(cls, batch_input: ExecutionBatchInput, batch_debug: dict[str, Any]) -> None:
-        leased_request_views = cls._leased_request_views(batch_input)
-        batch_debug["leased_group_ids"] = list(batch_input.leased_group_ids)
-        batch_debug["leased_group_count"] = len(batch_input.leased_group_ids)
-        batch_debug["request_handle_count"] = len(leased_request_views)
-        batch_debug["request_id_samples"] = [envelope.request_id for _, _, envelope, _ in leased_request_views[:8]]
-        batch_debug["session_request_samples"] = [
-            (
-                envelope.session_id,
-                envelope.request_id,
-            )
-            for _, _, envelope, _ in leased_request_views[:8]
-        ]
-
     async def start_batch(
         self,
         *,
         batch_input: ExecutionBatchInput,
-        retire_leased_groups_cb: Callable[[list[str]], None] | None = None,
     ) -> int:
         leased_group_count = len(batch_input.leased_group_states)
         if leased_group_count <= 0:
@@ -2547,8 +2476,6 @@ class RuntimeDomain:
             )
         managed_session_handles = self._admit_runtime_slots(batch_input)
         await self._set_managed_session_timeouts_active(managed_session_handles, active=True)
-        if retire_leased_groups_cb is not None and batch_input.leased_group_ids:
-            retire_leased_groups_cb(list(batch_input.leased_group_ids))
         logger.info(
             "Agentic step admission rollout=%s leased_groups=%s activated_sessions=%s started_sessions=%s resident_slots=%s",
             batch_input.rollout_id,
@@ -2846,14 +2773,6 @@ class RuntimeDomain:
                 "Discarded registered agentic sessions during runtime shutdown count=%s",
                 discarded_sessions,
             )
-        if self._session_runner_pool_warm_task is not None:
-            warm_task = self._session_runner_pool_warm_task
-            warm_task.cancel()
-            self._session_runner_pool_warm_task = None
-            try:
-                await warm_task
-            except asyncio.CancelledError:
-                pass
         if self._service_client is not None:
             await self._service_client.aclose()
             self._service_client = None
@@ -3045,12 +2964,6 @@ class RuntimeDomainResources:
     compiler: AgenticCompilerResources
     target_session_count: int
 
-    def step_session_capacity(self) -> int:
-        return self.target_session_count
-
-    def materialization_cap(self, *, total_requests: int) -> int:
-        return min(total_requests, self.compiler.cpu_executor._max_workers)
-
     def session_runner_pool_size(self, *, total_requests: int) -> int:
         launch_limit = max(self.target_session_count, total_requests)
         if launch_limit <= 0 or total_requests <= 0:
@@ -3114,24 +3027,9 @@ def clear_agentic_runtime_caches() -> None:
     logger.info("Agentic runtime caches cleared.")
 
 
-def agentic_prepare_pool_target_from_args(args: Any) -> int:
-    oversample_group_count = args.over_sampling_batch_size
-    configured_pool_size = args.agentic_prepare_pool_size
-    default_pool_target = oversample_group_count
-    prepare_pool_target_groups = (
-        configured_pool_size if configured_pool_size not in {None, ""} else default_pool_target
-    )
-    if prepare_pool_target_groups < oversample_group_count:
-        raise RuntimeError(
-            f"agentic_prepare_pool_size ({prepare_pool_target_groups}) must be >= "
-            f"over_sampling_batch_size ({oversample_group_count}); pool must hold at least one sampling batch"
-        )
-    return prepare_pool_target_groups
-
-
 def agentic_target_session_count_from_args(args: Any) -> int:
     oversample_group_count = args.over_sampling_batch_size
-    prepare_pool_target_groups = agentic_prepare_pool_target_from_args(args)
+    prepare_pool_target_groups = args.agentic_prepare_pool_size or oversample_group_count
     tail_carry_group_count = args.rollout_batch_size if getattr(args, "fully_async", False) else 0
     sessions_per_group = args.n_samples_per_prompt
     return (tail_carry_group_count + oversample_group_count + prepare_pool_target_groups) * sessions_per_group

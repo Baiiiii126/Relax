@@ -1204,9 +1204,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=[],
                 help=(
                     "Extra environment variables for the managed-command agent process, formatted as KEY=VALUE. "
-                    "Examples: --agent-env FOO=bar ; --agent-env FOO=bar BAZ=qux ; "
+                    "Examples: --agent-env FOO=bar; --agent-env FOO=bar BAZ=qux; "
                     "--agent-env 'FOO=value with spaces' BAZ=qux."
                 ),
+            )
+            parser.add_argument(
+                "--agentic-tool-call-parser",
+                type=str,
+                default=None,
+                help=("SGLang tool-call parser for agentic rollout. Runs only when tools are present."),
+            )
+            parser.add_argument(
+                "--agentic-reasoning-parser",
+                type=str,
+                default=None,
+                help="SGLang reasoning parser for agentic rollout.",
             )
             parser.add_argument(
                 "--agentic-prepare-pool-size",
@@ -1215,6 +1227,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Target size of the agentic prepare pool in groups. "
                     "If unset, defaults to over_sampling_batch_size."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-eval-prepare-pool-size",
+                type=int,
+                default=None,
+                help=(
+                    "Target size of the agentic eval prepare pool in groups. "
+                    "If unset, derives from the train prepare pool session budget."
                 ),
             )
             return parser
@@ -2355,6 +2376,36 @@ def _normalize_sft_max_in_flight_steps(args, is_sft: bool) -> None:
     args.max_staleness = sft_max_in_flight_steps - 1
 
 
+def _validate_agentic_rollout_args(args) -> None:
+    if not args.use_agentic_rollout:
+        return
+    args.rollout_function_path = "relax.agentic.rollout.generate_rollout"
+    args.eval_function_path = "relax.agentic.rollout.generate_rollout"
+    args.apply_chat_template = False
+    if not isinstance(args.agent_command, str) or not args.agent_command.strip():
+        raise ValueError("--agent-command is required when --use-agentic-rollout is set.")
+    if not isinstance(args.agent_cwd, str) or not args.agent_cwd.strip():
+        raise ValueError("--agent-cwd is required when --use-agentic-rollout is set.")
+    if not os.path.isdir(os.path.expanduser(args.agent_cwd)):
+        raise ValueError(f"--agent-cwd must point to an existing directory, got {args.agent_cwd!r}.")
+    if args.agent_timeout <= 0:
+        raise ValueError("--agent-timeout must be > 0.")
+    if not isinstance(args.agent_env, list) or not all(isinstance(item, str) for item in args.agent_env):
+        raise TypeError("--agent-env must be provided as a list of KEY=VALUE strings.")
+    for item in args.agent_env:
+        if "=" not in item:
+            raise ValueError(f"--agent-env entry must be KEY=VALUE, got {item!r}.")
+        key = item.split("=", 1)[0].strip()
+        if not key:
+            raise ValueError(f"--agent-env entry must include a non-empty key, got {item!r}.")
+        if key.startswith("RELAX_"):
+            raise ValueError(f"--agent-env does not allow reserved key {key!r}.")
+    if args.agentic_prepare_pool_size is not None and args.agentic_prepare_pool_size <= 0:
+        raise ValueError("--agentic-prepare-pool-size must be > 0.")
+    if args.agentic_eval_prepare_pool_size is not None and args.agentic_eval_prepare_pool_size <= 0:
+        raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -2393,17 +2444,7 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
     _normalize_sft_max_in_flight_steps(args, is_sft)
-
-    if getattr(args, "use_agentic_rollout", False):
-        args.rollout_function_path = "relax.agentic.rollout.generate_rollout"
-        args.eval_function_path = "relax.agentic.rollout.generate_rollout"
-        args.apply_chat_template = False
-        if not isinstance(getattr(args, "agent_command", None), str) or not args.agent_command.strip():
-            raise ValueError("--agent-command is required when --use-agentic-rollout is set.")
-        if not isinstance(getattr(args, "agent_cwd", None), str) or not args.agent_cwd.strip():
-            raise ValueError("--agent-cwd is required when --use-agentic-rollout is set.")
-        if args.agent_timeout <= 0:
-            raise ValueError("--agent-timeout must be > 0.")
+    _validate_agentic_rollout_args(args)
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(

@@ -63,6 +63,17 @@ Agentic rollout 分为四个 resident domain：
 
 可以通过 `--agent-env "FOO=bar" "BAZ=qux"` 向 agent process 传入额外环境变量。`RELAX_` 前缀由训练框架保留。
 
+tool-call parser 要和 agent app 使用的模型、chat template 或 prompt 里的 tool-call 格式一致。
+
+如果 agent app 会使用 OpenAI-style assistant `tool_calls` 或 `reasoning_content`，Relax 可以用 SGLang parser 处理 assistant 文本：
+
+```bash
+--agentic-reasoning-parser qwen3
+--agentic-tool-call-parser qwen3_coder
+```
+
+reasoning parser 作用于 assistant 文本。tool-call parser 只会在请求里带有 `tools` 时生效。
+
 `--agent-timeout` 控制每个 managed-command agent session 的 active runtime budget，单位是秒。Session 已经 admitted 且 managed process 正在运行时计入预算；session gated 时暂停计时。超时后，Relax 向 managed agent process group 发送 `SIGTERM`，记录 managed-command timeout，并丢弃对应 runtime group。
 
 Relax 在 `--agent-cwd` 下运行 command，并注入这些环境变量：
@@ -143,10 +154,10 @@ Dataset 到 input 的转换关系：
 
 Relax 暴露 `/v1/chat/completions`。Agent 可以使用 OpenAI Python SDK、LiteLLM 或任意 HTTP client。
 
-将 assistant response 追加回 history 时，保持 assistant `content` 为 string：
+将返回的 assistant message 直接追加到 `messages`：
 
 ```python
-messages.append({"role": "assistant", "content": choice.message.content})
+messages.append(response.choices[0].message)
 ```
 
 支持的 request fields：
@@ -176,10 +187,12 @@ Relax 会先将 `chat_template_kwargs` 与 `--apply-chat-template-kwargs` 合并
 | `top_logprobs` | omitted or `null` | 拒绝 |
 | `functions` | omitted, `null`, or `[]` | 拒绝 |
 | `function_call` | omitted, `null`, or `"none"` | 拒绝 |
-| `tool_choice` | omitted, `null`, or `"none"` | 拒绝 |
-| `parallel_tool_calls` | omitted, `null`, or `false` | 拒绝 |
 
-在当前 agentic chat protocol 中，agent 需要从 assistant response 文本中解析 tool call，执行 tool，并把 tool result 追加到 `messages`。**后续会接入 SGLang function calling support**。
+::: warning
+agentic 的文本解析路径不会用 `tool_choice` 或 `parallel_tool_calls` 去约束生成。tool parsing 由 `tools` 加上 `--agentic-tool-call-parser` 决定，reasoning parsing 由 `--agentic-reasoning-parser` 决定。
+:::
+
+在当前 agentic chat protocol 中，SGLang 返回 tokens，Relax 先把 tokens 解码成 assistant 文本，再按需解析 reasoning content 和 tool call，随后把生成出来的 assistant message 追加回 session history。真正执行工具、以及后续的 tool message，仍由 agent app 负责。
 
 对于 `context_length_exceeded` 等上下文错误，agent 可以将 session 标记为 `finish_length` 并正常退出。对于其他 API error，推荐直接 raise exception，让 Relax 按 session lifecycle 执行清理。
 
