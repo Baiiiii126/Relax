@@ -3789,6 +3789,7 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
+    tracking_utils.flush_metrics(args, step)
 
 
 def compute_metrics_from_samples(args, samples):

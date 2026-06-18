@@ -791,6 +791,7 @@ def train(
                     num_per_epoch * num_steps_per_rollout
                 )
             tracking_utils.log(args, log_dict, step_key="train/step")
+            tracking_utils.flush_metrics(args, accumulated_step_id)
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
