@@ -47,6 +47,43 @@ _TRAINING_ARTIFACT_ARRAY_FIELDS: list[tuple[str, Any]] = [
 ]
 
 
+def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> list[dict[str, Any]]:
+    tool_calls = message.get("tool_calls")
+    if tool_calls is None:
+        return []
+    if not isinstance(tool_calls, list):
+        raise TypeError(f"messages[{message_index}].tool_calls must be a list, got {type(tool_calls)}")
+    normalized = []
+    for call_index, tool_call in enumerate(tool_calls):
+        if not isinstance(tool_call, dict):
+            raise TypeError(
+                f"messages[{message_index}].tool_calls[{call_index}] must be a dict, got {type(tool_call)}"
+            )
+        call_id = tool_call.get("id")
+        if call_id is not None and (not isinstance(call_id, str) or not call_id):
+            raise ValueError(f"messages[{message_index}].tool_calls[{call_index}].id must be a non-empty string")
+        function = tool_call.get("function")
+        if function is not None:
+            if not isinstance(function, dict):
+                raise TypeError(
+                    f"messages[{message_index}].tool_calls[{call_index}].function must be a dict, got {type(function)}"
+                )
+            function_name = function.get("name")
+            if function_name is not None and not isinstance(function_name, str):
+                raise TypeError(
+                    f"messages[{message_index}].tool_calls[{call_index}].function.name must be a string, "
+                    f"got {type(function_name)}"
+                )
+            arguments = function.get("arguments")
+            if arguments is not None and not isinstance(arguments, str):
+                raise TypeError(
+                    f"messages[{message_index}].tool_calls[{call_index}].function.arguments must be a string, "
+                    f"got {type(arguments)}"
+                )
+        normalized.append(copy.deepcopy(tool_call))
+    return normalized
+
+
 def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     if messages is None:
         return []
@@ -65,28 +102,56 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
         if role not in _ALLOWED_MESSAGE_ROLES:
             allowed_roles = ", ".join(sorted(_ALLOWED_MESSAGE_ROLES))
             raise ValueError(f"messages[{index}].role must be one of: {allowed_roles}")
+        tool_calls = _normalize_tool_calls(message, message_index=index) if role == "assistant" else []
+        reasoning_content = message.get("reasoning_content")
+        if reasoning_content is not None and not isinstance(reasoning_content, str):
+            raise TypeError(f"messages[{index}].reasoning_content must be a string, got {type(reasoning_content)}")
+        has_reasoning_content = isinstance(reasoning_content, str) and bool(reasoning_content)
+        assistant_allows_empty_content = role == "assistant" and (tool_calls or has_reasoning_content)
+        if role == "tool" and "tool_call_id" in message:
+            tool_call_id = message["tool_call_id"]
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise ValueError(f"messages[{index}].tool_call_id must be a non-empty string")
+        else:
+            tool_call_id = None
         if "content" not in message:
-            raise ValueError(f"messages[{index}] must include content")
-        content = message["content"]
-        if (
-            content is None
-            or (isinstance(content, str) and not content.strip())
-            or (isinstance(content, list) and not content)
-        ):
+            if assistant_allows_empty_content:
+                content = None
+            else:
+                raise ValueError(f"messages[{index}] must include content")
+        else:
+            content = message["content"]
+        if content is None:
+            if not assistant_allows_empty_content:
+                raise ValueError(f"messages[{index}].content must not be empty")
+        elif isinstance(content, str) and not content.strip():
+            if not assistant_allows_empty_content:
+                raise ValueError(f"messages[{index}].content must not be empty")
+        elif isinstance(content, list) and not content:
             raise ValueError(f"messages[{index}].content must not be empty")
-        if isinstance(content, str):
-            ensured.append({"role": role, "content": content})
-            continue
-        if not isinstance(content, list):
-            raise TypeError(f"messages[{index}].content must be a list or string, got {type(content)}")
-        rendered_content = []
-        for item_index, item in enumerate(content):
-            if not isinstance(item, dict):
-                raise TypeError(f"messages[{index}].content[{item_index}] must be a dict, got {type(item)}")
-            if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"].strip():
-                raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
-            rendered_content.append(copy.deepcopy(item))
-        ensured.append({"role": role, "content": rendered_content})
+        rendered_message = {"role": role}
+        if content is None:
+            rendered_message["content"] = None
+        elif isinstance(content, str):
+            rendered_message["content"] = content
+        elif isinstance(content, list):
+            rendered_content = []
+            for item_index, item in enumerate(content):
+                if not isinstance(item, dict):
+                    raise TypeError(f"messages[{index}].content[{item_index}] must be a dict, got {type(item)}")
+                if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"].strip():
+                    raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
+                rendered_content.append(copy.deepcopy(item))
+            rendered_message["content"] = rendered_content
+        else:
+            raise TypeError(f"messages[{index}].content must be a list, string, or None, got {type(content)}")
+        if has_reasoning_content:
+            rendered_message["reasoning_content"] = reasoning_content
+        if tool_calls:
+            rendered_message["tool_calls"] = tool_calls
+        if role == "tool" and tool_call_id is not None:
+            rendered_message["tool_call_id"] = tool_call_id
+        ensured.append(rendered_message)
     return ensured
 
 
@@ -314,7 +379,6 @@ class MsgNode:
     wall_elapsed_s: float = 0.0
     generation_elapsed_s: float = 0.0
     status: str | None = None
-    terminal_count: int = 0
     reward: float | dict[str, Any] | None = None
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None
@@ -371,7 +435,7 @@ class SessionForest:
     train_metadata: dict[str, Any] | None
     static_metadata: dict[str, Any] = field(default_factory=dict)
     root_state_hash: str | None = None
-    root_state_hashes: set[str] = field(default_factory=set)
+    leaf_state_hashes: set[str] = field(default_factory=set)
     nodes_by_hash: dict[str, MsgNode] = field(default_factory=dict)
     children_by_hash: dict[str, list[str]] = field(default_factory=dict)
 
@@ -426,14 +490,11 @@ class SessionForest:
             return RequestKind.RESUMED
         return RequestKind.FRESH
 
-    def _node(self, state_hash: str) -> MsgNode:
-        return self.nodes_by_hash[state_hash]
-
     def lineage(self, state_hash: str) -> list[MsgNode]:
         lineage: list[MsgNode] = []
         current_hash: str | None = state_hash
         while current_hash is not None:
-            node = self._node(current_hash)
+            node = self.nodes_by_hash[current_hash]
             lineage.append(node)
             current_hash = node.parent_state_hash
         lineage.reverse()
@@ -494,15 +555,8 @@ class SessionForest:
                 chat_template_kwargs = normalize_template_kwargs(node.chat_template_kwargs)
         return chat_template_kwargs
 
-    def export_terminal_hashes(self) -> list[str]:
-        terminal_hashes: list[str] = []
-        for state_hash, node in self.nodes_by_hash.items():
-            if state_hash in self.root_state_hashes:
-                continue
-            if node.terminal_count <= 0:
-                continue
-            terminal_hashes.extend([state_hash] * node.terminal_count)
-        return terminal_hashes
+    def export_leaf_hashes(self) -> list[str]:
+        return list(self.leaf_state_hashes)
 
     def subtree_root_hash(self, state_hash: str) -> str | None:
         lineage = self.lineage(state_hash)
@@ -526,35 +580,24 @@ class SessionForest:
         subtree_root = self.nodes_by_hash[subtree_root_hash]
         return normalize_template_kwargs(subtree_root.chat_template_kwargs)
 
-    def _mark_parent_non_terminal(self, parent_state_hash: str | None) -> None:
-        if parent_state_hash is None:
-            return
-        parent_node = self.nodes_by_hash[parent_state_hash]
-        if parent_node.terminal_count > 0:
-            parent_node.terminal_count -= 1
-
     def _register_node(self, node: MsgNode) -> MsgNode:
         existing = self.nodes_by_hash.get(node.state_hash)
         if existing is not None:
             if existing.kind != node.kind:
                 raise ValueError(f"State hash collision with mismatched kinds: {existing.kind} vs {node.kind}")
-            if existing.state_hash not in self.root_state_hashes:
-                existing.terminal_count += 1
             return existing
 
-        node.terminal_count = 0 if node.parent_state_hash is None else 1
-        self.nodes_by_hash[node.state_hash] = node
         if node.parent_state_hash is None:
-            if self.root_state_hash is None:
-                self.root_state_hash = node.state_hash
-            self.root_state_hashes.add(node.state_hash)
-        else:
+            if self.root_state_hash is not None:
+                raise ValueError("SessionForest root already exists")
+            self.root_state_hash = node.state_hash
+        self.nodes_by_hash[node.state_hash] = node
+        if node.parent_state_hash is not None:
+            self.leaf_state_hashes.add(node.state_hash)
             children = self.children_by_hash.setdefault(node.parent_state_hash, [])
-            parent_was_leaf = not children
             if node.state_hash not in children:
                 children.append(node.state_hash)
-                if parent_was_leaf:
-                    self._mark_parent_non_terminal(node.parent_state_hash)
+                self.leaf_state_hashes.discard(node.parent_state_hash)
         return node
 
     def _next_state_hash(

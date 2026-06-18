@@ -63,6 +63,17 @@ Enable agentic rollout and pass the working directory and launch command to Rela
 
 Optional extra environment variables for the agent process can be passed with `--agent-env "FOO=bar" "BAZ=qux"`. The `RELAX_` prefix is reserved by the training framework.
 
+Choose the tool-call parser to match the model, chat template, or prompt format used by your agent app.
+
+If your agent app uses OpenAI-style assistant `tool_calls` or `reasoning_content`, Relax can post-process assistant text with SGLang parsers:
+
+```bash
+--agentic-reasoning-parser qwen3
+--agentic-tool-call-parser qwen3_coder
+```
+
+The reasoning parser runs on assistant text. The tool-call parser runs only when the request includes `tools`.
+
 `--agent-timeout` controls each managed-command agent session's active runtime budget in seconds. The budget is charged while an admitted managed process is running and pauses while the session is gated. On timeout, Relax sends `SIGTERM` to the managed agent process group, records a managed-command timeout, and drops the corresponding runtime group.
 
 Relax runs the command under `--agent-cwd` and injects these environment variables:
@@ -143,10 +154,10 @@ If the dataset prompt already contains `{"type": "image", "image": ...}`, Relax 
 
 Relax exposes `/v1/chat/completions`. The agent can use the OpenAI Python SDK, LiteLLM, or any HTTP client.
 
-When appending the assistant response back into history, keep assistant `content` as a string:
+Append the returned assistant message directly to `messages`:
 
 ```python
-messages.append({"role": "assistant", "content": choice.message.content})
+messages.append(response.choices[0].message)
 ```
 
 Supported request fields:
@@ -176,10 +187,12 @@ Current limitations:
 | `top_logprobs` | omitted or `null` | rejected |
 | `functions` | omitted, `null`, or `[]` | rejected |
 | `function_call` | omitted, `null`, or `"none"` | rejected |
-| `tool_choice` | omitted, `null`, or `"none"` | rejected |
-| `parallel_tool_calls` | omitted, `null`, or `false` | rejected |
 
-In the current agentic chat protocol, the agent needs to parse tool-call text from the assistant response, execute the tool, and append the tool result to `messages`. **SGLang function calling support will be integrated in the future**.
+::: warning
+The agentic text-parsing path does not use `tool_choice` or `parallel_tool_calls` to steer generation. Tool parsing is driven by `tools` plus `--agentic-tool-call-parser`, and reasoning parsing is driven by `--agentic-reasoning-parser`.
+:::
+
+In the current agentic chat protocol, SGLang returns tokens, Relax decodes assistant text from them, optionally parses reasoning content and tool calls, and then appends the resulting assistant message back into the session history. The agent app still owns tool execution and the subsequent tool messages.
 
 For context errors such as `context_length_exceeded`, the agent may mark the session as `finish_length` and exit normally. For other API errors, raising the exception is recommended so Relax can clean up according to the session lifecycle.
 

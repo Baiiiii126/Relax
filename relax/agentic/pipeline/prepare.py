@@ -86,13 +86,8 @@ class PrepareDomain:
             raise RuntimeError("PrepareDomain requires a non-empty scope_id.")
         self.scope_id = scope_id
         self.prefetch_concurrency = prefetch_concurrency
-        self.configured_pool_target_group_count = pool_target_group_count
-        if self.configured_pool_target_group_count < 0:
-            raise RuntimeError(
-                f"pool_target_group_count must be non-negative, got {self.configured_pool_target_group_count}."
-            )
         self.data_source = data_source
-        self.pool_target_group_count = self.configured_pool_target_group_count
+        self.pool_target_group_count = pool_target_group_count
         self.runtime_driver = None
 
         # Resident mutable state
@@ -108,7 +103,6 @@ class PrepareDomain:
         self._launching_group_count = 0
         self._launch_tasks: set[asyncio.Task[None]] = set()
         self._launch_error: BaseException | None = None
-        self._last_logged_pool_target: int | None = None
 
         # Event signalling that a fetch cycle completed (success, error, or cancel).
         # Waited on by the step thread, set by the background fetch coroutine.
@@ -223,8 +217,6 @@ class PrepareDomain:
     ) -> None:
         if self._closed:
             raise RuntimeError("PrepareDomain is closed")
-        if pool_target_group_count < 0:
-            raise RuntimeError(f"pool_target_group_count must be non-negative, got {pool_target_group_count}.")
         runtime_scope_id = getattr(runtime_driver, "scope_id", None)
         if runtime_scope_id != self.scope_id:
             raise RuntimeError(
@@ -236,9 +228,7 @@ class PrepareDomain:
                 self._fetch_task = None
                 self._fetch_submitted = False
             self.runtime_driver = runtime_driver
-        self.set_pool_target(pool_target_group_count)
-
-    # Pool counts (thread-safe via _lock)
+            self.pool_target_group_count = pool_target_group_count
 
     def _resident_group_count(self) -> int:
         return len(self.warming_group_ids) + len(self.ready_group_ids)
@@ -265,7 +255,6 @@ class PrepareDomain:
                 "ready": len(self.ready_group_ids),
                 "resident": self._resident_group_count(),
                 "pool_target": self.pool_target_group_count,
-                "pool_cap": self.configured_pool_target_group_count,
                 "fetch_ready_batches": len(self._ready_batches),
                 "buffered_groups": self._buffered_prepare_group_count(),
                 "fetch_inflight": self._fetch_task is not None or self._fetch_submitted,
@@ -287,18 +276,6 @@ class PrepareDomain:
         log_fn = logger.debug if level == "debug" else logger.info
         fields = {**counts, **{key: value for key, value in extra.items() if value is not None}}
         log_fn(format_agentic_event("PREPARE", event, **fields))
-
-    # Pool target
-
-    def set_pool_target(self, target_groups: int) -> None:
-        requested_target = target_groups
-        if requested_target < 0:
-            raise RuntimeError(f"target_groups must be non-negative, got {requested_target}.")
-        capped_target = min(self.configured_pool_target_group_count, requested_target)
-        self.pool_target_group_count = capped_target
-        if self._last_logged_pool_target != capped_target:
-            self._last_logged_pool_target = capped_target
-            self._log_pool_state("target_update")
 
     # Prepare accept
 
@@ -379,7 +356,7 @@ class PrepareDomain:
             expected_sessions = len(group_state.request_handles)
             ready_sessions = int(snapshot.get("ready_sessions") or 0) if snapshot else 0
             total_sessions = int(snapshot.get("total_sessions") or 0) if snapshot else 0
-            if total_sessions >= expected_sessions and ready_sessions >= expected_sessions:
+            if ready_sessions == expected_sessions:
                 with self._lock:
                     group_state.status = "ready"
                     self.ready_group_ids.append(group_id)
@@ -489,40 +466,23 @@ class PrepareDomain:
 
         Hard constraints:
         - Refuses when the domain is closed.
-        - Refuses when no data source is configured; eval callers can feed
-          prepared batches directly.
-        - Refuses when ``pool_target_group_count`` is 0.  That state is
-          reserved for explicit outer-loop shutdown, not ordinary step
-          progression.
         - Measures resident capacity with prepared groups owned by this domain.
         - Requests exactly the current prepare-pool gap.
         - Caps ``_ready_batches`` at ``prefetch_concurrency`` (typically 1).
         """
         with self._lock:
-            if self._closed:
+            if (
+                self._closed
+                or self._source_exhausted
+                or self._fetch_task is not None
+                or self._fetch_submitted
+                or len(self._ready_batches) >= self.prefetch_concurrency
+            ):
                 return False
-            if self.data_source is None:
+            prepare_pool_gap = self.pool_target_group_count - self._pool_group_count_locked()
+            if prepare_pool_gap <= 0:
                 return False
-            if self.pool_target_group_count <= 0:
-                return False
-            if self._source_exhausted:
-                return False
-            if self._pool_group_count_locked() >= self.pool_target_group_count:
-                return False
-            if self._fetch_task is not None or self._fetch_submitted:
-                return False
-            if len(self._ready_batches) >= self.prefetch_concurrency:
-                return False
-            pool_group_count = self._pool_group_count_locked()
-            remaining_group_count = self.pool_target_group_count - pool_group_count
-            if remaining_group_count <= 0:
-                return False
-            requested_group_count = remaining_group_count
-            if requested_group_count <= 0:
-                raise RuntimeError(
-                    f"PrepareDomain requested group count must be positive when data_source is configured, "
-                    f"got {requested_group_count}."
-                )
+            requested_group_count = prepare_pool_gap
             # Mark submitted inside the lock so that no concurrent
             # start_fetch() can slip through before _bg_fetch() sets
             # _fetch_task.
@@ -602,7 +562,7 @@ class PrepareDomain:
         if not self.has_ready_output():
             return False
         with self._lock:
-            if self._closed or self.pool_target_group_count <= 0:
+            if self._closed:
                 return False
             fetch_output = self._ready_batches.popleft()
         await self.accept_prepare(fetch_output.sample_groups)
