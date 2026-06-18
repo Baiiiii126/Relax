@@ -468,6 +468,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-tq-timeout-minutes",
+                type=int,
+                default=None,
+                help=(
+                    "SFT-only timeout (in minutes) for the producer's TransferQueue waits. "
+                    "If the consumer dies, the SFT producer would otherwise spin forever on "
+                    "_wait_for_buffer_capacity. On timeout the producer raises TimeoutError "
+                    "and the job crashes. Defaults to --distributed-timeout-minutes."
+                ),
+            )
+            parser.add_argument(
                 "--sft-predict-interval",
                 type=int,
                 default=None,
@@ -2376,6 +2387,16 @@ def _normalize_sft_max_in_flight_steps(args, is_sft: bool) -> None:
     args.max_staleness = sft_max_in_flight_steps - 1
 
 
+def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
+    if not is_sft:
+        return
+    timeout = getattr(args, "sft_tq_timeout_minutes", None)
+    if timeout is None:
+        args.sft_tq_timeout_minutes = args.distributed_timeout_minutes
+    elif timeout <= 0:
+        raise ValueError("--sft-tq-timeout-minutes must be > 0.")
+
+
 def _validate_agentic_rollout_args(args) -> None:
     if not args.use_agentic_rollout:
         return
@@ -2444,6 +2465,7 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
     _normalize_sft_max_in_flight_steps(args, is_sft)
+    _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
