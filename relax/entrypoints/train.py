@@ -32,20 +32,39 @@ _ctrl: Controller | None = None
 _shutdown_done = False
 
 
-def _graceful_shutdown(sig=None, frame=None):
+def _hard_exit(code: int):
+    """Exit without running Python/native extension destructors."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
+def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     """Shut down SGLang engines and Ray on SIGTERM / SIGINT / atexit."""
     global _shutdown_done
+
+    if sig is not None:
+        exit_code = 128 + sig
+
     if _shutdown_done:
+        if exit_code is not None:
+            _hard_exit(exit_code)
         return
+
     _shutdown_done = True
 
     sig_name = signal.Signals(sig).name if sig else "atexit"
     logger.info(f"Graceful shutdown triggered ({sig_name}) — cleaning up SGLang engines...")
+
     if _ctrl is not None:
         try:
             _ctrl.shutdown()
         except Exception as e:
             logger.warning(f"Controller shutdown error during {sig_name}: {e}")
+
     if ray.is_initialized():
         try:
             serve.shutdown()
@@ -53,8 +72,9 @@ def _graceful_shutdown(sig=None, frame=None):
             logger.info("Ray shutdown successfully")
         except Exception as e:
             logger.warning(f"Ray shutdown error during {sig_name}: {e}")
-    if sig is not None:
-        sys.exit(128 + sig)
+
+    if exit_code is not None:
+        _hard_exit(exit_code)
 
 
 def main(args):
@@ -92,13 +112,12 @@ def main(args):
     except Exception as e:
         telemetry.mark_end(status="failed", error_type=type(e).__name__, error_message=str(e))
         logger.exception(f"Training loop failed with error: {e}")
-        _graceful_shutdown()
-        os._exit(1)
+        _graceful_shutdown(exit_code=1)
 
     telemetry.mark_end(status="success")
     logger.info("Main func successfully")
     # Gracefully shut down SGLang engine processes before tearing down Ray Serve.
-    _graceful_shutdown()
+    _graceful_shutdown(exit_code=0)
 
 
 if __name__ == "__main__":

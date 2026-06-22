@@ -53,7 +53,7 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len 2048
    --rollout-temperature 0.8
 
-   --global-batch-size 16
+   --global-batch-size 8
    --use-fault-tolerance
 )
 
@@ -76,12 +76,11 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
    --use-kl-loss
-   --kl-loss-coef 0.00
+   --kl-loss-coef 0.01
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-
    --use-tis
 )
 
@@ -132,7 +131,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --resource '{"actor": [1, 1], "rollout": [1, 1], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}'\
    --max-staleness 1 \
    --num-data-storage-units 1 \
-   --num-iters-per-train-update 2 \
+   --num-iters-per-train-update 1 \
    --ref-actor-config '{"tensor_model_parallel_size": 1, "max_tokens_per_gpu": 9216, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
     --use-health-check \
