@@ -37,7 +37,7 @@ CKPT_ARGS=(
    --megatron-to-hf-mode bridge
    --save ${SAVE_DIR}/sft/${EXP_NAME}
    --load ${SAVE_DIR}/sft/${EXP_NAME}
-   --save-interval 1000
+   --save-interval 100
    --num-epoch 10
 )
 
@@ -47,9 +47,9 @@ SFT_ARGS=(
    --input-key conversations
    --multimodal-keys '{"image":"images"}'
    --conversation-key-map '{"from":"role","value":"content","human":"user","gpt":"assistant"}'
-   --global-batch-size 64
+   --global-batch-size 512
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
+   --max-tokens-per-gpu 20480
    --balance-data
    --per-rank-fetch
    --sft-prefetch-num-workers 16
@@ -77,11 +77,11 @@ PREDICT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --sequence-parallel
-   --pipeline-model-parallel-size 2
+   --pipeline-model-parallel-size 1
    --context-parallel-size 1
-   --expert-model-parallel-size 4
+   --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full

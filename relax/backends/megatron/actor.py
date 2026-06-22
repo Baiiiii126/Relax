@@ -41,7 +41,7 @@ from relax.engine.sft.runtime import (
     should_run_sft_predict,
 )
 from relax.utils import device as device_utils
-from relax.utils import tracking_utils
+from relax.utils import telemetry, tracking_utils
 from relax.utils.async_utils import run
 from relax.utils.data.stream_dataloader import (
     create_stream_dataloader,
@@ -478,6 +478,59 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
+    def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
+        is_sft = is_sft_mode(self.args)
+        has_rollout = getattr(self, "rollout_manager", None) is not None
+
+        if not is_sft and dist.get_rank() != 0:
+            return
+
+        if is_sft:
+            should_run_eval = should_run_sft_eval(self.args, rollout_id)
+            should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
+            should_mark_eval = should_run_eval or should_run_predict
+            if should_mark_eval:
+                telemetry.mark_eval_begin(rollout_id, role="actor")
+            try:
+                if should_run_eval:
+                    if dist.get_rank() == 0:
+                        run(
+                            self.data_system_client.async_clear_partition(
+                                partition_id=sft_partition_id(self.args, rollout_id)
+                            )
+                        )
+                    dist.barrier(group=get_gloo_group())
+                    run_sft_eval(self, rollout_id)
+
+                if should_run_predict:
+                    run_sft_predict(self, rollout_id)
+            except Exception as e:
+                logger.warning(f"SFT eval/predict at rollout_id {rollout_id} failed: {e}")
+                raise
+            finally:
+                if should_mark_eval:
+                    telemetry.mark_eval_end(rollout_id, role="actor")
+            return
+
+        # RL path: trigger rollout-based evaluation if configured.
+        # Telemetry marks for RL eval live on the Rollout side
+        # (see Rollout._run_eval_with_mark), so we don't emit them here.
+        if not has_rollout:
+            return
+        try:
+            rollout_serve_url = get_serve_url("rollout")
+            response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
+            response.raise_for_status()
+            if end_update_weight:
+                response = requests.get(f"{rollout_serve_url}/end_update_weight")
+                response.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
+
+    def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
+        """Backward-compatible name kept for existing internal call sites."""
+        self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
+
     def train(self, rollout_id: int) -> None:
         # offload genrm before train (rollout has already self-offloaded at end of _async_run)
         if self.args.offload_rollout and dist.get_rank() == 0 and self.genrm_manager is not None:
@@ -709,6 +762,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
+
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
             self.args.rotate_ckpt
@@ -717,7 +771,6 @@ class MegatronTrainRayActor(TrainRayActor):
         ):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
-        # SFT bundles sleep + update_weights into the predict block below.
         if self._per_step_rollout:
             if self.args.offload_train:
                 self.sleep()
@@ -725,38 +778,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
-        # uses run_sft_eval (PPL) and /predict (generative) below instead.
+        # uses local eval/predict runner below.
         dist.barrier(group=get_gloo_group())
-        if self._per_step_rollout:
-            if dist.get_rank() == 0:
-                try:
-                    response = requests.get(f"{get_serve_url('rollout')}/evaluate", params={"train_step": rollout_id})
-                    response.raise_for_status()
-                except Exception as e:
-                    logger.warning(f"Error triggering evaluation for rollout_id {rollout_id}: {e}")
-
-        # SFT periodic PPL eval — runs entirely inside Megatron actor (no
-        # SGLang/Rollout). Producer pushes the eval set serially in chunks
-        # to `sft_eval_<rollout_id>_n<N>_<i>`; the runner discovers N,
-        # consumes each chunk, runs forward-only, aggregates and logs.
-        if should_run_sft_eval(self.args, rollout_id):
-            # Free `sft_<rollout_id>` from TQ before entering eval. The
-            # Actor component clears it only after `_execute_training`
-            # returns, which won't fire until we exit train_actor — and the
-            # producer's serial eval push gates on this partition draining.
-            if dist.get_rank() == 0:
-                run(
-                    self.data_system_client.async_clear_partition(partition_id=sft_partition_id(self.args, rollout_id))
-                )
-            dist.barrier(group=get_gloo_group())
-            try:
-                run_sft_eval(self, rollout_id)
-            except Exception as e:
-                logger.warning(f"SFT eval at rollout_id {rollout_id} failed: {e}")
-                raise
-
-        if has_rollout and should_run_sft_predict(self.args, rollout_id):
-            run_sft_predict(self, rollout_id)
+        self._run_step_evaluation(rollout_id)
 
         # On the final training step the rollout component has already exited
         # its main loop, so nothing else awaits the eval handler. Block here
@@ -1128,19 +1152,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
-        if dist.get_rank() == 0:
-            try:
-                rollout_serve_url = get_serve_url("rollout")
-                response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
-                response.raise_for_status()
-                # Release the rollout from the paused state set by
-                # can_do_update_weight_for_async (called inside
-                # _check_services_health). Without this the rollout loop stays
-                # blocked on _weight_update_ready forever.
-                response = requests.get(f"{rollout_serve_url}/end_update_weight")
-                response.raise_for_status()
-            except Exception as e:
-                logger.warning(f"Error during weight update coordination for rollout_id {rollout_id}: {e}")
+        self._run_step_evaluation(rollout_id, end_update_weight=True)
 
         # On the final training step the rollout component has already exited
         # its main loop, so the eval just triggered above will not be awaited
@@ -1201,7 +1213,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.num_microbatches,
                 )
             self.prof.step(rollout_id=rollout_id)
-
             data_for_log = self.data_iterator[0].get_buffer()
             rollout_data = merge_dict_list(data_for_log)
             log_rollout_data(rollout_id, self.args, rollout_data)
@@ -1216,18 +1227,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
-            try:
-                if dist.get_rank() == 0:
-                    rollout_serve_url = get_serve_url("rollout")
-                    response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
-                    response.raise_for_status()
-
-                    response = requests.get(f"{rollout_serve_url}/end_update_weight")
-                    response.raise_for_status()
-            except Exception as e:
-                logger.warning(
-                    f"Error during async weight update: {e}, maybe cause by rollout server failure. Will continue without async update for this step."
-                )
+            self._run_step_evaluation(rollout_id, end_update_weight=True)
             # On the final training step the rollout component has already
             # exited its main loop, so the eval just triggered above will not
             # be awaited anywhere. Block until it finishes; otherwise the
@@ -1235,8 +1235,10 @@ class MegatronTrainRayActor(TrainRayActor):
             # SGLang engines mid-flight.
             if (rollout_id + 1) == self.args.num_rollout:
                 self._wait_for_previous_eval()
+
             if self.args.use_routing_replay:
                 RoutingReplay.clear_all()
+
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
@@ -1276,6 +1278,8 @@ class MegatronTrainRayActor(TrainRayActor):
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
             return
+        telemetry.mark_save_begin(rollout_id, role=self.role)
+
         # torch dist may trigger nccl communication during saving; resume the
         # paused model (process groups + tms) so save can issue collectives and
         # touch GPU tensors.
@@ -1304,6 +1308,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train and self._per_step_rollout:
             self.sleep()
+
+        telemetry.mark_save_end(rollout_id, role=self.role)
 
     @timer
     def update_weights(self) -> None:
