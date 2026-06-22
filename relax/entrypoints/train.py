@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import atexit
-import importlib
 import os
 import signal
 import sys
@@ -11,19 +10,15 @@ import ray
 import yaml
 from ray import serve
 
+from relax.utils import try_import_telemetry_hook
 
-# Optional telemetry hook: if the RELAX_TELEMETRY_HOOK env var names an
-# importable module, import it here so it can install any patches it needs
-# (e.g. a metrics-forwarding shim) before Controller is referenced below.
-# Silent no-op when the env var is unset or the named module is unavailable.
-_telemetry_hook = os.environ.get("RELAX_TELEMETRY_HOOK")
-if _telemetry_hook:
-    try:
-        importlib.import_module(_telemetry_hook)
-    except ImportError:
-        pass
+
+# Optional telemetry hook: import before Controller so it can install patches.
+# Missing or broken hooks must not change training behavior.
+try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
+from relax.utils import telemetry  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
@@ -95,10 +90,12 @@ def main(args):
     try:
         ctrl.training_loop()
     except Exception as e:
+        telemetry.mark_end(status="failed", error_type=type(e).__name__, error_message=str(e))
         logger.exception(f"Training loop failed with error: {e}")
         _graceful_shutdown()
         os._exit(1)
 
+    telemetry.mark_end(status="success")
     logger.info("Main func successfully")
     # Gracefully shut down SGLang engine processes before tearing down Ray Serve.
     _graceful_shutdown()
@@ -106,4 +103,5 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    telemetry.mark_start(fields=vars(args))
     main(args)

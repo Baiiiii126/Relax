@@ -24,7 +24,7 @@ from megatron.core.utils import get_model_config, unwrap_model
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
-from relax.utils import tracking_utils
+from relax.utils import telemetry, tracking_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory
 from relax.utils.timer import timer
@@ -981,10 +981,13 @@ def initialize_model_and_optimizer(
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         logger.info("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
+    telemetry.mark("setup_begin", role=role)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
+    telemetry.mark("setup_end", role=role)
     model[0].role = role
     reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
     clear_memory()
+    telemetry.mark("checkpoint_load_begin", role=role)
     iteration, _ = load_checkpoint(
         model,
         optimizer,
@@ -992,6 +995,7 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
+    telemetry.mark("checkpoint_load_end", role=role)
     if reinit_critic_output_layer:
         _reinitialize_critic_output_layer(model)
         if (args.fp16 or args.bf16) and optimizer is not None:
