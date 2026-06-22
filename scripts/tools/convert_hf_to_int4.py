@@ -169,6 +169,21 @@ def pack_layer(
     return packed_weight, scale, packed_zp
 
 
+def _store_quantized(
+    q_weights: dict[str, torch.Tensor],
+    base_name: str,
+    weight: torch.Tensor,
+    group_size: int,
+    is_symmetric: bool,
+) -> None:
+    qw, s, zp = pack_layer(weight, group_size, is_symmetric)
+    q_weights[f"{base_name}.weight_packed"] = qw
+    q_weights[f"{base_name}.weight_scale"] = s
+    q_weights[f"{base_name}.weight_shape"] = torch.tensor(weight.shape, dtype=torch.int32, device=weight.device)
+    if zp is not None:
+        q_weights[f"{base_name}.weight_zero_point"] = zp
+
+
 class ConversionResult:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -208,23 +223,33 @@ def _process_file(
             (r.startswith("re:") and re.match(r[3:], name)) or r == name or name.startswith(r) for r in ignore_rules
         )
 
+        is_fused_experts = name.endswith(".experts.gate_up_proj") or name.endswith(".experts.down_proj")
+        if not is_ignored and weight.dim() == 3 and is_fused_experts:
+            base = name.rsplit(".", 1)[0]  # ``...mlp.experts``
+            logger.debug(f"Packing fused experts {name}, memory usage: {torch.cuda.memory_allocated()}")
+            for expert_idx in range(weight.shape[0]):
+                expert = weight[expert_idx]
+                if name.endswith(".gate_up_proj"):
+                    gate_w, up_w = expert.chunk(2, dim=0)
+                    _store_quantized(
+                        q_weights, f"{base}.{expert_idx}.gate_proj", gate_w.contiguous(), group_size, is_symmetric
+                    )
+                    _store_quantized(
+                        q_weights, f"{base}.{expert_idx}.up_proj", up_w.contiguous(), group_size, is_symmetric
+                    )
+                else:
+                    _store_quantized(
+                        q_weights, f"{base}.{expert_idx}.down_proj", expert.contiguous(), group_size, is_symmetric
+                    )
+            continue
+
         if is_ignored or not name.endswith(".weight") or weight.dim() < 2:
             logger.debug(f"Ignoring {name}, memory usage: {torch.cuda.memory_allocated()}")
             q_weights[name] = weight
             continue
 
         logger.debug(f"Packing {name}, memory usage: {torch.cuda.memory_allocated()}")
-        qw, s, zp = pack_layer(weight, group_size, is_symmetric)
-        qweight_name = name.replace(".weight", ".weight_packed")
-        scale_name = name.replace(".weight", ".weight_scale")
-        weight_shape = torch.tensor(weight.shape, dtype=torch.int32, device="cuda")
-        weight_shape_name = name.replace(".weight", ".weight_shape")
-        if zp is not None:
-            zp_name = name.replace(".weight", ".weight_zero_point")
-            q_weights[zp_name] = zp
-        q_weights[qweight_name] = qw
-        q_weights[scale_name] = s
-        q_weights[weight_shape_name] = weight_shape
+        _store_quantized(q_weights, name.rsplit(".weight", 1)[0], weight, group_size, is_symmetric)
 
     safetensors.torch.save_file(q_weights, os.path.join(output_path, filename), metadata={"format": "pt"})
 
@@ -326,14 +351,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ignore-rules",
         nargs="+",
+        # Quantize ONLY the routed MoE experts; leave everything else in BF16.
+        # Routed experts are ``...mlp.experts.gate_up_proj`` / ``.down_proj``
+        # (Qwen3.5/3.6 fused 3D) or ``...mlp.experts.<i>.<proj>.weight``
+        # (Qwen3-30B-A3B split 2D) -- none of the rules below match those, so
+        # this list is backward compatible with the text-only 30B recipe while
+        # additionally skipping this model's vision tower, MTP block, linear/
+        # mamba attention, shared experts and router gate.
         default=[
             "re:.*lm_head.*",
             "re:.*norm.*",
             "re:.*embed.*",
             "re:.*self_attn.*",
-            "re:.*shared_experts.*",
-            "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
-            "re:.*mlp\\.gate\\.*",
+            "re:.*shared_expert.*",  # shared_expert / shared_expert_gate (singular)
+            "re:.*mlp\\.gate\\.weight",  # MoE router gate (not an expert)
+            "re:.*visual.*",  # vision tower
+            "re:.*linear_attn.*",  # GDN / mamba linear-attention block
+            "re:mtp\\..*",  # multi-token-prediction block (unused by rollout)
         ],
         help="Ignore Rules",
     )

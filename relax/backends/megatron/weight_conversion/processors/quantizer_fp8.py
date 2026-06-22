@@ -14,6 +14,12 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     assert quantization_config["activation_scheme"] == "dynamic"
     weight_block_size = quantization_config.get("weight_block_size", None)
 
+    modules_to_not_convert = quantization_config.get("modules_to_not_convert", None)
+    if modules_to_not_convert:
+        return _quantize_params_fp8_by_ignore_list(
+            converted_named_params, set(modules_to_not_convert), weight_block_size
+        )
+
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
     match = re.match(decoder_layers_pattern, megatron_name)
 
@@ -85,6 +91,32 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
 
     # for other parameters, we just return the original converted_named_params
     return converted_named_params
+
+
+def _checkpoint_module_name(hf_name):
+    module = hf_name[: -len(".weight")] if hf_name.endswith(".weight") else hf_name
+    match = re.match(r"(.*\.experts)\.\d+\.(gate_proj|up_proj|down_proj)$", module)
+    if match:
+        base, proj = match.groups()
+        fused = "down_proj" if proj == "down_proj" else "gate_up_proj"
+        return f"{base}.{fused}"
+    return module
+
+
+def _quantize_params_fp8_by_ignore_list(converted_named_params, modules_to_not_convert, weight_block_size):
+    quantize_named_params = []
+    for name, param in converted_named_params:
+        is_quantizable = (
+            name.endswith(".weight")
+            and param.dim() == 2
+            and param.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and _checkpoint_module_name(name) not in modules_to_not_convert
+        )
+        if is_quantizable:
+            quantize_named_params.extend(_quantize_param(name, param, weight_block_size))
+        else:
+            quantize_named_params.append((name, param))
+    return quantize_named_params
 
 
 def _quantize_param(name, weight, weight_block_size):
