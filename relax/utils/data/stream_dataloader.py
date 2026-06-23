@@ -310,12 +310,22 @@ def _broadcast_routed_experts(
         sends data to (tp_rank==0, pp_rank==1), then TP broadcast in
         each PP stage sends from tp_rank==0 to other tp_ranks.
         """
+        # Short-circuit: when both TP and PP groups are trivial (size 1),
+        # skip the GPU round-trip entirely and return the source tensor.
+        tp_trivial = mpu.get_tensor_model_parallel_world_size() <= 1
+        pp_trivial = (not broadcast_pp) or mpu.get_pipeline_model_parallel_world_size() <= 1
+        if tp_trivial and pp_trivial:
+            if is_sender and tensor is not None:
+                return tensor.to(dtype=dtype).contiguous()
+            # Shouldn't happen (sender has the tensor), but be safe.
+            return torch.empty(0, dtype=dtype)
+
         # After PP broadcast, every tp_rank==0 has the data.
         # After TP broadcast, every rank has the data.
         is_tp_rank0 = mpu.get_tensor_model_parallel_rank() == 0
 
         # --- Step 1: PP broadcast (only among tp_rank==0 ranks) ---
-        if broadcast_pp and is_tp_rank0:
+        if not pp_trivial and is_tp_rank0:
             pp_group = mpu.get_pipeline_model_parallel_group()
             pp_src_global = dist.get_global_rank(pp_group, 0)
 
@@ -342,43 +352,51 @@ def _broadcast_routed_experts(
             dist.broadcast(tensor, src=pp_src_global, group=pp_group)
 
         # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
-        tp_group = mpu.get_tensor_model_parallel_group()
-        tp_src_global = dist.get_global_rank(tp_group, 0)
+        if not tp_trivial:
+            tp_group = mpu.get_tensor_model_parallel_group()
+            tp_src_global = dist.get_global_rank(tp_group, 0)
 
-        # Now every tp_rank==0 has the tensor (from step 1 or original).
-        if is_tp_rank0 and tensor is not None:
-            ndim_t = torch.tensor([tensor.ndim], dtype=torch.long, device=cuda_dev)
-        else:
-            ndim_t = torch.tensor([0], dtype=torch.long, device=cuda_dev)
-        dist.broadcast(ndim_t, src=tp_src_global, group=tp_group)
-        ndim = ndim_t.item()
+            # Now every tp_rank==0 has the tensor (from step 1 or original).
+            if is_tp_rank0 and tensor is not None:
+                ndim_t = torch.tensor([tensor.ndim], dtype=torch.long, device=cuda_dev)
+            else:
+                ndim_t = torch.tensor([0], dtype=torch.long, device=cuda_dev)
+            dist.broadcast(ndim_t, src=tp_src_global, group=tp_group)
+            ndim = ndim_t.item()
 
-        if is_tp_rank0 and tensor is not None:
-            shape_t = torch.tensor(list(tensor.shape), dtype=torch.long, device=cuda_dev)
-        else:
-            shape_t = torch.empty(ndim, dtype=torch.long, device=cuda_dev)
-        dist.broadcast(shape_t, src=tp_src_global, group=tp_group)
-        shape = torch.Size(shape_t.tolist())
+            if is_tp_rank0 and tensor is not None:
+                shape_t = torch.tensor(list(tensor.shape), dtype=torch.long, device=cuda_dev)
+            else:
+                shape_t = torch.empty(ndim, dtype=torch.long, device=cuda_dev)
+            dist.broadcast(shape_t, src=tp_src_global, group=tp_group)
+            shape = torch.Size(shape_t.tolist())
 
-        if is_tp_rank0 and tensor is not None:
-            buf = tensor.to(dtype=dtype, device=cuda_dev).contiguous()
-        else:
-            buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
-        dist.broadcast(buf, src=tp_src_global, group=tp_group)
+            if is_tp_rank0 and tensor is not None:
+                buf = tensor.to(dtype=dtype, device=cuda_dev).contiguous()
+            else:
+                buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
+            dist.broadcast(buf, src=tp_src_global, group=tp_group)
+            tensor = buf
 
-        return buf
+        return tensor
 
-    values_gpu = _bcast_tensor(values, is_src, torch.int32)
-    offsets_gpu = _bcast_tensor(offsets, is_src, torch.long)
+    values_out = _bcast_tensor(values, is_src, torch.int32)
+    offsets_out = _bcast_tensor(offsets, is_src, torch.long)
 
     if keep_on_gpu:
         # When optimize_routing_replay is enabled, keep tensors on GPU to
         # avoid a redundant GPU→CPU→GPU round-trip.  fill_routing_replay's
         # RoutingReplay.record() handles GPU→CPU-pinned copy automatically.
-        return values_gpu, offsets_gpu
+        # _bcast_tensor may short-circuit and return CPU tensors when all
+        # groups are trivial (size 1); ensure GPU residency in that case.
+        if not values_out.is_cuda:
+            values_out = values_out.to(device=cuda_dev)
+        if not offsets_out.is_cuda:
+            offsets_out = offsets_out.to(device=cuda_dev)
+        return values_out, offsets_out
 
     # Move back to CPU for downstream consumption (fill_routing_replay etc.)
-    return values_gpu.cpu(), offsets_gpu.cpu()
+    return values_out.cpu(), offsets_out.cpu()
 
 
 def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
@@ -396,17 +414,30 @@ def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
         dist.broadcast(buf, src=dist.get_global_rank(group, 0), group=group)
         return buf
 
+    # --- Short-circuit: skip all GPU round-trips when every group is trivial ---
+    cp_trivial = mpu.get_context_parallel_world_size() <= 1
+    tp_trivial = mpu.get_tensor_model_parallel_world_size() <= 1
+    pp_trivial = (not broadcast_pp) or mpu.get_pipeline_model_parallel_world_size() <= 1
+
+    if cp_trivial and tp_trivial and pp_trivial:
+        # No actual broadcast needed — return the source tensor on CPU directly,
+        # avoiding the costly CPU → GPU → NCCL self-send → GPU → CPU round-trip.
+        if tensor is not None:
+            return tensor.to(dtype=dtype).contiguous()
+        return torch.empty(shape, dtype=dtype)
+
     # --- Step 1: CP broadcast (CP=0 -> other CP ranks of TP=0/PP=0) ---
     # Only the global source's CP group has real data on its rank-0; the rest
     # broadcast a placeholder that the TP / PP stages below overwrite.
-    if mpu.get_context_parallel_world_size() > 1:
+    if not cp_trivial:
         tensor = _bcast(tensor, is_src, mpu.get_context_parallel_group())
 
     # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
-    tensor = _bcast(tensor, mpu.get_tensor_model_parallel_rank() == 0, mpu.get_tensor_model_parallel_group())
+    if not tp_trivial:
+        tensor = _bcast(tensor, mpu.get_tensor_model_parallel_rank() == 0, mpu.get_tensor_model_parallel_group())
 
     # --- Step 3: PP broadcast (pp_rank==0 -> others in each PP group) ---
-    if broadcast_pp:
+    if not pp_trivial:
         tensor = _bcast(tensor, mpu.get_pipeline_model_parallel_rank() == 0, mpu.get_pipeline_model_parallel_group())
 
     return tensor
@@ -661,23 +692,25 @@ def get_data_from_transfer_queue(
         # need to fan out the result to the other CP partners of (TP=0, PP=0)
         # before TP / PP broadcasts can propagate it across the rest of the
         # world. Skipping this is what caused the 16-idle / 16-hung split.
-        with timer("tgd_bcast_cp"):
-            dist.broadcast_object_list(
-                rollout_data,
-                device=cuda_dev,
-                group=mpu.get_context_parallel_group(),
-                group_src=0,
-            )
-        with timer("tgd_bcast_tp"):
-            dist.broadcast_object_list(
-                rollout_data,
-                device=cuda_dev,
-                group=mpu.get_tensor_model_parallel_group(),
-                group_src=0,
-            )
+        if mpu.get_context_parallel_world_size() > 1:
+            with timer("tgd_bcast_cp"):
+                dist.broadcast_object_list(
+                    rollout_data,
+                    device=cuda_dev,
+                    group=mpu.get_context_parallel_group(),
+                    group_src=0,
+                )
+        if mpu.get_tensor_model_parallel_world_size() > 1:
+            with timer("tgd_bcast_tp"):
+                dist.broadcast_object_list(
+                    rollout_data,
+                    device=cuda_dev,
+                    group=mpu.get_tensor_model_parallel_group(),
+                    group_src=0,
+                )
 
         # Conditionally broadcast across pipeline parallel ranks
-        if broadcast_pp:
+        if broadcast_pp and mpu.get_pipeline_model_parallel_world_size() > 1:
             with timer("tgd_bcast_pp"):
                 dist.broadcast_object_list(
                     rollout_data,
@@ -695,7 +728,8 @@ def get_data_from_transfer_queue(
     # --- Stream multimodal tensors via NCCL (zero-copy, CPU-resident result) ---
     mm_inputs = None
     if has_multimodal:
-        mm_inputs = _broadcast_multimodal_inputs(mm_spec, mm_send_tensors, should_fetch, cuda_dev, broadcast_pp)
+        with timer("tgd_bcast_mm"):
+            mm_inputs = _broadcast_multimodal_inputs(mm_spec, mm_send_tensors, should_fetch, cuda_dev, broadcast_pp)
 
     # --- Broadcast routed_experts tensors via efficient dist.broadcast ---
     # Skipped entirely in per_rank_fetch mode: each rank already received the
