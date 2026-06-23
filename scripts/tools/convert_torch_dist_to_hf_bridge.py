@@ -28,6 +28,29 @@ def _patched_load_model_config(checkpoint_path):
 _model_load_save_module.load_model_config = _patched_load_model_config
 
 
+def _checkpoint_has_mtp(input_dir):
+    """Return True if the torch-dist checkpoint actually stores MTP weights.
+
+    `input_dir` may be a Megatron checkpoint root (containing
+    `latest_checkpointed_iteration.txt` and `iter_*` subdirs) or a single
+    checkpoint directory. Detection reads the torch DCP `.metadata` and looks
+    for any `mtp` key.
+    """
+    from torch.distributed.checkpoint import FileSystemReader
+
+    ckpt_dir = input_dir
+    latest_file = os.path.join(input_dir, "latest_checkpointed_iteration.txt")
+    if os.path.exists(latest_file):
+        with open(latest_file) as f:
+            tag = f.read().strip()
+        iter_dir = os.path.join(input_dir, f"iter_{int(tag):07d}")
+        if os.path.isdir(iter_dir):
+            ckpt_dir = iter_dir
+
+    metadata = FileSystemReader(ckpt_dir).read_metadata()
+    return any("mtp" in k.lower() for k in metadata.state_dict_metadata)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert torch distributed checkpoint to HuggingFace format using Megatron Bridge"
@@ -56,6 +79,12 @@ if __name__ == "__main__":
     # Use Bridge's provider so the correct model class is created (e.g., Qwen3VLModel
     # instead of GPTModel). This is needed because MLM checkpoints lack run_config.yaml.
     provider = bridge.to_megatron_provider(load_weights=False)
+
+    # Some HF configurations enable MTP layers, but RL-trained Megatron checkpoints lack MTP weights, which causes a loading error.
+    if getattr(provider, "mtp_num_layers", 0) and not _checkpoint_has_mtp(args.input_dir):
+        print(f"[convert] Checkpoint has no MTP weights; disabling MTP (was mtp_num_layers={provider.mtp_num_layers})")
+        provider.mtp_num_layers = 0
+
     _provider_override["provider"] = provider
     print(f"[convert] Using Bridge provider: {type(provider).__name__}")
 
