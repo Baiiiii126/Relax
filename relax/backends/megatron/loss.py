@@ -13,6 +13,7 @@ from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
+    compute_cispo_loss,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
@@ -448,7 +449,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "sapo", "ppo", "reinforce_plus_plus",
+    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
     and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
@@ -496,7 +497,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo"]:
+    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
@@ -803,6 +804,14 @@ def policy_loss_function(
         tau_neg = getattr(args, "sapo_tau_neg", 1.05)
         pg_loss, pg_clipfrac = compute_sapo_loss(
             ppo_kl=ppo_kl, advantages=advantages, tau_pos=tau_pos, tau_neg=tau_neg
+        )
+    elif args.advantage_estimator == "cispo":
+        pg_loss, pg_clipfrac = compute_cispo_loss(
+            log_probs=log_probs,
+            ppo_kl=ppo_kl,
+            advantages=advantages,
+            eps_clip=args.eps_clip,
+            eps_clip_high=args.eps_clip_high,
         )
     else:
         pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)

@@ -196,7 +196,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     if (
-        args.advantage_estimator in ["grpo", "gspo", "sapo", "reinforce_plus_plus_baseline"]
+        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
     ):
         # group norm
@@ -209,7 +209,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         mean = rewards.mean(dim=-1, keepdim=True)
         rewards = rewards - mean
 
-        if args.advantage_estimator in ["grpo", "gspo", "sapo"] and args.grpo_std_normalization:
+        if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
             std = rewards.std(dim=-1, keepdim=True)
             rewards = rewards / (std + 1e-6)
 

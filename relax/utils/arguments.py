@@ -1416,6 +1416,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus_baseline",
                     "ppo",
                     "sapo",
+                    "cispo",
                 ],
                 default="grpo",
                 help=(
@@ -2969,6 +2970,13 @@ def slime_validate_args(args):
         )
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if args.advantage_estimator == "ppo":
+        raise ValueError(
+            "PPO (Proximal Policy Optimization) is no longer supported in Relax. "
+            "Please use one of the following advantage estimators instead: "
+            "'grpo', 'gspo', 'sapo', 'cispo', 'reinforce_plus_plus', or 'reinforce_plus_plus_baseline'."
+        )
 
     if args.rotate_ckpt:
         assert args.save is not None, "--save must be set when --rotate-ckpt is set."
