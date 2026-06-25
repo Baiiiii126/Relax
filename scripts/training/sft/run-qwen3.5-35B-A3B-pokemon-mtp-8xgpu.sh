@@ -47,7 +47,7 @@ SFT_ARGS=(
    --input-key conversations
    --multimodal-keys '{"image":"images"}'
    --conversation-key-map '{"from":"role","value":"content","human":"user","gpt":"assistant"}'
-   --global-batch-size 512
+   --global-batch-size 64
    --use-dynamic-batch-size
    --max-tokens-per-gpu 20480
    --balance-data
