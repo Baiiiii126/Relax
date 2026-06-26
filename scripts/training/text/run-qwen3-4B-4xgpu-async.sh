@@ -48,7 +48,7 @@ ROLLOUT_ARGS=(
    --reward-key score
 
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 2
+   --rollout-batch-size 4
    --n-samples-per-prompt 8
    --rollout-max-response-len 2048
    --rollout-temperature 0.8
@@ -69,7 +69,8 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --micro-batch-size 1
+   # --micro-batch-size 1
+   --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
 )
 

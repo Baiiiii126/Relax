@@ -1132,26 +1132,51 @@ def loss_function(
     if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
         loss = loss + 0 * logits.sum()
 
+    # Fully-async + dynamic-batch path injects per-rollout loss_scale and tags
+    # dummy micro-batches (used to align num_microbatches across DPs). Dummy
+    # mbs must contribute zero gradient AND zero metric values.
+    is_dummy = batch.get("__is_dummy__", False)
+    explicit_loss_scale = batch.get("__loss_scale__", None)
+
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
     if not args.calculate_per_token_loss:
-        loss = (
-            loss * num_microbatches / global_batch_size * mpu.get_data_parallel_world_size(with_context_parallel=True)
-        )
+        if is_dummy:
+            # Zero-out gradient contribution but keep the autograd graph
+            # connected so PP/CP backward collectives still complete.
+            loss = 0.0 * loss
+        elif explicit_loss_scale is not None:
+            loss = loss * explicit_loss_scale
+        else:
+            loss = (
+                loss
+                * num_microbatches
+                / global_batch_size
+                * mpu.get_data_parallel_world_size(with_context_parallel=True)
+            )
     else:
-        loss = loss * mpu.get_context_parallel_world_size()
+        if is_dummy:
+            loss = 0.0 * loss
+        else:
+            loss = loss * mpu.get_context_parallel_world_size()
+
+    effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
+    log_values = torch.tensor(
+        [
+            num_samples if not args.calculate_per_token_loss else effective_num_tokens,
+        ]
+        + list(log.values()),
+        device=logits.device,
+    )
+    if is_dummy:
+        # Drop this mb's contribution from logged metric averages.
+        log_values = torch.zeros_like(log_values)
 
     return (
         loss,
-        (num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
+        (effective_num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
         {
             "keys": list(log.keys()),
-            "values": torch.tensor(
-                [
-                    num_samples if not args.calculate_per_token_loss else num_tokens,
-                ]
-                + list(log.values()),
-                device=logits.device,
-            ),
+            "values": log_values,
         },
     )

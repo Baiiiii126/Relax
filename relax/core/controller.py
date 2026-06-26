@@ -10,7 +10,7 @@ import ray
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
-from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
+from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler, StreamingTokenBudgetSampler
 
 from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
 from relax.agentic.session.service import (
@@ -107,7 +107,16 @@ class Controller:
         total_storage_size = (
             self.config.rollout_batch_size * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
         )
-        if algo_key == "sft" or getattr(self.config, "balance_data", False):
+        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+            # Fully-async + dynamic-batch path streams data per DP via token
+            # budget; the controller-side sampler maintains per-DP buckets and
+            # balances tokens at small-unit granularity.  See
+            # docs/draft/dynamic_batch_size_fully_async.md.
+            sampler = StreamingTokenBudgetSampler(
+                n_samples_per_prompt=self.config.n_samples_per_prompt,
+            )
+            logger.info("Using StreamingTokenBudgetSampler (fully_async + dynamic batch)")
+        elif algo_key == "sft" or getattr(self.config, "balance_data", False):
             # SFT walks the SeqlenBalancedSampler branch (sequential / balanced sampling),
             # since the GRPO grouped sampler assumes n_samples_per_prompt > 1 rollouts.
             dp_size = compute_dp_size(self.config)

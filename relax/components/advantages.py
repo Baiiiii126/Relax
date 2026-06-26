@@ -50,11 +50,20 @@ class Advantages(Base):
                 self._logger.info(
                     f"Start to got rollout_id: {step} data from transfer queue for compute advantages and returns."
                 )
-                while not run_(
-                    self.data_system_client.async_check_consumption_status(
-                        "compute_advantages_and_returns", f"train_{step}"
-                    )
-                ):
+                # On the fully-async dynamic-batch path the partition is not
+                # pre-allocated to global_batch_size, so the tensor-wide .all()
+                # consumption check is unreliable — use the producer-driven drained
+                # predicate (production_completed AND all inserted samples consumed).
+                _stream_drain = getattr(self.config, "fully_async", False) and getattr(
+                    self.config, "use_dynamic_batch_size", False
+                )
+                _drain_check = (
+                    self.data_system_client.async_check_stream_drained
+                    if _stream_drain
+                    else self.data_system_client.async_check_consumption_status
+                )
+
+                while not run_(_drain_check("compute_advantages_and_returns", f"train_{step}")):
                     adv_data_fields = [
                         "tokens",
                         "total_lengths",

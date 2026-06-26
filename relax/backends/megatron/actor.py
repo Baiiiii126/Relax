@@ -44,6 +44,8 @@ from relax.utils import device as device_utils
 from relax.utils import telemetry, tracking_utils
 from relax.utils.async_utils import run
 from relax.utils.data.stream_dataloader import (
+    MicroBatchListIterator,
+    StreamingTQIterator,
     create_stream_dataloader,
     get_data_from_transfer_queue,
     post_process_rollout_data,
@@ -70,7 +72,7 @@ from relax.utils.utils import (
 from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
-from .cp_utils import slice_with_cp
+from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
 from .data import (
     DataIterator,
     get_data_iterator,
@@ -794,36 +796,38 @@ class MegatronTrainRayActor(TrainRayActor):
             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob.")
-        batch_size = (
-            self.args.global_batch_size
-            // mpu.get_data_parallel_world_size(with_context_parallel=False)
-            // self.args.num_iters_per_train_update
-        )
-        batch_index = 0
-        while not self.all_consumed("ref_log_probs", rollout_id):
-            data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
-            if self.args.multimodal_keys is not None:
-                data_fields.append("multimodal_train_inputs")
-            data, batch_meta = self._get_data_from_transfer_queue(
-                "ref_log_probs", rollout_id, data_fields, batch_size, batch_index
-            )
-            if data is None:
-                continue
-            batch_index += 1
-            logger.info(f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob")
-            data_iterator, num_microbatches = get_data_iterator(
-                self.args,
-                self.model,
-                data,
-                max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
-            )
+        data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
+        if self.args.multimodal_keys is not None:
+            data_fields.append("multimodal_train_inputs")
 
-            output_dict = self.compute_log_prob(
-                data_iterator,
-                num_microbatches,
-                store_prefix="ref_",
+        if self._use_streaming_fwd():
+            self._streaming_fwd_putback(rollout_id, "ref_log_probs", "ref_", data_fields)
+        else:
+            batch_size = (
+                self.args.global_batch_size
+                // mpu.get_data_parallel_world_size(with_context_parallel=False)
+                // self.args.num_iters_per_train_update
             )
-            self._put_data_to_transfer_queue(output_dict, batch_meta)
+            batch_index = 0
+            while not self.all_consumed("ref_log_probs", rollout_id):
+                data, batch_meta = self._get_data_from_transfer_queue(
+                    "ref_log_probs", rollout_id, data_fields, batch_size, batch_index
+                )
+                if data is None:
+                    continue
+                batch_index += 1
+                logger.info(
+                    f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob"
+                )
+                data_iterator, num_microbatches = get_data_iterator(
+                    self.args, self.model, data, max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu
+                )
+                output_dict = self.compute_log_prob(
+                    data_iterator,
+                    num_microbatches,
+                    store_prefix="ref_",
+                )
+                self._put_data_to_transfer_queue(output_dict, batch_meta, data)
         self.prof.step(rollout_id=rollout_id)
 
         self.recv_weight_fully_async(rollout_id)
@@ -836,40 +840,47 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 os.environ["ROUTING_REPLAY_STAGE"] = "record"
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob.")
-        batch_size = (
-            self.args.global_batch_size
-            // mpu.get_data_parallel_world_size(with_context_parallel=False)
-            // self.args.num_iters_per_train_update
-        )
-        batch_index = 0
-        while not self.all_consumed("actor_log_probs", rollout_id):
-            data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
-            if self.args.multimodal_keys is not None:
-                data_fields.append("multimodal_train_inputs")
-            data, batch_meta = self._get_data_from_transfer_queue(
-                "actor_log_probs", rollout_id, data_fields, batch_size, batch_index
-            )
-            if data is None:
-                continue
-            batch_index += 1
-            logger.info(
-                f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob"
-            )
-            data_iterator, num_microbatches = get_data_iterator(
-                self.args,
-                self.model,
-                data,
-                max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
-            )
+        data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
+        if self.args.multimodal_keys is not None:
+            data_fields.append("multimodal_train_inputs")
 
-            output_dict = self.compute_log_prob(
-                data_iterator,
-                num_microbatches,
-                store_prefix="",
+        if self._use_streaming_fwd():
+            self._streaming_fwd_putback(
+                rollout_id,
+                "actor_log_probs",
+                "",
+                data_fields,
+                clear_routing_replay_forward=self.args.use_rollout_routing_replay,
             )
-            self._put_data_to_transfer_queue(output_dict, batch_meta)
-            if self.args.use_rollout_routing_replay:
-                RoutingReplay.clear_all_forward()
+        else:
+            batch_size = (
+                self.args.global_batch_size
+                // mpu.get_data_parallel_world_size(with_context_parallel=False)
+                // self.args.num_iters_per_train_update
+            )
+            batch_index = 0
+            while not self.all_consumed("actor_log_probs", rollout_id):
+                data, batch_meta = self._get_data_from_transfer_queue(
+                    "actor_log_probs", rollout_id, data_fields, batch_size, batch_index
+                )
+                if data is None:
+                    continue
+                batch_index += 1
+                logger.info(
+                    f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob"
+                )
+                data_iterator, num_microbatches = get_data_iterator(
+                    self.args, self.model, data, max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu
+                )
+
+                output_dict = self.compute_log_prob(
+                    data_iterator,
+                    num_microbatches,
+                    store_prefix="",
+                )
+                self._put_data_to_transfer_queue(output_dict, batch_meta, data)
+                if self.args.use_rollout_routing_replay:
+                    RoutingReplay.clear_all_forward()
         self.prof.step(rollout_id=rollout_id)
 
         self.recv_weight_fully_async(rollout_id)
@@ -951,6 +962,75 @@ class MegatronTrainRayActor(TrainRayActor):
                     chunk[key] = value
             chunks.append(chunk)
         return chunks
+
+    def _use_streaming_fwd(self) -> bool:
+        """Whether ref / actor_fwd forward should stream via token-budget
+        fetches.
+
+        Mirrors ``train_async``'s auto-selection of the streaming path: only
+        the fully-async + dynamic-batch combination benefits, and we currently
+        only support PP=1 (VPP implies PP>1) because the forward+putback loop
+        has no pipelined meta tracking across stages.
+        """
+        return (
+            getattr(self.args, "fully_async", False)
+            and getattr(self.args, "use_dynamic_batch_size", False)
+            and mpu.get_pipeline_model_parallel_world_size() == 1
+            and (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) == 1
+        )
+
+    def _streaming_fwd_putback(
+        self,
+        rollout_id: int,
+        task_name: str,
+        store_prefix: str,
+        data_fields: list,
+        clear_routing_replay_forward: bool = False,
+    ) -> None:
+        """Stream token-budget micro-batches, run forward-only, put log_probs
+        back.
+
+        Forward has no backward / gradient all-reduce, so each DP rank drains
+        its own per-DP bucket independently (no cross-DP ``num_microbatches``
+        MAX alignment, unlike ``get_data_iterator``).  Each streamed chunk is
+        already bounded by ``token_budget`` (~one micro-batch), so it is
+        forwarded as a single micro-batch.  ``forward_only`` reorders outputs
+        by ``micro_batch_indices`` when ``use_dynamic_batch_size`` is set, so
+        we build the iterator with an identity index list.
+        """
+        dp_rank = mpu.get_data_parallel_rank()
+        dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+        cp_size = mpu.get_context_parallel_world_size()
+        token_budget = self.args.max_tokens_per_gpu * cp_size
+
+        streaming_iter = StreamingTQIterator(
+            args=self.args,
+            tq_client=self.data_system_client,
+            data_fields=data_fields,
+            rollout_id=rollout_id,
+            token_budget=token_budget,
+            loss_scale=1.0,  # forward-only: __loss_scale__ is unused
+            # streaming=True drained predicate; PP=1 here (see _use_streaming_fwd) so
+            # all_consumed's PP broadcast is harmless.
+            all_consumed_fn=lambda: self.all_consumed(
+                task_name, rollout_id, partition_id=f"train_{rollout_id}", streaming=True
+            ),
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+            task_name=task_name,
+        )
+        for data, batch_meta in streaming_iter:
+            n = len(data["total_lengths"])
+            data_iterator = [DataIterator(data, micro_batch_indices=[list(range(n))])]
+            num_microbatches = [1]
+            output_dict = self.compute_log_prob(
+                data_iterator,
+                num_microbatches,
+                store_prefix=store_prefix,
+            )
+            self._put_data_to_transfer_queue(output_dict, batch_meta, data)
+            if clear_routing_replay_forward:
+                RoutingReplay.clear_all_forward()
 
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
@@ -1145,8 +1225,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # partially-filled partition, deadlocking against the staleness bound.
         # Returned flags are for update_weights_fully_async only — hybrid uses
         # the sync update_weights path so we just discard them.
-        self._check_services_health()
         self._wait_for_previous_eval()
+        self._check_services_health()
 
         # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
         self.update_weights()
@@ -1191,7 +1271,13 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.opd_log_prob_top_k > 0:
                 data_fields.append("teacher_topk_token_ids")
                 data_fields.append("teacher_topk_k")
-        if self.data_iterator is None:
+        if getattr(self.args, "use_dynamic_batch_size", False):
+            # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
+            # using token-budget fetches, align num_microbatches across DPs
+            # via all-reduce(MAX) + dummy mb padding, then run a single
+            # train_one_step.  See docs/draft/dynamic_batch_size_fully_async.md.
+            self.data_iterator, self.num_microbatches = self._drain_dynamic_batch_rollout(rollout_id, data_fields)
+        elif self.data_iterator is None:
             self.data_iterator, self.num_microbatches = create_stream_dataloader(
                 self.args,
                 rollout_id=rollout_id,
@@ -1220,11 +1306,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
             )
 
-            rollout_only, actor_fwd_only = self._check_services_health()
-
-            # wait for last evaluation
+            # Wait for prior eval before pausing rollout for weight sync.
             self._wait_for_previous_eval()
 
+            rollout_only, actor_fwd_only = self._check_services_health()
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
             self._run_step_evaluation(rollout_id, end_update_weight=True)
@@ -1574,10 +1659,15 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
 
-    def all_consumed(self, task_name, rollout_id, partition_id: str | None = None):
+    def all_consumed(self, task_name, rollout_id, partition_id: str | None = None, streaming: bool = False):
         # Only (TP=0, PP=0, CP=0) queries the transfer queue; otherwise different cp_ranks
         # may observe different consumption status due to concurrent fetches and diverge,
         # leaving some ranks idle while others enter the next collective and hang.
+        #
+        # streaming=True uses the producer-driven drained predicate (check_stream_drained)
+        # instead of the tensor-wide .all() check, which is unreliable without a preset
+        # partition size. This is the lockstep-across-PP drain path, so the PP broadcast
+        # below is safe (unlike the 1F1B schedule — see all_consumed_streaming).
         if partition_id is None:
             partition_id = sft_partition_id(self.args, rollout_id)
         if (
@@ -1585,7 +1675,10 @@ class MegatronTrainRayActor(TrainRayActor):
             and mpu.get_pipeline_model_parallel_rank() == 0
             and mpu.get_context_parallel_rank() == 0
         ):
-            status = [run(self.data_system_client.async_check_consumption_status(task_name, partition_id))]
+            if streaming:
+                status = [run(self.data_system_client.async_check_stream_drained(task_name, partition_id))]
+            else:
+                status = [run(self.data_system_client.async_check_consumption_status(task_name, partition_id))]
         else:
             status = [True]
         status = torch.tensor(status, device=device_utils.make_current_torch_device())
@@ -1594,6 +1687,179 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.broadcast(status, group=mpu.get_pipeline_model_parallel_group(), group_src=0)
 
         return status[0]
+
+    def all_consumed_streaming(self, task_name, rollout_id):
+        """End-of-stream check for the streaming PP schedule — NO pipeline-
+        group collective.
+
+        ``all_consumed`` broadcasts the consumption flag across the PP group.
+        That is FATAL for the streaming iterator: each PP stage pulls from its
+        own ``StreamingTQIterator`` at different points in the 1F1B schedule
+        (warmup / steady / cooldown), so stage A may call this check (because its
+        sampler returned empty) while stage B is busy in fwd/bwd compute and not
+        calling it.  A PP-group broadcast then blocks stage A forever waiting for
+        the others to join → the hang observed at long sequences (PP>1, any DP).
+
+        The sampler result cache guarantees every PP stage sees the SAME data
+        sequence per ``batch_index``, so each stage independently reaches
+        end-of-stream at the same micro-batch count.  We therefore query the
+        controller WITHOUT any PP/CP broadcast.  Within a PP stage the TP ranks
+        are in lockstep (only tp_rank==0 fetches; the get_data TP broadcast keeps
+        them aligned on the "data is None" branch), so we broadcast the flag over
+        the TP group ONLY to give tp_rank>0 the same answer.  CP ranks within a
+        stage are likewise in lockstep, so a CP-group broadcast is safe too.
+        """
+        if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0:
+            # Streaming end-of-stream predicate (no preset global batch): the producer
+            # marks production_completed and we require every actually-inserted sample
+            # to be consumed, rather than a tensor-wide .all() over (possibly dynamic)
+            # rows. See TransferQueue check_stream_drained.
+            status = [run(self.data_system_client.async_check_stream_drained(task_name, f"train_{rollout_id}"))]
+        else:
+            status = [True]
+        status = torch.tensor(status, device=device_utils.make_current_torch_device())
+        # Intra-PP-stage groups only (CP then TP, matching all_consumed's order
+        # minus the PP broadcast) — these ranks call __next__ in lockstep.
+        # Crucially NO pipeline-group broadcast: PP stages are NOT in lockstep
+        # during 1F1B, so a PP collective here would deadlock.
+        dist.broadcast(status, group=mpu.get_context_parallel_group(), group_src=0)
+        dist.broadcast(status, group=mpu.get_tensor_model_parallel_group(), group_src=0)
+        return status[0]
+
+    def _drain_dynamic_batch_rollout(self, rollout_id, data_fields):
+        """Build data iterators for the fully-async + dynamic-batch train path.
+
+        Streaming mode (default when ``use_dynamic_batch_size`` + ``fully_async``):
+            Returns a ``StreamingTQIterator`` that pulls micro-batches from TQ on
+            demand.  The streaming schedule in ``streaming_schedules.py`` iterates
+            it until ``StopIteration`` without needing a fixed ``num_microbatches``.
+            All PP stages independently build their own iterator; the sampler result
+            cache ensures they all see the same data sequence and raise
+            ``StopIteration`` at the same micro-batch count.
+
+        Legacy mode (VPP or explicit opt-out):
+            Pre-drains the full bucket, cross-DP MAX-aligns ``num_microbatches``,
+            pads shorter DPs with dummy mbs, and returns a ``MicroBatchListIterator``.
+            This is the only supported mode when VPP is active (interleaved schedule
+            requires a fixed ``num_microbatches``).
+        """
+        dp_rank = mpu.get_data_parallel_rank()
+        dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+        cp_size = mpu.get_context_parallel_world_size()
+        vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+
+        task_name = "actor_train"
+        token_budget = self.args.max_tokens_per_gpu * cp_size
+        # Loss denominator = per-partition sample count. Each train_{rollout_id} is
+        # always filled to rollout_batch_size groups, so this stays
+        # rollout_batch_size * n_samples_per_prompt — intentionally NOT global_batch_size
+        # (which may now differ after dropping that equality constraint).
+        n_global = self.args.rollout_batch_size * self.args.n_samples_per_prompt
+        # loss_scale: each sample across all DPs is weighted equally.
+        # dp_world_size_with_cp compensates for the later DP allreduce average.
+        loss_scale = 1.0 / n_global * mpu.get_data_parallel_world_size(with_context_parallel=True)
+
+        # Use streaming iterator when VPP is inactive (streaming schedule handles PP>1).
+        use_streaming = vpp_size == 1
+
+        if use_streaming:
+            streaming_iter = StreamingTQIterator(
+                args=self.args,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                rollout_id=rollout_id,
+                token_budget=token_budget,
+                loss_scale=loss_scale,
+                # PP-collective-free end-of-stream check: the streaming PP
+                # schedule pulls per-stage at different schedule points, so a
+                # PP-group broadcast inside __next__ would deadlock.  See
+                # all_consumed_streaming for the full rationale.
+                all_consumed_fn=lambda: self.all_consumed_streaming(task_name, rollout_id),
+                dp_rank=dp_rank,
+                dp_size=dp_size,
+                task_name=task_name,
+            )
+            data_iterator = [streaming_iter]
+            num_microbatches = [1]  # streaming schedule ignores this value
+            return data_iterator, num_microbatches
+
+        # ── Legacy drain path (VPP only) ────────────────────────────────────
+        dp_group = mpu.get_data_parallel_group()
+        partition_id = f"train_{rollout_id}"
+        sampling_config = {
+            "dp_rank": dp_rank,
+            "dp_size": dp_size,
+            "task_name": task_name,
+        }
+
+        mbs: List[tuple] = []
+        batch_index = 0
+        empty_streak = 0
+        while not self.all_consumed(task_name, rollout_id, partition_id=partition_id, streaming=True):
+            rollout_data, batch_meta = get_data_from_transfer_queue(
+                self.args,
+                self.data_system_client,
+                data_fields,
+                batch_size=None,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                batch_index=batch_index,
+                broadcast_pp=False,
+                token_budget=token_budget,
+                allow_underfill=True,
+            )
+            if rollout_data is None:
+                empty_streak += 1
+                time.sleep(min(0.2 * empty_streak, 2.0))
+                continue
+            empty_streak = 0
+            mbs.append((rollout_data, batch_meta))
+            batch_index += 1
+
+        k_local = len(mbs)
+
+        device = device_utils.make_current_torch_device()
+        k_tensor = torch.tensor([k_local], dtype=torch.int, device=device)
+        dist.all_reduce(k_tensor, op=dist.ReduceOp.MAX, group=dp_group)
+        k_global = int(k_tensor.item())
+        logger.debug(
+            f"[dynamic-batch] rollout={rollout_id} dp_rank={dp_rank} "
+            f"k_local={k_local} k_global={k_global} "
+            f"sample_counts={[len(m[0].get('total_lengths', [])) for m in mbs]} "
+            f"token_totals={[sum(m[0].get('total_lengths', [0])) for m in mbs]}"
+        )
+
+        from megatron.core.utils import get_model_config
+
+        config = get_model_config(self.model[0])
+        vp_group_size = config.microbatch_group_size_per_vp_stage
+        k_global = max(
+            ((k_global + vp_group_size - 1) // vp_group_size) * vp_group_size,
+            vp_group_size,
+        )
+
+        if k_local == 0 and k_global > 0:
+            raise RuntimeError(
+                f"DP rank {dp_rank} drained 0 micro-batches but K_global={k_global} "
+                f"for rollout {rollout_id}. Check sampler balance / rollout production."
+            )
+
+        if k_local < k_global:
+            shortest_idx = min(
+                range(k_local),
+                key=lambda i: sum(mbs[i][0].get("total_lengths", [0])),
+            )
+            template_batch, template_meta = mbs[shortest_idx]
+            for _ in range(k_global - k_local):
+                mbs.append((template_batch, template_meta))
+
+        vpp_loss_scale = k_global / n_global * mpu.get_data_parallel_world_size(with_context_parallel=True)
+        data_iterator = [
+            MicroBatchListIterator(mbs, dummy_after=k_local, loss_scale=vpp_loss_scale) for _ in range(vpp_size)
+        ]
+        num_microbatches = [k_global]
+        return data_iterator, num_microbatches
 
     def _get_data_from_transfer_queue(
         self, task_name, rollout_id, data_fields, batch_size, batch_index, partition_id: str | None = None
@@ -1640,8 +1906,71 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return rollout_data, batch_meta
 
-    def _put_data_to_transfer_queue(self, output_dict=None, batch_meta=None):
+    def _gather_cp_output_for_transfer_queue(self, output_dict, rollout_data):
+        token_fields = {
+            "log_probs",
+            "ref_log_probs",
+            "rollout_log_probs",
+            "teacher_log_probs",
+            "values",
+            "advantages",
+            "returns",
+            "opd_reverse_kl",
+        }
+        fields_to_gather = [
+            key for key, value in output_dict.items() if key in token_fields and isinstance(value, List)
+        ]
+        if mpu.get_context_parallel_world_size() == 1 or not fields_to_gather:
+            return output_dict
+        if rollout_data is None:
+            raise ValueError("rollout_data is required to gather CP-sharded outputs before putting to TransferQueue")
+
+        total_lengths = [int(length) for length in rollout_data["total_lengths"]]
+        response_lengths = [int(length) for length in rollout_data["response_lengths"]]
+        max_seq_lens = rollout_data.get("max_seq_lens")
+        if max_seq_lens is None:
+            max_seq_lens = [None] * len(total_lengths)
+        padded_total_lengths = maybe_padded_total_lengths(
+            total_lengths,
+            self.args.qkv_format,
+            "multimodal_train_inputs" in rollout_data or getattr(self.args, "uses_unsplit_forward", False),
+        )
+        if padded_total_lengths is None:
+            padded_total_lengths = [None] * len(total_lengths)
+
+        gathered_output = dict(output_dict)
+        for key in fields_to_gather:
+            values = output_dict[key]
+            if len(values) != len(total_lengths):
+                raise ValueError(
+                    f"Cannot gather field '{key}' with {len(values)} values for {len(total_lengths)} samples"
+                )
+            gathered_output[key] = [
+                all_gather_with_cp(
+                    value,
+                    total_length,
+                    response_length,
+                    padded_total_length=padded_total_length,
+                    qkv_format=self.args.qkv_format,
+                    max_seq_len=max_seq_len,
+                )
+                for value, total_length, response_length, max_seq_len, padded_total_length in zip(
+                    values,
+                    total_lengths,
+                    response_lengths,
+                    max_seq_lens,
+                    padded_total_lengths,
+                    strict=False,
+                )
+            ]
+
+        return gathered_output
+
+    def _put_data_to_transfer_queue(self, output_dict=None, batch_meta=None, rollout_data=None):
         if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
+            output_dict = self._gather_cp_output_for_transfer_queue(output_dict, rollout_data)
+            if mpu.get_context_parallel_rank() != 0:
+                return
             output_dict = {
                 key: value.cpu()
                 if not isinstance(value, List)

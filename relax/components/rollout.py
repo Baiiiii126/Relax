@@ -552,6 +552,18 @@ class Rollout(Base):
         return 0
 
     async def _async_check_production_for_update_weight(self, step: int) -> bool:
+        # The final rollout has already left the producer loop; there is no
+        # in-flight generation to pause before syncing weights for final eval.
+        if step >= self.config.num_rollout:
+            return True
+
+        # No-preset-global-batch path: a tensor-wide .all() flips True as soon as
+        # activated rows are produced (even mid-fill across steps), admitting an
+        # under-filled partition. Gate on the explicit producer completion signal.
+        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+            return await self.data_system_client.async_check_production_completed(
+                f"train_{step - 1}"
+            ) or await self.data_system_client.async_check_production_completed(f"train_{step}")
         return await self.data_system_client.async_check_production_status(
             ["tokens"], f"train_{step - 1}"
         ) or await self.data_system_client.async_check_production_status(["tokens"], f"train_{step}")
@@ -562,6 +574,8 @@ class Rollout(Base):
         failure)."""
         if self.eval_handler is None:
             return {"done": True}
+        if isinstance(self.eval_handler, asyncio.Future):
+            return {"done": self.eval_handler.done()}
         try:
             ready, _ = ray.wait([self.eval_handler], timeout=0)
         except Exception:

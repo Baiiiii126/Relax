@@ -83,7 +83,7 @@ PERF_ARGS=(
 
    --calculate-per-token-loss
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 12288
    --no-rope-fusion
 )
 

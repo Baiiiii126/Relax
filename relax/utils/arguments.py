@@ -1131,7 +1131,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Balance the number of tokens between data parallel ranks with `karmarkar_karp` for verl. "
-                    "Note that this may allocate the different response of the same prompt into different training steps."
+                    "Note that this may allocate the different response of the same prompt into different training steps. "
+                    "In fully-async + --use-dynamic-batch-size mode this is effectively always on: the "
+                    "StreamingTokenBudgetSampler already balances tokens across DP ranks per sample, so the "
+                    "flag is accepted but has no additional effect there."
                 ),
             )
 
@@ -2685,6 +2688,24 @@ def slime_validate_args(args):
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
 
+        # The token-budget sampler always emits at least one sample per micro-batch,
+        # even if that single sample exceeds the budget (otherwise the stream stalls).
+        # So the per-GPU token budget (max_tokens_per_gpu * context_parallel_size,
+        # since a sequence is split across CP ranks) must be able to hold the longest
+        # possible single sample (rollout_max_context_len). Otherwise an over-long
+        # sample produces an oversized micro-batch that OOMs mid-training.
+        max_ctx_len = getattr(args, "rollout_max_context_len", None)
+        if max_ctx_len is not None:
+            cp_size = getattr(args, "context_parallel_size", 1)
+            token_budget = args.max_tokens_per_gpu * cp_size
+            if token_budget < max_ctx_len:
+                raise ValueError(
+                    f"max_tokens_per_gpu * context_parallel_size ({args.max_tokens_per_gpu} * {cp_size} = "
+                    f"{token_budget}) must be >= rollout_max_context_len ({max_ctx_len}); otherwise a single "
+                    f"over-long sample forms an oversized micro-batch and OOMs. Increase max_tokens_per_gpu "
+                    f"(or context_parallel_size), or reduce rollout_max_context_len."
+                )
+
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
 
@@ -2786,14 +2807,6 @@ def slime_validate_args(args):
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "
             "Use --hybrid instead, which is the supported public flag for hybrid training mode."
-        )
-
-    if args.fully_async and args.balance_data and not args.hybrid:
-        raise ValueError(
-            "--balance-data is not supported in pure fully-async mode (--fully-async without --hybrid). "
-            "In pure fully-async training, the actor consumes rollout data via StreamDataLoader "
-            "which is incompatible with data balancing. Use --hybrid mode "
-            "or remove --balance-data from your command."
         )
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
