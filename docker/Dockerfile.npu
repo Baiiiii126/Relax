@@ -1,9 +1,30 @@
 #
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 FROM quay.io/ascend/vllm-ascend:v0.18.0-a3
 
-COPY . /root/Relax
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+
+ENV http_proxy=${HTTP_PROXY} \
+    https_proxy=${HTTPS_PROXY} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    no_proxy=${NO_PROXY} \
+    NO_PROXY=${NO_PROXY}
+
 WORKDIR /root
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+RUN if [ -n "$HTTP_PROXY" ]; then \
+      echo "Acquire::http::Proxy \"$HTTP_PROXY\";" > /etc/apt/apt.conf.d/99proxy; \
+      echo "Acquire::https::Proxy \"$HTTPS_PROXY\";" >> /etc/apt/apt.conf.d/99proxy; \
+    fi
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
     build-essential patchelf tmux net-tools htop nano iputils-ping \
@@ -41,11 +62,13 @@ RUN pip config set global.index-url ${PIP_INDEX_URL} && \
     cd /root/sgl-kernel-npu && \
     git checkout 2026.04.15.rc4 && \
     bash build.sh && \
-    pip install output/*.whl && \
-    cd /root/Relax && pip install -r requirements.txt && pip install -e .
+    pip install output/*.whl
+
+COPY . /root/Relax
+RUN cd /root/Relax && pip install -r requirements.txt && pip install -e .
 
 RUN pip install --no-cache-dir tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps && \
     pip install nvidia-modelopt && \
     pip install setuptools==79.0.1 && \
     pip install transformers==4.57.3 && \

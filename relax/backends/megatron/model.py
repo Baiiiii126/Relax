@@ -25,6 +25,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.utils import telemetry, tracking_utils
+from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory
 from relax.utils.timer import timer
@@ -550,7 +551,28 @@ def train_one_step(
         return output_tensor, partial(loss_function, args, batch, num_microbatches)
 
     # Forward pass.
-    forward_backward_func = get_forward_backward_func()
+    use_streaming = (
+        getattr(args, "use_dynamic_batch_size", False)
+        and getattr(args, "fully_async", False)
+        and mpu.get_virtual_pipeline_model_parallel_world_size() is None
+        and isinstance(data_iterator[0], StreamingTQIterator)
+    )
+    if use_streaming:
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size <= 1:
+            from relax.backends.megatron.streaming_schedules import (
+                streaming_forward_backward_no_pipelining,
+            )
+
+            forward_backward_func = streaming_forward_backward_no_pipelining
+        else:
+            from relax.backends.megatron.streaming_schedules import (
+                streaming_forward_backward_pipelining_without_interleaving,
+            )
+
+            forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
+    else:
+        forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
