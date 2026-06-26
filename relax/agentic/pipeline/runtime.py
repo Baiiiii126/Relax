@@ -716,6 +716,51 @@ class ManagedSessionRunner:
             if (task := self._tasks_by_handle.get(session_handle)) is not None and task.done()
         ]
 
+    async def completed_session_diagnostics(self, *, session_handles: list[str]) -> dict[str, dict[str, Any]]:
+        """Peek the result/exception of each completed task without consuming
+        it.
+
+        Returns a dict mapping session_handle -> diagnostic payload. The diagnostic
+        payload distinguishes:
+          - ``{"kind": "exception", "error_type": str, "message": str}`` — task
+            raised; for AgentExecutionError the ``message`` carries the agent
+            subprocess's exit code AND full stdout+stderr (see
+            ``execute_managed_session_input`` line ~346).
+          - ``{"kind": "cancelled"}`` — task was cancelled (e.g. shutdown).
+          - ``{"kind": "result", "session_id": str, "reward": Any}`` — task
+            returned a result payload but never produced a chat IR upstream
+            (the genuine "silent-success" case: agent exited 0 without doing work).
+
+        Tasks that are missing from tracking or not yet done are omitted so this
+        is safe to call with the full set of group handles. Does NOT consume the
+        task — other layers (materialization, release_sessions) can still process
+        it normally.
+        """
+        result: dict[str, dict[str, Any]] = {}
+        for handle in session_handles:
+            task = self._tasks_by_handle.get(handle)
+            if task is None or not task.done():
+                continue
+            if task.cancelled():
+                result[handle] = {"kind": "cancelled"}
+                continue
+            exc = task.exception()
+            if exc is not None:
+                result[handle] = {
+                    "kind": "exception",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                continue
+            payload = task.result()
+            reward = payload.get("reward") if isinstance(payload, dict) else None
+            result[handle] = {
+                "kind": "result",
+                "session_id": self._session_id_by_handle.get(handle, ""),
+                "reward": reward,
+            }
+        return result
+
     async def collect_session(self, *, session_handle: str) -> dict[str, Any]:
         task = self._tasks_by_handle.get(session_handle)
         if task is None:
@@ -888,6 +933,47 @@ class ManagedSessionRunnerPool:
             for session_handle in completed_session_handles:
                 completed_handles.append(ManagedSessionHandle(runner_id=runner_id, session_handle=str(session_handle)))
         return completed_handles
+
+    def completed_session_diagnostics(
+        self, *, session_handles: list[ManagedSessionHandle]
+    ) -> dict[ManagedSessionHandle, dict[str, Any]]:
+        """Fan out to each runner and collect diagnostic info for every handle
+        whose task has finished.
+
+        See ``ManagedSessionRunner.completed_session_diagnostics`` for the per-
+        handle payload schema. Used by RuntimeDomain when raising the
+        ``completed before producing a chat IR`` error so the driver log can
+        show the agent's actual exit reason (AgentExecutionError stdio for
+        subprocess crashes, ``kind=result`` for true silent-success bugs)
+        instead of only a list of session_ids.
+        """
+        if not session_handles:
+            return {}
+        handles_by_runner_id: dict[int, list[str]] = {}
+        for handle in session_handles:
+            if handle.runner_id < 0 or handle.runner_id >= len(self._handles):
+                raise RuntimeError(
+                    "Managed session handle references an unknown runner: "
+                    f"runner_id={handle.runner_id}, runner_count={len(self._handles)}."
+                )
+            handles_by_runner_id.setdefault(handle.runner_id, []).append(handle.session_handle)
+        refs = []
+        ref_to_runner_id: dict[Any, int] = {}
+        for runner_id in sorted(handles_by_runner_id):
+            ref = self._handles[runner_id].completed_session_diagnostics.remote(
+                session_handles=handles_by_runner_id[runner_id]
+            )
+            refs.append(ref)
+            ref_to_runner_id[ref] = runner_id
+        diagnostics: dict[ManagedSessionHandle, dict[str, Any]] = {}
+        for ref, partial in zip(refs, ray.get(refs), strict=True):
+            runner_id = ref_to_runner_id[ref]
+            if not isinstance(partial, dict):
+                continue
+            for session_handle_str, diag in partial.items():
+                key = ManagedSessionHandle(runner_id=runner_id, session_handle=str(session_handle_str))
+                diagnostics[key] = diag
+        return diagnostics
 
     def available_launch_slots(self) -> int:
         available_launch_slots = self._total_capacity - self._active_session_count - self._reserved_launch_slots
@@ -1689,11 +1775,16 @@ class RuntimeDomain:
                     if cause is not None:
                         session_local_failure_type = type(cause).__name__
                 if session_local_failure:
-                    logger.info(
-                        "Dropping failed resident agentic session session_id=%s request_id=%s error_type=%s",
+                    # ERROR-level + full message: AgentExecutionError carries the agent
+                    # subprocess's stdout+stderr (runtime.py:340-342), so dumping str(error)
+                    # surfaces the actual Python traceback from the agent in the training log,
+                    # instead of just a one-line "Dropping ..." that hides every retry's cause.
+                    logger.error(
+                        "Dropping failed resident agentic session session_id=%s request_id=%s error_type=%s\n%s",
                         materialized_record.session_id,
                         materialized_record.request_id,
                         session_local_failure_type,
+                        str(materialized_record.error),
                     )
                     discarded_group_keys.add(materialized_record.group_key)
                     await self._drop_runtime_group_resources(group_key=materialized_record.group_key)
@@ -2060,14 +2151,66 @@ class RuntimeDomain:
         total_sessions: int,
         ready_sessions: int,
     ) -> None:
-        completed_requests = self.prepare_group_completed_before_ready(group_state=group_state)
-        if not completed_requests:
+        if not group_state.request_handles:
             return
+        runner_pool = self._session_runner_pool
+        if runner_pool is None:
+            raise RuntimeError("RuntimeDomain cannot validate prepare-owned managed sessions without a runner pool.")
+        # Build the (managed_handle -> session_id, request_id) mapping inline so
+        # we can both detect "task done" AND look up its actual result/exception
+        # in a single runner round-trip. Otherwise we'd race the materialization
+        # layer's AgentExecutionError logger (runtime.py:~1755), which never
+        # gets to run because this raise kills the rollout dataflow loop first.
+        handle_to_request: dict[ManagedSessionHandle, tuple[str, str]] = {}
+        for request_handle in group_state.request_handles:
+            managed_handle = request_handle.managed_session_handle
+            if not isinstance(managed_handle, ManagedSessionHandle):
+                raise RuntimeError(
+                    "Prepare-owned request is missing a managed session handle; "
+                    f"group_id={group_state.group_id} slot_idx={request_handle.slot_idx}."
+                )
+            try:
+                envelope = group_state.request_group[request_handle.slot_idx]
+            except IndexError as exc:
+                raise RuntimeError(
+                    f"Prepare group {group_state.group_id} has inconsistent slot indexing "
+                    f"at slot={request_handle.slot_idx}."
+                ) from exc
+            handle_to_request[managed_handle] = (envelope.session_id, envelope.request_id)
+        diagnostics = runner_pool.completed_session_diagnostics(session_handles=list(handle_to_request))
+        if not diagnostics:
+            return
+        error_sections: list[str] = []
+        for managed_handle, diag in diagnostics.items():
+            session_id, request_id = handle_to_request[managed_handle]
+            kind = diag.get("kind") if isinstance(diag, dict) else None
+            if kind == "exception":
+                # AgentExecutionError.message already carries
+                # "Managed command agent exited with code N\n<combined stdout+stderr>"
+                # (see execute_managed_session_input). Dumping it here gives the
+                # actual agent failure (e.g. concurrent pip race, import error,
+                # SIF startup failure) in the driver log.
+                error_sections.append(
+                    f"\n--- session {session_id} (request {request_id}) failed: "
+                    f"{diag.get('error_type', 'Exception')} ---\n"
+                    f"{diag.get('message', '')}"
+                )
+            elif kind == "cancelled":
+                error_sections.append(f"\n--- session {session_id} (request {request_id}) cancelled ---")
+            else:
+                # Genuine silent-success: task returned a payload but never
+                # produced a chat IR upstream. Likely an agent bug that exited
+                # 0 before making any chat completion call.
+                reward = diag.get("reward") if isinstance(diag, dict) else None
+                error_sections.append(
+                    f"\n--- session {session_id} (request {request_id}) silent-success "
+                    f"(exit 0, no chat IR, reward={reward!r}) ---"
+                )
         raise RuntimeError(
             "Prepare-owned managed agent session completed before producing a chat IR: "
             f"group_id={group_state.group_id}, group_generation={group_state.group_generation}, "
             f"expected_sessions={len(group_state.request_handles)}, total_sessions={total_sessions}, "
-            f"ready_sessions={ready_sessions}, completed_requests={completed_requests[:8]}."
+            f"ready_sessions={ready_sessions}, completed_session_count={len(diagnostics)}." + "".join(error_sections)
         )
 
     async def activate_group_sessions(
