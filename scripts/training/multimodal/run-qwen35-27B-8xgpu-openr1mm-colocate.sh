@@ -24,7 +24,7 @@ source "${MODEL_CONFIG_DIR}/qwen35-27B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/colocate_openr1mm}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
-MODEL_DIR="${MODEL_DIR:-/mnt/nj-public02/dataset/redaccel/models}"
+MODEL_DIR="${MODEL_DIR:?Please set MODEL_DIR to the directory containing Qwen3.5-27B}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
