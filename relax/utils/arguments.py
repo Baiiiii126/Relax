@@ -1239,8 +1239,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Target size of the agentic prepare pool in groups. "
-                    "If unset, defaults to over_sampling_batch_size."
+                    "Positive target size of the agentic prepare pool in groups, or 0 to start agent processes after "
+                    "rollout begins. If unset, defaults to over_sampling_batch_size."
                 ),
             )
             parser.add_argument(
@@ -2425,8 +2425,8 @@ def _validate_agentic_rollout_args(args) -> None:
             raise ValueError(f"--agent-env entry must include a non-empty key, got {item!r}.")
         if key.startswith("RELAX_"):
             raise ValueError(f"--agent-env does not allow reserved key {key!r}.")
-    if args.agentic_prepare_pool_size is not None and args.agentic_prepare_pool_size <= 0:
-        raise ValueError("--agentic-prepare-pool-size must be > 0.")
+    if args.agentic_prepare_pool_size is not None and args.agentic_prepare_pool_size < 0:
+        raise ValueError("--agentic-prepare-pool-size must be >= 0.")
     if args.agentic_eval_prepare_pool_size is not None and args.agentic_eval_prepare_pool_size <= 0:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
