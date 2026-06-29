@@ -138,25 +138,51 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
     exec bash "$RUN_SCRIPT" "$@"
 else
     # ── WORKER NODE ─────────────────────────────────────────────────────────
-    echo "=== Worker node: joining Ray cluster at ${MASTER_ADDR}:6379 ==="
-    while true; do
-        ray start \
-            --address="${MASTER_ADDR}:6379" \
+    # NOTE: `set -e` is active, so each retry loop below must keep the
+    # potentially-failing command in a condition position (if/until/||),
+    # otherwise the first failure kills the script and there is no retry.
+    GCS_PORT="${GCS_PORT:-6379}"
+    echo "=== Worker node: waiting for head GCS at ${MASTER_ADDR}:${GCS_PORT} ==="
+    for i in $(seq 1 120); do
+        if timeout 2 bash -c "</dev/tcp/${MASTER_ADDR}/${GCS_PORT}" 2>/dev/null; then
+            echo "Head GCS reachable after ${i} attempt(s)"
+            break
+        fi
+        if [ "$i" -eq 120 ]; then
+            echo "ERROR: head GCS at ${MASTER_ADDR}:${GCS_PORT} unreachable after 10min" >&2
+            exit 1
+        fi
+        sleep 5
+    done
+
+    echo "=== Worker node: joining Ray cluster at ${MASTER_ADDR}:${GCS_PORT} ==="
+    joined=0
+    for i in $(seq 1 30); do
+        ray stop --force >/dev/null 2>&1 || true
+        if ray start \
+            --address="${MASTER_ADDR}:${GCS_PORT}" \
             --num-gpus "${NUM_GPUS}" \
             --node-ip-address "${HOST_IP}" \
             --disable-usage-stats \
             --dashboard-host=0.0.0.0 \
-            --dashboard-port=8265
-
-        sleep 5
-        ray status
-        if [ $? -eq 0 ]; then
-            echo "Successfully connected to the Ray cluster!"
+            --dashboard-port=8265; then
+            echo "Joined Ray cluster on attempt ${i}"
+            joined=1
             break
-        else
-            echo "Failed to connect to the Ray cluster. Retrying in 5 seconds..."
         fi
+        echo "ray start failed on attempt ${i}, retrying in 5s..."
+        sleep 5
     done
+    if [ "$joined" -ne 1 ]; then
+        echo "ERROR: worker failed to join Ray cluster after 30 attempts" >&2
+        exit 1
+    fi
+
+    if ! ray status >/dev/null 2>&1; then
+        echo "ERROR: ray status failed after join" >&2
+        exit 1
+    fi
+    echo "Successfully connected to the Ray cluster!"
 
     # Worker nodes block indefinitely (training runs on head node)
     echo "=== Worker node ready, waiting for training to complete ==="
