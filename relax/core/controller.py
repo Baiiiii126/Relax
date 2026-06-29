@@ -10,7 +10,7 @@ import ray
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
-from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
+from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler, StreamingTokenBudgetSampler
 
 from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
 from relax.agentic.session.service import (
@@ -112,8 +112,6 @@ class Controller:
             # budget; the controller-side sampler maintains per-DP buckets and
             # balances tokens at small-unit granularity.  See
             # docs/draft/dynamic_batch_size_fully_async.md.
-            from transfer_queue import StreamingTokenBudgetSampler
-
             sampler = StreamingTokenBudgetSampler(
                 n_samples_per_prompt=self.config.n_samples_per_prompt,
             )
