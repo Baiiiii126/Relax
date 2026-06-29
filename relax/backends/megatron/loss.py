@@ -1,5 +1,6 @@
 from argparse import Namespace
 from collections.abc import Callable, Iterator
+from functools import partial
 from typing import Any
 
 import torch
@@ -15,6 +16,7 @@ from relax.utils.training.ppo_utils import (
     compute_approx_kl,
     compute_cispo_loss,
     compute_gspo_kl,
+    compute_log_probs,
     compute_opsm_mask,
     compute_policy_loss,
     compute_sapo_loss,
@@ -67,7 +69,14 @@ def get_responses(
     """
     qkv_format = args.qkv_format
 
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    # SFT chunked path (--sft-chunked-logits) feeds hidden_states (bf16) into
+    # this slicer — slicing itself is dtype-agnostic; that caller casts to fp32
+    # per sub-chunk. All other paths (RL, SFT legacy logits, SFT eval PPL)
+    # produce real fp32 logits and must stay strict.
+    if args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False):
+        assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
+    else:
+        assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
 
     if qkv_format == "thd":
@@ -149,7 +158,14 @@ def get_responses(
 
         # Apply temperature per-chunk instead of on the full [T, V] logits to avoid
         # a single ~16GiB allocation that OOMs under fragmentation.
-        if args.rollout_temperature != 1.0:
+        # Skip when SFT chunked path is on (--sft-chunked-logits): in that mode
+        # `logits_chunk` here is actually `hidden_states` (shape [R, H], not
+        # [R, V]) — dividing hidden activations by a softmax-distribution
+        # temperature is mathematically meaningless. That caller applies
+        # temperature on the real per-sub-chunk logits after lm_head instead.
+        if args.rollout_temperature != 1.0 and not (
+            args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False)
+        ):
             logits_chunk = logits_chunk / args.rollout_temperature
 
         yield logits_chunk, tokens_chunk
@@ -258,6 +274,7 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
     **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Compute per-token log-probabilities (and optionally entropy) on
@@ -270,13 +287,21 @@ def get_log_probs_and_entropy(
     when requested.
 
     Args:
-        logits: Policy logits with shape `[1, T, V]`.
+        logits: Policy logits with shape `[1, T, V]`. When ``lm_head_forward``
+            is provided this is instead per-sample hidden_states
+            `[B, S, H]` — see ``lm_head_forward`` below.
         args: Configuration (temperature applied in `get_responses`).
         unconcat_tokens: List of token tensors per sample.
         total_lengths: Total sequence lengths per sample.
         response_lengths: Response segment lengths per sample.
         with_entropy: If True, include "entropy" key in result.
         non_loss_data: Unused; kept for API compatibility.
+        lm_head_forward: If set, ``logits`` is actually hidden_states; we defer
+            the lm_head into this loss path and chunk the matmul at
+            ``args.sft_logits_chunk_size`` so the full ``[B, S, V/TP]`` logits
+            never materialize (SFT chunked path). Requires ``with_entropy=False``
+            and ``with_topk=False`` — chunked path has no full-vocab tensor to
+            derive entropy/top-k from.
 
     Returns:
         Tuple of:
@@ -286,7 +311,15 @@ def get_log_probs_and_entropy(
         a list of `[R]` tensors.
     """
     assert non_loss_data
+    if lm_head_forward is not None:
+        assert not with_entropy and not with_topk, (
+            "lm_head_forward chunked path doesn't materialize full vocab — entropy/topk unavailable."
+        )
+        sft_chunk_size = getattr(args, "sft_logits_chunk_size", 1024)
+        if sft_chunk_size <= 0:
+            sft_chunk_size = 1024
     resolved_topk_k = topk_k if topk_k is not None else getattr(args, "opd_log_prob_top_k", 0)
+    tp_group = mpu.get_tensor_model_parallel_group()
     log_probs_list = []
     entropy_list = []
     topk_token_ids_list = []
@@ -299,15 +332,41 @@ def get_log_probs_and_entropy(
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
     ):
-        log_prob, entropy = calculate_log_probs_and_entropy(
-            logits_chunk,
-            tokens_chunk,
-            mpu.get_tensor_model_parallel_group(),
-            with_entropy=with_entropy,
-            chunk_size=args.log_probs_chunk_size,
-        )
+        if lm_head_forward is not None:
+            # SFT chunked: logits_chunk is per-sample hidden_states [R, H].
+            # Run lm_head per sub-chunk so the full [R, V/TP] logits tensor
+            # never materializes; concat per-sub-chunk log_probs back into the
+            # per-sample [R] tensor that downstream expects.
+            chunk_lps: list[torch.Tensor] = []
+            for s in range(0, logits_chunk.size(0), sft_chunk_size):
+                e = min(s + sft_chunk_size, logits_chunk.size(0))
+                h_sub = logits_chunk[s:e].unsqueeze(1)  # [sub, 1, H]
+                logits_sub, _ = lm_head_forward(h_sub)
+                logits_sub = logits_sub.squeeze(1).float()
+                if args.rollout_temperature != 1.0:
+                    logits_sub = logits_sub / args.rollout_temperature
+                chunk_lps.append(compute_log_probs(logits_sub, tokens_chunk[s:e], tp_group).squeeze(-1))
+            log_prob = (
+                torch.cat(chunk_lps, dim=0)
+                if chunk_lps
+                # fp32 to match compute_log_probs's return dtype (Megatron's
+                # fused_vocab_parallel_cross_entropy returns fp32 because we
+                # upcast logits with .float() above). Mismatch would break the
+                # downstream torch.cat over per-sample log_probs.
+                else logits_chunk.new_zeros((0,), dtype=torch.float32)
+            )
+            entropy = None
+        else:
+            log_prob, entropy = calculate_log_probs_and_entropy(
+                logits_chunk,
+                tokens_chunk,
+                tp_group,
+                with_entropy=with_entropy,
+                chunk_size=args.log_probs_chunk_size,
+            )
+            log_prob = log_prob.squeeze(-1)
 
-        log_probs_list.append(log_prob.squeeze(-1))
+        log_probs_list.append(log_prob)
         entropy_list.append(entropy)
 
         if with_topk:
@@ -1065,11 +1124,56 @@ def sft_loss_function(
     )
 
 
+def sft_loss_function_chunked(
+    args: Namespace,
+    batch: RolloutBatch,
+    hidden_states: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """SFT loss that defers lm_head into the loss to avoid materializing the
+    full [B, S, V/TP] logits tensor. ``hidden_states`` is [B, S, H] (the bypass
+    in forward_step gathers any SP-sharded hidden into full S);
+    ``lm_head_forward`` is the captured original output_layer.forward.
+
+    Inner-func signature matches ``sft_loss_function``; dispatched from
+    ``loss_function`` via ``partial(this, lm_head_forward=lm_head_forward)`` so
+    the recompute wrap, CP grad-flow guard, Megatron scaling tail, and return-
+    tuple shape all reuse ``loss_function``'s outer body. Body itself mirrors
+    ``sft_loss_function`` one-for-one — only difference is passing
+    ``lm_head_forward`` into ``get_log_probs_and_entropy`` (which then chunks
+    the lm_head + CE matmul internally — see that function's docstring).
+    """
+    _, log_probs_and_entropy = get_log_probs_and_entropy(
+        hidden_states,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        with_entropy=False,
+        max_seq_lens=batch.get("max_seq_lens", None),
+        padded_total_lengths=batch.get("padded_total_lengths", None),
+        lm_head_forward=lm_head_forward,
+    )
+
+    log_probs = log_probs_and_entropy["log_probs"]
+    log_probs = torch.cat(log_probs, dim=0)
+    loss = -sum_of_sample_mean(log_probs)
+
+    if log_probs.numel() == 0:
+        loss += 0 * hidden_states.sum()
+
+    return loss, {"loss": loss.clone().detach()}
+
+
 def loss_function(
     args: Namespace,
     batch: RolloutBatch,
     num_microbatches: int,
     logits: torch.Tensor,
+    *,
+    lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1084,7 +1188,13 @@ def loss_function(
         batch: Mini-batch with "loss_masks", "response_lengths", and other
             keys required by the selected loss function.
         num_microbatches: Number of gradient accumulation steps.
-        logits: Model outputs (policy or value head).
+        logits: Model outputs (policy or value head). For SFT chunked path,
+            this is actually hidden_states `[B, S, H]` (model() bypassed the
+            output_layer); ``lm_head_forward`` must be supplied so the loss
+            function can run lm_head per sub-chunk.
+        lm_head_forward: Captured original output_layer.forward callable from
+            ``_bypass_output_layer``; only meaningful when SFT chunked path is
+            active. Forward_step always partials this in (None when not chunked).
 
     Returns:
         Tuple of `(scaled_loss, normalizer, logging_dict)` where:
@@ -1113,7 +1223,13 @@ def loss_function(
         case "value_loss":
             func = value_loss_function
         case "sft":
-            func = sft_loss_function
+            if getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
+                # Bind lm_head_forward so chunked path matches the standard
+                # inner-func signature; outer body (recompute, CP guard,
+                # Megatron scaling, return-tuple) is then shared with legacy.
+                func = partial(sft_loss_function_chunked, lm_head_forward=lm_head_forward)
+            else:
+                func = sft_loss_function
         case "custom_loss":
             func = load_function(args.custom_loss_function_path)
         case _:

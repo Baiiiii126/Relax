@@ -340,6 +340,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--sft-logits-chunk-size",
+                type=int,
+                default=1024,
+                help="SFT only: chunk size for the lm_head + CE matmul under "
+                "sft_loss_function_chunked (avoids materializing full [B,S,V/TP] logits). "
+                "Independent from --log-probs-chunk-size, which only chunks the post-logits "
+                "log_prob reduce used by RL paths and SFT eval (PPL).",
+            )
+            parser.add_argument(
+                "--sft-chunked-logits",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="SFT only: defer lm_head into the loss and chunk the lm_head + CE "
+                "matmul (sft_loss_function_chunked) to avoid materializing full [B,S,V/TP] "
+                "logits. Default off — legacy external-loss SFT path materializes full logits "
+                "and runs CE externally. Set --sft-chunked-logits to opt in. Force-disabled "
+                "when --enable-mtp-training is set (MTP head needs the real output_layer; "
+                "bypass would break it) or when embeddings are tied "
+                "(--untie-embeddings-and-output-weights not set: output_layer is built with "
+                "skip_weight_param_allocation=True so output_layer.weight is None and the "
+                "chunked path's lm_head matmul has nothing to multiply against; tied models "
+                "are small enough that the chunked path's memory win is marginal anyway).",
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",
@@ -2948,6 +2972,44 @@ def slime_validate_args(args):
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
+
+    # --sft-chunked-logits incompatibilities. All three are flagged here so
+    # downstream (model.py _should_use_sft_chunked + the three loss.py direct
+    # reads of args.sft_chunked_logits) sees a single, consistent truth.
+    # All three are hard asserts — the user must remove --sft-chunked-logits
+    # from their script rather than have it silently flipped off.
+    if getattr(args, "sft_chunked_logits", False):
+        # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
+        #    Output_layer is built with skip_weight_param_allocation=True →
+        #    output_layer.weight is None → chunked path's lm_head matmul
+        #    crashes on NoneType. The chunked memory win is marginal on the
+        #    small models that ship with tied embeddings anyway, so the user
+        #    should just drop the flag.
+        assert getattr(args, "untie_embeddings_and_output_weights", False), (
+            "--sft-chunked-logits is incompatible with tied embeddings "
+            "(HF config.tie_word_embeddings=true → "
+            "--untie-embeddings-and-output-weights not set; output_layer.weight "
+            "is None and the chunked path's lm_head matmul has nothing to "
+            "multiply against). Remove --sft-chunked-logits; the chunked "
+            "memory win is marginal on tied-weight models."
+        )
+        # 2) MTP. MTP's _postprocess reaches for self.output_layer directly;
+        #    _bypass_output_layer's passthrough would break the MTP head.
+        assert not getattr(args, "enable_mtp_training", False), (
+            "--sft-chunked-logits is incompatible with --enable-mtp-training "
+            "(MTP head needs the real output_layer; the chunked path's "
+            "passthrough would break it). Remove one of the two flags."
+        )
+        # 3) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        #    forward through model.build_schedule_plan(), which does NOT call
+        #    model(**kwargs) and so never hits _bypass_output_layer — chunked
+        #    silently degrades to the full-logits path.
+        assert not getattr(args, "overlap_moe_expert_parallel_comm", False), (
+            "--sft-chunked-logits is incompatible with "
+            "--overlap-moe-expert-parallel-comm (combined-1f1b path bypasses "
+            "_bypass_output_layer; chunked would silently degrade). "
+            "Remove one of the two flags."
+        )
 
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
