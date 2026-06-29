@@ -4,7 +4,31 @@ import argparse
 import os
 
 import megatron.bridge.training.model_load_save as _model_load_save_module
+import safetensors.torch as _safetensors_torch
 from megatron.bridge import AutoBridge
+
+
+# Some megatron_to_hf mappings in Megatron Bridge yield non-contiguous tensors (e.g. after
+# transpose/narrow/chunk without a trailing .contiguous()). The shared-tensor dedup check in
+# safetensors.save_file runs `tensor.view(-1)[-1]`, which raises
+# "view size is not compatible with input tensor's size and stride" on such tensors.
+# Force .contiguous() at the save boundary as a safety net.
+_original_save_file = _safetensors_torch.save_file
+
+
+def _save_file_ensure_contiguous(tensors, filename, metadata=None):
+    fixed = {}
+    for k, v in tensors.items():
+        if hasattr(v, "is_contiguous") and not v.is_contiguous():
+            print(
+                f"[convert] forcing .contiguous() on non-contig tensor: {k} shape={tuple(v.shape)} stride={v.stride()}"
+            )
+            v = v.contiguous()
+        fixed[k] = v
+    return _original_save_file(fixed, filename, metadata=metadata)
+
+
+_safetensors_torch.save_file = _save_file_ensure_contiguous
 
 
 # Here we need to patch Megatron Bridge's `load_model_config`, since the checkpoint is saved
