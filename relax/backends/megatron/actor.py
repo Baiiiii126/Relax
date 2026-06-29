@@ -74,7 +74,10 @@ from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
 from .data import (
+    ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
+    build_rollout_minibatch_plan,
+    concat_rollout_batches,
     get_data_iterator,
     log_perf_data,
     log_perf_data_fwd,
@@ -543,9 +546,26 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.debug_train_only:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for debug with mcore.")
-            batch_size = self.args.global_batch_size // mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+            if is_sft_mode(self.args):
+                batch_size = self.args.global_batch_size // dp_size
+                rollout_mini_local_sample_counts = None
+            else:
+                plan = build_rollout_minibatch_plan(self.args, dp_size)
+                batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
+                rollout_mini_local_sample_counts = [
+                    plan.mini_local_sample_request for _ in range(plan.num_rollout_minis)
+                ]
             rollout_data = get_debug_data(self.args, rollout_id, batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, rollout_data)
+            if rollout_mini_local_sample_counts is not None:
+                if sum(rollout_mini_local_sample_counts) != len(rollout_data["total_lengths"]):
+                    raise RuntimeError(
+                        "debug rollout data size does not match rollout mini plan: "
+                        f"counts={rollout_mini_local_sample_counts}, "
+                        f"num_local_samples={len(rollout_data['total_lengths'])}"
+                    )
+                rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
 
             if self.role == "critic":
                 return self.train_critic(rollout_id, rollout_data)
@@ -557,16 +577,20 @@ class MegatronTrainRayActor(TrainRayActor):
                 batch_size = self.args.global_batch_size // mpu.get_data_parallel_world_size(
                     with_context_parallel=False
                 )
+                num_rollout_minis = 1
             else:
-                batch_size = (
-                    self.args.rollout_batch_size
-                    * self.args.n_samples_per_prompt
-                    // mpu.get_data_parallel_world_size(with_context_parallel=False)
+                plan = build_rollout_minibatch_plan(
+                    self.args,
+                    mpu.get_data_parallel_world_size(with_context_parallel=False),
                 )
+                batch_size = plan.mini_local_sample_request
+                num_rollout_minis = plan.num_rollout_minis
             batch_index = 0
             task_name = sft_task_name(self.args, component="backend")
             empty_poll_sleep_s = float(os.environ.get("RELAX_EMPTY_POLL_SLEEP_MS", "50")) / 1000.0
-            while not self.all_consumed(task_name, rollout_id):
+            rollout_mini_batches: list[RolloutBatch] = []
+            rollout_mini_local_sample_counts: list[int] = []
+            while batch_index < num_rollout_minis and not self.all_consumed(task_name, rollout_id):
                 data_fields = build_data_fields(self.args)
                 with timer("train_get_data"):
                     rollout_data, batch_meta = self._get_data_from_transfer_queue(
@@ -577,6 +601,28 @@ class MegatronTrainRayActor(TrainRayActor):
                         time.sleep(empty_poll_sleep_s)
                     continue
                 batch_index += 1
+                if is_sft_mode(self.args):
+                    if self.role == "critic":
+                        return self.train_critic(rollout_id, rollout_data)
+                    else:
+                        return self.train_actor(rollout_id, rollout_data)
+                if len(rollout_data["total_lengths"]) != batch_size:
+                    raise RuntimeError(
+                        f"rollout mini batch local size mismatch for rollout_id={rollout_id}, "
+                        f"batch_index={batch_index - 1}: expected {batch_size}, "
+                        f"got {len(rollout_data['total_lengths'])}."
+                    )
+                rollout_mini_batches.append(rollout_data)
+                rollout_mini_local_sample_counts.append(len(rollout_data["total_lengths"]))
+
+            if not is_sft_mode(self.args):
+                if len(rollout_mini_batches) != num_rollout_minis:
+                    raise RuntimeError(
+                        f"Expected {num_rollout_minis} rollout mini batches for rollout_id={rollout_id}, "
+                        f"got {len(rollout_mini_batches)}."
+                    )
+                rollout_data = concat_rollout_batches(rollout_mini_batches)
+                rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
                 if self.role == "critic":
                     return self.train_critic(rollout_id, rollout_data)
                 else:
@@ -1048,26 +1094,31 @@ class MegatronTrainRayActor(TrainRayActor):
         """
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-        batch_size = self.args.global_batch_size // dp_size // self.args.num_iters_per_train_update
+        plan = build_rollout_minibatch_plan(self.args, dp_size)
+        batch_size = plan.mini_local_sample_request
 
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
+        rollout_mini_local_sample_counts: list[int] = []
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
             # the full rollout (rollout_batch_size * n_samples_per_prompt) for
             # this step, so load the whole per-rank slice and split it into
-            # one-global-batch chunks — matching how the streaming path drains
-            # the entire train partition per rollout step.
+            # rollout mini windows.
             logger.info(f"start to get rollout_id: {rollout_id} data from debug rollout data for train_hybrid.")
-            total_samples = self.args.rollout_batch_size * self.args.n_samples_per_prompt
-            full_batch_size = total_samples // dp_size
-            num_chunks = total_samples // self.args.global_batch_size
+            full_batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
             debug_data = get_debug_data(self.args, rollout_id, full_batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, debug_data)
-            for sub_batch in self._split_rollout_batch(debug_data, num_chunks):
+            for sub_batch in self._split_rollout_batch(debug_data, plan.num_rollout_minis):
+                if len(sub_batch["total_lengths"]) != batch_size:
+                    raise RuntimeError(
+                        f"debug rollout mini batch local size mismatch for train_hybrid({rollout_id}): "
+                        f"expected {batch_size}, got {len(sub_batch['total_lengths'])}."
+                    )
                 self._hybrid_forward_subbatch(sub_batch)
                 collected_batches.append(sub_batch)
+                rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
         else:
             batch_index = 0
             # Surface stuck-loop conditions: when the partition can never reach the
@@ -1078,7 +1129,7 @@ class MegatronTrainRayActor(TrainRayActor):
             loop_start = time.monotonic()
             last_progress = loop_start
             last_warn = loop_start
-            while not self.all_consumed("train", rollout_id):
+            while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id):
                 data_fields = [
                     "tokens",
                     "total_lengths",
@@ -1116,8 +1167,21 @@ class MegatronTrainRayActor(TrainRayActor):
                 batch_index += 1
 
                 # Forward passes on this sub-batch (small memory footprint)
+                if len(sub_batch["total_lengths"]) != batch_size:
+                    raise RuntimeError(
+                        f"rollout mini batch local size mismatch for train_hybrid({rollout_id}), "
+                        f"batch_index={batch_index - 1}: expected {batch_size}, "
+                        f"got {len(sub_batch['total_lengths'])}."
+                    )
                 self._hybrid_forward_subbatch(sub_batch)
                 collected_batches.append(sub_batch)
+                rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
+
+        if len(collected_batches) != plan.num_rollout_minis:
+            raise RuntimeError(
+                f"Expected {plan.num_rollout_minis} rollout mini batches for train_hybrid({rollout_id}), "
+                f"got {len(collected_batches)}."
+            )
 
         if self._active_model_tag != "actor":
             self._switch_model("actor")
@@ -1133,6 +1197,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data[key].extend(value)
                 else:
                     rollout_data[key].append(value)
+        rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
@@ -1299,7 +1364,14 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.num_microbatches,
                 )
             self.prof.step(rollout_id=rollout_id)
-            data_for_log = self.data_iterator[0].get_buffer()
+            if len(self.data_iterator) > 1 and all(
+                isinstance(iterator, StreamingTQIterator) for iterator in self.data_iterator
+            ):
+                data_for_log = []
+                for data_iterator in self.data_iterator:
+                    data_for_log.extend(data_iterator.get_buffer())
+            else:
+                data_for_log = self.data_iterator[0].get_buffer()
             rollout_data = merge_dict_list(data_for_log)
             log_rollout_data(rollout_id, self.args, rollout_data)
             train_dump_utils.save_debug_train_data(
@@ -1730,12 +1802,13 @@ class MegatronTrainRayActor(TrainRayActor):
         """Build data iterators for the fully-async + dynamic-batch train path.
 
         Streaming mode (default when ``use_dynamic_batch_size`` + ``fully_async``):
-            Returns a ``StreamingTQIterator`` that pulls micro-batches from TQ on
-            demand.  The streaming schedule in ``streaming_schedules.py`` iterates
-            it until ``StopIteration`` without needing a fixed ``num_microbatches``.
-            All PP stages independently build their own iterator; the sampler result
-            cache ensures they all see the same data sequence and raise
-            ``StopIteration`` at the same micro-batch count.
+            Returns one ``StreamingTQIterator`` per rollout-mini window.  Each
+            iterator pulls token-budget micro-batches from the same TQ partition
+            until its local sample target is reached, and the training loop runs
+            one optimizer step per iterator.  All PP stages independently build
+            their own iterators; the sampler result cache ensures they all see
+            the same data sequence and raise ``StopIteration`` at the same
+            micro-batch count.
 
         Legacy mode (VPP or explicit opt-out):
             Pre-drains the full bucket, cross-DP MAX-aligns ``num_microbatches``,
@@ -1750,40 +1823,57 @@ class MegatronTrainRayActor(TrainRayActor):
 
         task_name = "actor_train"
         token_budget = self.args.max_tokens_per_gpu * cp_size
-        # Loss denominator = per-partition sample count. Each train_{rollout_id} is
-        # always filled to rollout_batch_size groups, so this stays
-        # rollout_batch_size * n_samples_per_prompt — intentionally NOT global_batch_size
-        # (which may now differ after dropping that equality constraint).
-        n_global = self.args.rollout_batch_size * self.args.n_samples_per_prompt
-        # loss_scale: each sample across all DPs is weighted equally.
+        plan = build_rollout_minibatch_plan(self.args, dp_size)
+        # loss_scale: each sample in one optimizer step is weighted equally.
         # dp_world_size_with_cp compensates for the later DP allreduce average.
-        loss_scale = 1.0 / n_global * mpu.get_data_parallel_world_size(with_context_parallel=True)
+        loss_scale = 1.0 / plan.mini_global_samples * mpu.get_data_parallel_world_size(with_context_parallel=True)
 
         # Use streaming iterator when VPP is inactive (streaming schedule handles PP>1).
         use_streaming = vpp_size == 1
 
         if use_streaming:
-            streaming_iter = StreamingTQIterator(
-                args=self.args,
-                tq_client=self.data_system_client,
-                data_fields=data_fields,
-                rollout_id=rollout_id,
-                token_budget=token_budget,
-                loss_scale=loss_scale,
-                # PP-collective-free end-of-stream check: the streaming PP
-                # schedule pulls per-stage at different schedule points, so a
-                # PP-group broadcast inside __next__ would deadlock.  See
-                # all_consumed_streaming for the full rationale.
-                all_consumed_fn=lambda: self.all_consumed_streaming(task_name, rollout_id),
-                dp_rank=dp_rank,
-                dp_size=dp_size,
-                task_name=task_name,
+            batch_index_stride = 1_000_000
+            overflow_buffer = []
+            data_iterator = [
+                StreamingTQIterator(
+                    args=self.args,
+                    tq_client=self.data_system_client,
+                    data_fields=data_fields,
+                    rollout_id=rollout_id,
+                    token_budget=token_budget,
+                    loss_scale=loss_scale,
+                    # PP-collective-free end-of-stream check: the streaming PP
+                    # schedule pulls per-stage at different schedule points, so a
+                    # PP-group broadcast inside __next__ would deadlock.  See
+                    # all_consumed_streaming for the full rationale.
+                    all_consumed_fn=lambda: self.all_consumed_streaming(task_name, rollout_id),
+                    dp_rank=dp_rank,
+                    dp_size=dp_size,
+                    task_name=task_name,
+                    max_samples=plan.mini_local_sample_request,
+                    rollout_mini_index=mini_idx,
+                    start_batch_index=mini_idx * batch_index_stride,
+                    overflow_buffer=overflow_buffer,
+                )
+                for mini_idx in range(plan.num_rollout_minis)
+            ]
+            num_microbatches = [1 for _ in range(plan.num_rollout_minis)]  # streaming schedule ignores this value
+            logger.info(
+                "[dynamic-batch] rollout=%s split into %d rollout-mini windows "
+                "(mini_global_samples=%d mini_local_samples=%d)",
+                rollout_id,
+                plan.num_rollout_minis,
+                plan.mini_global_samples,
+                plan.mini_local_sample_request,
             )
-            data_iterator = [streaming_iter]
-            num_microbatches = [1]  # streaming schedule ignores this value
             return data_iterator, num_microbatches
 
         # ── Legacy drain path (VPP only) ────────────────────────────────────
+        if plan.num_rollout_minis != 1:
+            raise NotImplementedError(
+                "fully_async + dynamic-batch rollout-mini updates are only supported without virtual pipeline "
+                f"parallelism. Got vpp_size={vpp_size}, num_rollout_minis={plan.num_rollout_minis}."
+            )
         dp_group = mpu.get_data_parallel_group()
         partition_id = f"train_{rollout_id}"
         sampling_config = {
@@ -1854,7 +1944,9 @@ class MegatronTrainRayActor(TrainRayActor):
             for _ in range(k_global - k_local):
                 mbs.append((template_batch, template_meta))
 
-        vpp_loss_scale = k_global / n_global * mpu.get_data_parallel_world_size(with_context_parallel=True)
+        vpp_loss_scale = (
+            k_global / plan.mini_global_samples * mpu.get_data_parallel_world_size(with_context_parallel=True)
+        )
         data_iterator = [
             MicroBatchListIterator(mbs, dummy_after=k_local, loss_scale=vpp_loss_scale) for _ in range(vpp_size)
         ]

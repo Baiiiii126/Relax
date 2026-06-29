@@ -702,13 +702,15 @@ async def generate_rollout_async(
     # is fixed here instead of being mutated mid-loop.
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
+    is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
+
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
-    # (num_old_samples). Completed groups beyond this are over-sampling surplus, kept for
-    # the next step. NOTE this is the commit cap; the number of tasks SUBMITTED is the
-    # (larger) over_sampling envelope so the fast groups can fill the target without
-    # waiting on the slow tail.
-    target_data_size = args.rollout_batch_size + num_old_samples
+    # (num_old_samples). The final backfill step is special: there is no
+    # train_{rollout_id} partition, so it only closes train_{rollout_id-1}.
+    target_data_size = num_old_samples if is_final_backfill else args.rollout_batch_size + num_old_samples
+    if target_data_size <= 0:
+        raise RuntimeError(f"Final rollout backfill requested for rollout_id={rollout_id} without pending deficit")
 
     # Inner-loop top-up threshold = the commit target. Each submit_generate_tasks call
     # admits a full over_sampling_batch_size of groups, so one round already puts more
@@ -740,19 +742,30 @@ async def generate_rollout_async(
     committed_prev = 0  # groups committed to train_{rollout_id-1} this step
     committed_curr = 0  # groups committed to train_{rollout_id} this step
     prev_target = num_old_samples
-    curr_target = args.rollout_batch_size
+    curr_target = 0 if is_final_backfill else args.rollout_batch_size
 
-    logger.info(
-        f"Starting rollout step {rollout_id}: target(commit)={target_data_size} "
-        f"(rollout_batch={args.rollout_batch_size} + old={num_old_samples}), submit_target={submit_target}"
-    )
+    if is_final_backfill:
+        logger.info(
+            f"Starting final rollout backfill step {rollout_id}: target(prev)={target_data_size}, "
+            f"submit_target={submit_target}"
+        )
+    else:
+        logger.info(
+            f"Starting rollout step {rollout_id}: target(commit)={target_data_size} "
+            f"(rollout_batch={args.rollout_batch_size} + old={num_old_samples}), submit_target={submit_target}"
+        )
 
     loop = asyncio.get_running_loop()
+
+    def target_reached() -> bool:
+        if is_final_backfill:
+            return total_transfer_samples >= target_data_size
+        return len(data) >= target_data_size
 
     # Outer loop stops once we've COMMITTED target_data_size groups; inner loop tops up
     # submissions whenever in-flight admitted groups drop below the commit target, each
     # round admitting a full over_sampling_batch_size so the surplus absorbs aborts.
-    while len(data) < target_data_size:
+    while not target_reached():
         while state.remaining_batch_size < submit_target:
             _t_get_samples = monotonic()
 
@@ -793,12 +806,16 @@ async def generate_rollout_async(
             # the buffer for partial resume; completed groups beyond target_data_size are
             # over-sampling surplus carried to the buffer (reused next step); completed
             # groups within target are committed to the transfer queue.
-            if any(sample.status == Sample.Status.ABORTED for sample in group):
+            group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
+            should_commit = (
+                total_transfer_samples < target_data_size if is_final_backfill else len(data) < target_data_size
+            )
+            if group_aborted:
                 for sample in group:
                     if sample.response and "start_rollout_id" not in sample.metadata:
                         sample.metadata["start_rollout_id"] = rollout_id
                 aborted_samples.append(group)
-            elif len(data) < target_data_size:
+            elif should_commit:
                 batch_to_transfer.append(group)
                 total_transfer_samples += 1
             else:
@@ -806,7 +823,9 @@ async def generate_rollout_async(
                 # (added back to the buffer after this step) instead of dropping it.
                 oversample_surplus.append(group)
 
-            if len(data) < target_data_size:
+            if (is_final_backfill and should_commit and not group_aborted) or (
+                not is_final_backfill and len(data) < target_data_size
+            ):
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
 
@@ -883,24 +902,41 @@ async def generate_rollout_async(
 
     if len(batch_to_transfer) > 0:
         n = len(batch_to_transfer)
-        # Tail flush to the current partition: last only if it completes this step's target.
-        curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
-        transfer_task = asyncio.create_task(
-            transfer_batch_to_data_system(
-                args,
-                batch_to_transfer,
-                n,
-                rollout_id,
-                data_system_client,
-                is_last=curr_is_last,
+        if is_final_backfill:
+            prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
+            transfer_task = asyncio.create_task(
+                transfer_batch_to_data_system(
+                    args,
+                    batch_to_transfer,
+                    n,
+                    rollout_id - 1,
+                    data_system_client,
+                    is_last=prev_is_last,
+                )
             )
-        )
-        committed_curr += n
-        transfer_tasks.append(transfer_task)
-        batch_to_transfer = []
-        logger.info(
-            f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
-        )
+            committed_prev += n
+            transfer_tasks.append(transfer_task)
+            batch_to_transfer = []
+            logger.info(f"Total yielded: {committed_prev}/{num_old_samples} for step: {rollout_id - 1}")
+        else:
+            # Tail flush to the current partition: last only if it completes this step's target.
+            curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
+            transfer_task = asyncio.create_task(
+                transfer_batch_to_data_system(
+                    args,
+                    batch_to_transfer,
+                    n,
+                    rollout_id,
+                    data_system_client,
+                    is_last=curr_is_last,
+                )
+            )
+            committed_curr += n
+            transfer_tasks.append(transfer_task)
+            batch_to_transfer = []
+            logger.info(
+                f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
+            )
 
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
@@ -948,8 +984,13 @@ async def generate_rollout_async(
     # Record this step's current-partition deficit for the next step's backfill debt.
     # committed_current = groups committed to rollout_id (current partition); the first
     # num_old_samples committed went to rollout_id-1 (previous-partition backfill).
-    committed_current = max(total_transfer_samples - num_old_samples, 0)
-    state.last_step_current_deficit = max(args.rollout_batch_size - committed_current, 0) if args.fully_async else 0
+    committed_current = 0 if is_final_backfill else max(total_transfer_samples - num_old_samples, 0)
+    if is_final_backfill:
+        state.last_step_current_deficit = 0
+    elif args.fully_async:
+        state.last_step_current_deficit = max(args.rollout_batch_size - committed_current, 0)
+    else:
+        state.last_step_current_deficit = 0
 
     # Carry over-sampling surplus back to the buffer (reused next step, committed first
     # via the completed-group fast path in generate_and_rm_group). Surplus groups are

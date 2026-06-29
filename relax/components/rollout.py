@@ -407,18 +407,18 @@ class Rollout(Base):
                     self._logger.info("Rollout loop paused, waiting to resume...")
                     await asyncio.sleep(1)
 
+                is_final_backfill_step = False
                 if local_step >= self.config.num_rollout:
+                    final_partition_id = f"train_{self.config.num_rollout - 1}"
                     if (
-                        self.config.max_staleness > 0
-                        and local_step == self.config.num_rollout
-                        and await self.data_source.get_buffer_length.remote() != 0
-                        and not await self.data_system_client.async_check_production_status(
-                            ["tokens"], f"train_{local_step - 1}"
-                        )
+                        local_step == self.config.num_rollout
+                        and getattr(self.config, "fully_async", False)
+                        and not await self._async_check_partition_production_complete(final_partition_id)
                     ):
                         self._logger.warning(
-                            "Production status check failed for final rollout step, continuing anyway"
+                            f"Final rollout partition {final_partition_id} is not complete; running backfill step"
                         )
+                        is_final_backfill_step = True
                     else:
                         self._logger.info("All rollouts finished")
                         break
@@ -468,6 +468,12 @@ class Rollout(Base):
 
                 await self._maybe_save_data(local_step)
                 self.step += 1
+                if is_final_backfill_step:
+                    final_partition_id = f"train_{self.config.num_rollout - 1}"
+                    if not await self._async_check_partition_production_complete(final_partition_id):
+                        raise RuntimeError(f"Final rollout partition {final_partition_id} is still incomplete")
+                    self._logger.info("All rollouts finished")
+                    break
         except Exception as e:
             error_msg = f"Rollout failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
@@ -552,10 +558,11 @@ class Rollout(Base):
         return 0
 
     async def _async_check_production_for_update_weight(self, step: int) -> bool:
-        # The final rollout has already left the producer loop; there is no
-        # in-flight generation to pause before syncing weights for final eval.
+        # During final backfill the rollout service may have stepped past
+        # num_rollout while train_{num_rollout-1} is still being closed. Do not
+        # let a weight update pause/abort that backfill.
         if step >= self.config.num_rollout:
-            return True
+            return await self._async_check_partition_production_complete(f"train_{self.config.num_rollout - 1}")
 
         # No-preset-global-batch path: a tensor-wide .all() flips True as soon as
         # activated rows are produced (even mid-fill across steps), admitting an
@@ -567,6 +574,11 @@ class Rollout(Base):
         return await self.data_system_client.async_check_production_status(
             ["tokens"], f"train_{step - 1}"
         ) or await self.data_system_client.async_check_production_status(["tokens"], f"train_{step}")
+
+    async def _async_check_partition_production_complete(self, partition_id: str) -> bool:
+        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+            return await self.data_system_client.async_check_production_completed(partition_id)
+        return await self.data_system_client.async_check_production_status(["tokens"], partition_id)
 
     @app.get("/is_eval_done")
     async def is_eval_done(self):

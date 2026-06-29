@@ -3,6 +3,8 @@
 from argparse import Namespace
 from collections.abc import Sequence
 from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -28,6 +30,136 @@ from .cp_utils import get_sum_of_sample_mean, maybe_padded_total_lengths, slice_
 
 
 logger = get_logger(__name__)
+
+ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY = "rollout_mini_local_sample_counts"
+ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY = "rollout_mini_global_sample_counts"
+ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY = "rollout_mini_prompt_group_counts"
+
+
+@dataclass(frozen=True)
+class RolloutMiniBatchPlan:
+    num_rollout_minis: int
+    mini_rollout_batch_size: int
+    fixed_n_samples_per_prompt: int | None
+    mini_global_samples: int | None
+    mini_local_sample_request: int | None
+
+
+def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBatchPlan:
+    """Build a prompt-group based mini plan for one rollout partition."""
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+
+    rollout_batch_size = int(args.rollout_batch_size)
+    n_samples_per_prompt = int(args.n_samples_per_prompt)
+    if rollout_batch_size <= 0:
+        raise ValueError(f"rollout_batch_size must be positive, got {rollout_batch_size}")
+    if n_samples_per_prompt <= 0:
+        raise ValueError(f"n_samples_per_prompt must be positive, got {n_samples_per_prompt}")
+
+    num_rollout_minis = getattr(args, "num_steps_per_rollout", None)
+    if num_rollout_minis is None:
+        global_batch_size = getattr(args, "global_batch_size", None)
+        if global_batch_size is None:
+            raise ValueError("global_batch_size is required when num_steps_per_rollout is not set")
+        total_samples = rollout_batch_size * n_samples_per_prompt
+        if total_samples % global_batch_size != 0:
+            raise ValueError(
+                "rollout_batch_size * n_samples_per_prompt must be divisible by global_batch_size "
+                f"when deriving rollout minis, got {total_samples=} and {global_batch_size=}"
+            )
+        num_rollout_minis = total_samples // global_batch_size
+
+    num_rollout_minis = int(num_rollout_minis)
+    if num_rollout_minis <= 0:
+        raise ValueError(f"num_rollout_minis must be positive, got {num_rollout_minis}")
+    if rollout_batch_size % num_rollout_minis != 0:
+        raise ValueError(
+            "rollout_batch_size must be divisible by num_rollout_minis, "
+            f"got rollout_batch_size={rollout_batch_size}, num_rollout_minis={num_rollout_minis}"
+        )
+
+    mini_rollout_batch_size = rollout_batch_size // num_rollout_minis
+    if mini_rollout_batch_size <= 0:
+        raise ValueError(f"mini_rollout_batch_size must be positive, got {mini_rollout_batch_size}")
+    if mini_rollout_batch_size % dp_size != 0:
+        raise ValueError(
+            "mini_rollout_batch_size must be divisible by data parallel size when using current "
+            "sample-count TransferQueue API, "
+            f"got mini_rollout_batch_size={mini_rollout_batch_size}, dp_size={dp_size}"
+        )
+
+    mini_global_samples = mini_rollout_batch_size * n_samples_per_prompt
+    if mini_global_samples % dp_size != 0:
+        raise ValueError(
+            "mini_rollout_batch_size * n_samples_per_prompt must be divisible by data parallel size, "
+            f"got mini_global_samples={mini_global_samples}, dp_size={dp_size}"
+        )
+
+    global_batch_size = getattr(args, "global_batch_size", None)
+    if global_batch_size is not None and int(global_batch_size) != mini_global_samples:
+        raise ValueError(
+            "global_batch_size must match the fixed-n_samples rollout mini size in phase 1, "
+            f"got global_batch_size={global_batch_size}, expected={mini_global_samples}"
+        )
+
+    return RolloutMiniBatchPlan(
+        num_rollout_minis=num_rollout_minis,
+        mini_rollout_batch_size=mini_rollout_batch_size,
+        fixed_n_samples_per_prompt=n_samples_per_prompt,
+        mini_global_samples=mini_global_samples,
+        mini_local_sample_request=mini_global_samples // dp_size,
+    )
+
+
+def _same_scalar_value(lhs: Any, rhs: Any) -> bool:
+    if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
+        return torch.equal(lhs, rhs)
+    return lhs == rhs
+
+
+def concat_rollout_batches(rollout_batches: Sequence[RolloutBatch]) -> RolloutBatch:
+    """Concatenate rollout mini windows while preserving scalar metadata."""
+    if not rollout_batches:
+        raise ValueError("rollout_batches must not be empty")
+
+    merged: RolloutBatch = {}
+    tensor_batches: dict[str, list[torch.Tensor]] = {}
+    scalar_values: dict[str, Any] = {}
+
+    for batch in rollout_batches:
+        if batch is None:
+            raise ValueError("rollout_batches must not contain None")
+        batch_size = len(batch.get("total_lengths", []))
+        if batch_size <= 0:
+            raise ValueError("rollout mini batch must contain at least one sample")
+
+        for key, value in batch.items():
+            if isinstance(value, (list, tuple)) and not isinstance(value, (str, bytes)):
+                if key not in merged:
+                    merged[key] = []
+                merged[key].extend(value)
+            elif isinstance(value, torch.Tensor) and value.ndim > 0 and value.size(0) == batch_size:
+                tensor_batches.setdefault(key, []).append(value)
+            else:
+                if key in scalar_values:
+                    if not _same_scalar_value(scalar_values[key], value):
+                        raise ValueError(f"Scalar rollout field {key!r} differs across mini batches")
+                else:
+                    scalar_values[key] = value
+
+    for key, tensors in tensor_batches.items():
+        if key in merged:
+            raise ValueError(f"Rollout field {key!r} appears as both list-like and tensor-like")
+        merged[key] = torch.cat(tensors, dim=0)
+
+    for key, value in scalar_values.items():
+        if key in merged:
+            raise ValueError(f"Rollout field {key!r} appears as both scalar and batched data")
+        merged[key] = value
+
+    return merged
+
 
 PAD_RULES = {
     # shape like [1, 128, 1036]
@@ -520,31 +652,49 @@ def get_data_iterator(
     num_local_samples = len(rollout_data["total_lengths"])
     global_batch_size = rollout_data.get("dynamic_global_batch_size", args.global_batch_size)
     num_local_gbs = global_batch_size // dp_size
+    step_local_sample_counts = rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)
 
-    if getattr(args, "balance_data", False):
-        # When balance_data is enabled, SeqlenBalancedSampler assigns
-        # samples with equal_size=False, so each DP rank may receive a
-        # different number of samples.  Use num_local_samples directly as
-        # the local batch size to process all assigned samples in a single
-        # step, avoiding remainder / empty-step issues.
-        num_local_gbs = num_local_samples
-        num_steps_per_rollout = 1
+    if step_local_sample_counts is not None:
+        if not isinstance(step_local_sample_counts, list) or not step_local_sample_counts:
+            raise ValueError(f"{ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY} must be a non-empty list")
+        if any((not isinstance(count, int)) or count <= 0 for count in step_local_sample_counts):
+            raise ValueError(
+                f"{ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY} must contain positive integers, "
+                f"got {step_local_sample_counts}"
+            )
+        if sum(step_local_sample_counts) != num_local_samples:
+            raise ValueError(
+                f"sum({ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY}) must equal num_local_samples, "
+                f"got counts={step_local_sample_counts}, num_local_samples={num_local_samples}"
+            )
+        num_steps_per_rollout = len(step_local_sample_counts)
     elif num_local_samples <= num_local_gbs:
         num_local_gbs = num_local_samples
         num_steps_per_rollout = 1
     else:
+        if num_local_samples % num_local_gbs != 0:
+            raise ValueError(
+                "num_local_samples must be divisible by local global-batch size when explicit rollout mini "
+                f"boundaries are absent, got num_local_samples={num_local_samples}, num_local_gbs={num_local_gbs}"
+            )
         num_steps_per_rollout = num_local_samples // num_local_gbs
 
-    # When balance_data is enabled, each DP rank may receive a different number
-    # of samples from the SeqlenBalancedSampler. Synchronise num_steps_per_rollout
-    # across DP ranks so that all ranks execute the same number of training steps
-    # (required by collective operations in the training loop).
+    # With balance_data, synchronise num_steps_per_rollout across DP ranks so
+    # collectives stay aligned. Explicit rollout-mini boundaries or divisible
+    # fixed-size local steps must already produce the same count on every rank;
+    # otherwise fail instead of generating empty batches.
     if getattr(args, "balance_data", False):
+        local_num_steps_per_rollout = num_steps_per_rollout
         steps_tensor = torch.tensor(
             [num_steps_per_rollout], dtype=torch.int, device=device_utils.make_current_torch_device()
         )
         dist.all_reduce(steps_tensor, op=dist.ReduceOp.MAX, group=dp_group)
         num_steps_per_rollout = steps_tensor.item()
+        if num_steps_per_rollout != local_num_steps_per_rollout:
+            raise RuntimeError(
+                "training step count differs across DP ranks under balance_data: "
+                f"local={local_num_steps_per_rollout}, global_max={num_steps_per_rollout}"
+            )
 
     if global_batch_size != args.global_batch_size:
         logger.info(
@@ -558,8 +708,17 @@ def get_data_iterator(
             data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
         return data_iterator
 
+    if step_local_sample_counts is None:
+        step_local_sample_counts = [num_local_gbs for _ in range(num_steps_per_rollout)]
+
     if not args.use_dynamic_batch_size:
-        num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
+        invalid_counts = [count for count in step_local_sample_counts if count % args.micro_batch_size != 0]
+        if invalid_counts:
+            raise ValueError(
+                "Each rollout mini local sample count must be divisible by micro_batch_size, "
+                f"got invalid_counts={invalid_counts}, micro_batch_size={args.micro_batch_size}"
+            )
+        num_microbatches = [count // args.micro_batch_size for count in step_local_sample_counts]
         data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
     else:
         _max_tokens = max_tokens_per_gpu if max_tokens_per_gpu is not None else args.max_tokens_per_gpu
@@ -568,9 +727,10 @@ def get_data_iterator(
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
         num_microbatches = []
+        step_offsets = np.cumsum([0, *step_local_sample_counts]).tolist()
         for i in range(num_steps_per_rollout):
-            start = i * num_local_gbs
-            end = min((i + 1) * num_local_gbs, num_local_samples)
+            start = step_offsets[i]
+            end = step_offsets[i + 1]
             num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], _max_tokens * cp_size))
 
         num_microbatches = torch.tensor(
@@ -589,8 +749,8 @@ def get_data_iterator(
         # balance the number of mirobatches across steps
         micro_batch_indices = []
         for i, num_mbs in enumerate(num_microbatches):
-            start = i * num_local_gbs
-            end = min((i + 1) * num_local_gbs, num_local_samples)
+            start = step_offsets[i]
+            end = step_offsets[i + 1]
             samples = rollout_data["total_lengths"][start:end]
             partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
             for j in range(num_mbs):
@@ -691,6 +851,9 @@ def log_rollout_data(
                 "packed_seq_params",
                 "vlm_packed_seq_params",
                 "__loss_scale__",
+                ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
+                ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
+                ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,
             ]:
                 continue
             # Upload per sample mean for each rollout value

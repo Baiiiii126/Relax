@@ -1022,6 +1022,12 @@ class StreamingTQIterator:
         dp_rank: Data-parallel rank of this worker.
         dp_size: Data-parallel world size.
         task_name: TQ task name (default ``"actor_train"``).
+        max_samples: Optional local sample limit for one rollout-mini window.
+        rollout_mini_index: Rollout-mini window id, passed to the TQ sampler.
+        start_batch_index: First batch index for this iterator; used to keep
+            sampler cache keys distinct across rollout-mini windows.
+        overflow_buffer: Shared FIFO of already-fetched samples that crossed a
+            rollout-mini boundary. Used by consecutive rollout-mini iterators.
         max_empty_sleep: Maximum sleep duration (seconds) between empty-poll retries.
     """
 
@@ -1037,8 +1043,14 @@ class StreamingTQIterator:
         dp_rank: int,
         dp_size: int,
         task_name: str = "actor_train",
+        max_samples: Optional[int] = None,
+        rollout_mini_index: int = 0,
+        start_batch_index: int = 0,
+        overflow_buffer: Optional[List[Tuple[Dict[str, Any], Any]]] = None,
         max_empty_sleep: float = 2.0,
     ) -> None:
+        if max_samples is not None and max_samples <= 0:
+            raise ValueError(f"max_samples must be positive when set, got {max_samples}")
         self.args = args
         self.tq_client = tq_client
         self.data_fields = data_fields
@@ -1049,9 +1061,13 @@ class StreamingTQIterator:
         self.dp_rank = dp_rank
         self.dp_size = dp_size
         self.task_name = task_name
+        self.max_samples = max_samples
+        self.rollout_mini_index = rollout_mini_index
+        self._sample_count: int = 0
+        self._overflow_buffer = overflow_buffer if overflow_buffer is not None else []
         self.max_empty_sleep = max_empty_sleep
 
-        self._batch_index: int = 0
+        self._batch_index: int = start_batch_index
         self._mb_count: int = 0
         # Per-mb timing: (tq_wait_s, compute_start_s) — compute time logged externally.
         self._tq_wait_times: List[float] = []
@@ -1085,6 +1101,68 @@ class StreamingTQIterator:
 
             self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-tq-prefetch")
 
+    def _remaining_samples(self) -> Optional[int]:
+        if self.max_samples is None:
+            return None
+        return max(self.max_samples - self._sample_count, 0)
+
+    def _sampling_config(self, batch_index: int) -> Dict[str, Any]:
+        config = {
+            "dp_rank": self.dp_rank,
+            "dp_size": self.dp_size,
+            "task_name": self.task_name,
+            "batch_index": batch_index,
+            "partition_id": f"train_{self.rollout_id}",
+            "allow_underfill": True,
+            "rollout_mini_index": self.rollout_mini_index,
+        }
+        remaining_samples = self._remaining_samples()
+        if remaining_samples is not None:
+            config.update(
+                {
+                    "max_samples": self.max_samples,
+                    "consumed_samples": self._sample_count,
+                    "remaining_samples": remaining_samples,
+                }
+            )
+        return config
+
+    @staticmethod
+    def _num_samples(data: Dict[str, Any]) -> int:
+        for key in ("tokens", "total_lengths", "response_lengths", "loss_masks"):
+            value = data.get(key)
+            if value is not None:
+                return len(value)
+        return 0
+
+    @staticmethod
+    def _split_sample_value(value: Any, split_at: int, n_samples: int) -> Tuple[Any, Any]:
+        if isinstance(value, torch.Tensor) and value.dim() > 0 and value.size(0) == n_samples:
+            return value[:split_at], value[split_at:]
+        if isinstance(value, list) and len(value) == n_samples:
+            return value[:split_at], value[split_at:]
+        if isinstance(value, tuple) and len(value) == n_samples:
+            return value[:split_at], value[split_at:]
+        return value, value
+
+    def _split_batch_at_sample(
+        self,
+        data: Dict[str, Any],
+        meta: Any,
+        split_at: int,
+        n_samples: int,
+    ) -> Tuple[Tuple[Dict[str, Any], Any], Tuple[Dict[str, Any], Any]]:
+        if split_at <= 0 or split_at >= n_samples:
+            raise ValueError(f"split_at must be in (0, {n_samples}), got {split_at}")
+
+        current: Dict[str, Any] = {}
+        overflow: Dict[str, Any] = {}
+        for key, value in data.items():
+            current_value, overflow_value = self._split_sample_value(value, split_at, n_samples)
+            current[key] = current_value
+            overflow[key] = overflow_value
+        return (current, meta), (overflow, meta)
+
     def _warm_next_batch_index(self, next_index: int) -> None:
         """Fire-and-forget controller cache warm-up for ``next_index``.
 
@@ -1092,20 +1170,16 @@ class StreamingTQIterator:
         sampling_config / partition / batch_index) so the controller sampler
         prepares & caches all dp slices.  Meta-only: result is discarded.
         """
+        remaining_samples = self._remaining_samples()
+        if remaining_samples is not None and remaining_samples <= 0:
+            return
         if self._prefetch_executor is None or next_index <= self._prefetched_index:
             return
         self._prefetched_index = next_index
 
         def _task() -> None:
             try:
-                config = {
-                    "dp_rank": self.dp_rank,
-                    "dp_size": self.dp_size,
-                    "task_name": self.task_name,
-                    "batch_index": next_index,
-                    "partition_id": f"train_{self.rollout_id}",
-                    "allow_underfill": True,
-                }
+                config = self._sampling_config(next_index)
                 self.tq_client.get_meta(
                     data_fields=self.data_fields,
                     token_budget=self.token_budget,
@@ -1152,6 +1226,113 @@ class StreamingTQIterator:
         dummy["__loss_scale__"] = self.loss_scale
         return dummy, meta
 
+    def _finish_real_batches(self, reason: str) -> Tuple[Dict[str, Any], Any]:
+        # Real data exhausted. Align mb count across DP ranks: MAX-reduce the
+        # real count, then enter the dummy-padding phase so every DP yields the
+        # same total number of micro-batches.
+        k_real = self._mb_count
+        k_global = self._dp_max_microbatches(k_real)
+        total_wait = sum(self._tq_wait_times)
+        logger.info(
+            "[StreamingTQIterator] rollout=%s mini=%d dp=%d real mbs=%d k_global=%d "
+            "samples=%d%s (pad %d dummy) total_tq_wait=%.3fs reason=%s",
+            self.rollout_id,
+            self.rollout_mini_index,
+            self.dp_rank,
+            k_real,
+            k_global,
+            self._sample_count,
+            f"/{self.max_samples}" if self.max_samples is not None else "",
+            max(0, k_global - k_real),
+            total_wait,
+            reason,
+        )
+        pad = k_global - k_real
+        if pad > 0 and self._last_batch is None:
+            self._shutdown_prefetch()
+            raise RuntimeError(
+                f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
+                f"dp={self.dp_rank} must pad {pad} dummy micro-batches but consumed zero real micro-batches"
+            )
+        self._dummies_remaining = pad
+        return self.__next__()
+
+    def _emit_data_batch(
+        self,
+        data: Dict[str, Any],
+        meta: Any,
+        tq_wait: float,
+        from_overflow: bool,
+    ) -> Tuple[Dict[str, Any], Any]:
+        n_samples = self._num_samples(data)
+        if n_samples <= 0:
+            raise RuntimeError(
+                f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
+                "received a non-empty batch with zero sample-aligned fields"
+            )
+
+        remaining_samples = self._remaining_samples()
+        if remaining_samples is not None and n_samples > remaining_samples:
+            (data, meta), overflow = self._split_batch_at_sample(data, meta, remaining_samples, n_samples)
+            self._overflow_buffer.insert(0, overflow)
+            logger.info(
+                "[StreamingTQIterator] rollout=%s mini=%d split overfilled mb: used=%d overflow=%d",
+                self.rollout_id,
+                self.rollout_mini_index,
+                remaining_samples,
+                n_samples - remaining_samples,
+            )
+            n_samples = remaining_samples
+
+        data["__loss_scale__"] = self.loss_scale
+        self._sample_count += n_samples
+        self._buffer.append((data, meta))
+        # Snapshot for dummy padding.  ``get_batch`` mutates the batch
+        # dict IN PLACE (e.g. reassigns ``batch["tokens"]`` to the
+        # concatenated+padded packed tensor), and the schedule passes
+        # this very ``data`` object to ``get_batch``.  If we kept a
+        # reference to it, a later ``_make_dummy_batch`` would copy the
+        # ALREADY-PACKED ``tokens`` while ``loss_masks`` / ``total_lengths``
+        # stay per-sample lists → loss_mask/token shape mismatch in
+        # ``get_batch`` (tok length = sum of two samples).  Store a
+        # shallow dict copy (new top-level dict, same per-sample list
+        # values, which get_batch does not mutate) so the dummy always
+        # rebuilds from the pristine raw fields.
+        self._last_batch = (dict(data), meta)
+        if not from_overflow:
+            self._batch_index += 1
+        self._mb_count += 1
+
+        adv_info = ""
+        if "advantages" in data:
+            advs = data["advantages"]
+            if isinstance(advs, list) and len(advs) > 0:
+                adv_vals = [a.float().mean().item() if hasattr(a, "mean") else float(a) for a in advs]
+                adv_info = (
+                    f" adv_means=[{','.join(f'{v:.4f}' for v in adv_vals[:4])}{'...' if len(adv_vals) > 4 else ''}]"
+                )
+        logger.info(
+            "[StreamingTQIterator] rollout=%s mini=%d dp=%d/%d mb=%d source=%s tq_wait=%.3fs "
+            "n_samples=%d samples=%d%s loss_scale=%.6f%s",
+            self.rollout_id,
+            self.rollout_mini_index,
+            self.dp_rank,
+            self.dp_size,
+            self._mb_count,
+            "overflow" if from_overflow else "tq",
+            tq_wait,
+            n_samples,
+            self._sample_count,
+            f"/{self.max_samples}" if self.max_samples is not None else "",
+            self.loss_scale,
+            adv_info,
+        )
+        if not from_overflow:
+            # Warm the controller cache for the next mb while the trainer
+            # computes this one (tail prefetch; meta-only).
+            self._warm_next_batch_index(self._batch_index)
+        return data, meta
+
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
         # Dummy-padding phase: real data exhausted, emit dummies up to k_global.
         if self._dummies_remaining is not None:
@@ -1168,17 +1349,20 @@ class StreamingTQIterator:
             )
             return self._make_dummy_batch()
 
-        sampling_config = {
-            "dp_rank": self.dp_rank,
-            "dp_size": self.dp_size,
-            "task_name": self.task_name,
-        }
         partition_id = f"train_{self.rollout_id}"
 
         t0 = time.monotonic()
         empty_streak = 0
 
         while True:
+            if self.max_samples is not None and self._sample_count >= self.max_samples:
+                return self._finish_real_batches("rollout mini sample limit reached")
+
+            if self._overflow_buffer:
+                data, meta = self._overflow_buffer.pop(0)
+                return self._emit_data_batch(data, meta, tq_wait=0.0, from_overflow=True)
+
+            sampling_config = self._sampling_config(self._batch_index)
             data, meta = get_data_from_transfer_queue(
                 args=self.args,
                 tq_client=self.tq_client,
@@ -1196,78 +1380,18 @@ class StreamingTQIterator:
             if data is not None:
                 tq_wait = time.monotonic() - t0
                 self._tq_wait_times.append(tq_wait)
-                data["__loss_scale__"] = self.loss_scale
-                self._buffer.append((data, meta))
-                # Snapshot for dummy padding.  ``get_batch`` mutates the batch
-                # dict IN PLACE (e.g. reassigns ``batch["tokens"]`` to the
-                # concatenated+padded packed tensor), and the schedule passes
-                # this very ``data`` object to ``get_batch``.  If we kept a
-                # reference to it, a later ``_make_dummy_batch`` would copy the
-                # ALREADY-PACKED ``tokens`` while ``loss_masks`` / ``total_lengths``
-                # stay per-sample lists → loss_mask/token shape mismatch in
-                # ``get_batch`` (tok length = sum of two samples).  Store a
-                # shallow dict copy (new top-level dict, same per-sample list
-                # values, which get_batch does not mutate) so the dummy always
-                # rebuilds from the pristine raw fields.
-                self._last_batch = (dict(data), meta)
-                self._batch_index += 1
-                self._mb_count += 1
-                n_samples = len(data.get("tokens", []))
-                adv_info = ""
-                if "advantages" in data:
-                    advs = data["advantages"]
-                    if isinstance(advs, list) and len(advs) > 0:
-                        adv_vals = [a.float().mean().item() if hasattr(a, "mean") else float(a) for a in advs]
-                        adv_info = f" adv_means=[{','.join(f'{v:.4f}' for v in adv_vals[:4])}{'...' if len(adv_vals) > 4 else ''}]"
-                logger.info(
-                    "[StreamingTQIterator] rollout=%s dp=%d/%d mb=%d tq_wait=%.3fs n_samples=%d loss_scale=%.6f%s",
-                    self.rollout_id,
-                    self.dp_rank,
-                    self.dp_size,
-                    self._mb_count,
-                    tq_wait,
-                    n_samples,
-                    self.loss_scale,
-                    adv_info,
-                )
-                # Warm the controller cache for the next mb while the trainer
-                # computes this one (tail prefetch; meta-only).
-                self._warm_next_batch_index(self._batch_index)
-                return data, meta
+                return self._emit_data_batch(data, meta, tq_wait=tq_wait, from_overflow=False)
 
             # Data not yet available — check if the rollout is fully consumed.
             if self.all_consumed_fn():
-                # Real data exhausted.  Align mb count across DP ranks: MAX-reduce
-                # the real count, then enter the dummy-padding phase so every DP
-                # yields the same total number of micro-batches.
-                k_real = self._mb_count
-                k_global = self._dp_max_microbatches(k_real)
-                total_wait = sum(self._tq_wait_times)
-                logger.info(
-                    "[StreamingTQIterator] rollout=%s dp=%d real mbs=%d k_global=%d "
-                    "(pad %d dummy) total_tq_wait=%.3fs",
-                    self.rollout_id,
-                    self.dp_rank,
-                    k_real,
-                    k_global,
-                    max(0, k_global - k_real),
-                    total_wait,
-                )
-                pad = k_global - k_real
-                if pad > 0 and self._last_batch is None:
-                    # No real batch to template a dummy from.  Cannot pad — the
-                    # DP collective will hang.  Surface loudly.
-                    logger.error(
-                        "[StreamingTQIterator] rollout=%s dp=%d must pad %d dummy mbs "
-                        "but consumed ZERO real mbs — DP collective WILL desync.",
-                        self.rollout_id,
-                        self.dp_rank,
-                        pad,
-                    )
+                if self.max_samples is not None and self._sample_count < self.max_samples:
                     self._shutdown_prefetch()
-                    raise StopIteration
-                self._dummies_remaining = pad
-                return self.__next__()
+                    raise RuntimeError(
+                        f"Transfer queue stream drained before rollout {self.rollout_id} mini "
+                        f"{self.rollout_mini_index} reached its local sample target: "
+                        f"{self._sample_count}/{self.max_samples}"
+                    )
+                return self._finish_real_batches("transfer queue stream drained")
 
             empty_streak += 1
             if empty_streak % 20 == 0:
