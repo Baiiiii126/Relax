@@ -6,7 +6,8 @@ import math
 import os
 import uuid
 from argparse import Namespace
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from megatron.core.utils import get_model_config, unwrap_model
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import telemetry, tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.logging_utils import get_logger
@@ -37,6 +39,104 @@ from .model_provider import get_model_provider_func, wrap_model_provider_with_fr
 
 
 logger = get_logger(__name__)
+
+
+def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
+    """Walk DDP / bridge-VL wrappers to the lm_head; None on non-last PP
+    stages.
+
+    ``unwrap_model`` strips Megatron's known wrapper classes (DDP, FP16, ...)
+    in one shot — same pattern as ``_iter_critic_output_layers``. The bounded
+    ``.module``/``.language_model`` walk that follows handles VL bridges and
+    non-Megatron DDP shapes used by tests.
+    """
+    module = unwrap_model(model)
+    for _ in range(4):  # bounded; bridge depth is at most 2
+        ol = getattr(module, "output_layer", None)
+        # Megatron sets `output_layer = nn.Identity()` on non-last PP stages
+        # (placeholder); we must return None there so `_bypass_output_layer`
+        # is a no-op and the loss never gets called on these ranks.
+        if ol is not None and not isinstance(ol, torch.nn.Identity):
+            return ol
+        # `.module`: any residual DDP / FP16 / FP32 wrapper not stripped by
+        # `unwrap_model` (e.g. test fakes, non-Megatron DDP shapes).
+        # `.language_model`: Megatron-Bridge multimodal convention — every
+        # known VL/Omni bridge (Qwen3-VL, Qwen3.5-VL, Qwen2.5-VL, Gemma3-VL,
+        # Nemotron-VL, Qwen3-Omni) wraps the inner GPTModel under
+        # `self.language_model`. If a future bridge breaks this convention,
+        # this walk returns None → bypass becomes no-op → SFT chunked path
+        # silently falls back to legacy (safe).
+        module = getattr(module, "module", None) or getattr(module, "language_model", None)
+        if module is None:
+            return None
+    return None
+
+
+@contextmanager
+def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
+    """Make output_layer a passthrough so model() returns hidden_states.
+
+    With ``--sequence-parallel`` the decoder emits ``[S/TP, B, H]`` and the
+    original lm_head would AG before the matmul; we do that AG here so
+    downstream SFT slicing sees the full sequence. The yielded callable runs
+    the *original* lm_head forward with ``sequence_parallel=False`` (input
+    already gathered) so it emits ``[chunk, 1, V/TP]`` per call.
+
+    No-op on PP stages with no output layer (the loss never runs there).
+    """
+    output_layer = _find_lm_output_layer(model)
+    if output_layer is None:
+        yield None
+        return
+
+    original_forward = output_layer.forward
+    sp_enabled = bool(getattr(output_layer, "sequence_parallel", False))
+    tp_group = getattr(output_layer, "tp_group", None) or mpu.get_tensor_model_parallel_group()
+
+    if sp_enabled:
+        from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+    def _passthrough(input_, weight=None, runtime_gather_output=None):
+        if sp_enabled:
+            input_ = gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=False, group=tp_group)
+        return input_, None
+
+    def _chunked_call(input_, weight=None, runtime_gather_output=None):
+        # ColumnParallelLinear's cuBLAS matmul requires input.dtype == weight.dtype.
+        # The VL bridge upcasts hidden_states to fp32 before output_layer; downcast
+        # here so matmul stays bf16/bf16. The caller upcasts logits back to fp32.
+        w = weight if weight is not None else output_layer.weight
+        if input_.dtype != w.dtype:
+            input_ = input_.to(w.dtype)
+        prev_sp = output_layer.sequence_parallel
+        output_layer.sequence_parallel = False
+        try:
+            return original_forward(input_, weight=weight, runtime_gather_output=runtime_gather_output)
+        finally:
+            output_layer.sequence_parallel = prev_sp
+
+    output_layer.forward = _passthrough
+    try:
+        yield _chunked_call
+    finally:
+        try:
+            del output_layer.forward
+        except AttributeError:
+            output_layer.forward = original_forward
+
+
+def _should_use_sft_chunked(args: Namespace) -> bool:
+    """Gate for the SFT chunked-logits path.
+
+    Two conditions all must hold:
+    - SFT mode (loss_type == "sft")
+    - User explicitly opted in via --sft-chunked-logits
+
+    All incompatibilities (tied embeddings, MTP, combined-1f1b) are enforced
+    earlier as hard AssertionErrors in arguments.py.slime_validate_args, so
+    by the time we reach this gate sft_chunked_logits=True is guaranteed safe.
+    """
+    return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
 
 
 def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dict) -> None:
@@ -470,6 +570,7 @@ def train_one_step(
 
         nonlocal main_loss_has_tokens
         is_vl_model = getattr(args, "is_vl_model", False)
+        sft_chunked = _should_use_sft_chunked(args)
         # Get the batch.
         with timer(f"get_data_batch_{uuid.uuid4().hex[:8]}", keep=False):
             batch = get_batch(
@@ -502,8 +603,16 @@ def train_one_step(
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
+        # set in the SFT branch below; left as None for return_schedule_plan or
+        # the non-SFT path so the original loss_function is used.
+        lm_head_forward = None
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
+            # build_schedule_plan path doesn't go through model() so the
+            # _bypass_output_layer wrapping can't apply. The combined-1f1b ×
+            # chunked-logits incompatibility is enforced as a hard assert in
+            # arguments.py.slime_validate_args, so sft_chunked is guaranteed
+            # False here — no runtime fallback or advisory needed.
             output_tensor = model.build_schedule_plan(
                 input_ids=batch["tokens"],
                 position_ids=None,
@@ -543,12 +652,22 @@ def train_one_step(
             if is_vl_model and mm_inputs:
                 forward_kwargs.update(mm_inputs)
 
-            output_tensor = model(**forward_kwargs)
+            # SFT: defer lm_head into the loss (sft_loss_function_chunked)
+            # so the full [B, S, V/TP] fp32 logits tensor never materializes.
+            if sft_chunked:
+                with _bypass_output_layer(model) as lm_head_forward:
+                    output_tensor = model(**forward_kwargs)
+            else:
+                output_tensor = model(**forward_kwargs)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        return output_tensor, partial(loss_function, args, batch, num_microbatches)
+        # Always dispatch via loss_function. lm_head_forward is None unless the
+        # SFT chunked path entered the bypass above; loss_function's "sft" case
+        # routes to sft_loss_function_chunked when both --sft-chunked-logits
+        # and lm_head_forward are set.
+        return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
 
     # Forward pass.
     use_streaming = (
