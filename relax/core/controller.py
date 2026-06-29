@@ -10,7 +10,18 @@ import ray
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
-from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler, StreamingTokenBudgetSampler
+from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
+
+
+try:
+    from transfer_queue import StreamingTokenBudgetSampler
+except ImportError as e:
+    raise ImportError(
+        "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
+        '    pip install "transferqueue @ git+https://github.com/redai-infra/'
+        'TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps\n'
+        "or use the latest image."
+    ) from e
 
 from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
 from relax.agentic.session.service import (
