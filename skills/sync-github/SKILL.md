@@ -14,7 +14,7 @@ description: Use when syncing Relax code between internal GitLab and external Gi
 1. **Prompt A：GitHub -> GitLab dev**  
    找到 GitHub 分支从 `gitlab/dev` 分出去的基点 `commitA`，识别 `commitA` 之后 GitHub PR 合入的外部 commit，只 cherry-pick 这些外部 commit 到新的 GitLab CR 分支。创建或确认无需 CR 后必须停止，等待云效 CR 提交和合入。
 2. **Prompt B：GitLab dev -> GitLab/GitHub main**  
-   只能在用户明确说“内部 CR 已合入，继续同步”后执行，直接在本地 `main` 从 `gitlab/main` 开始线性 cherry-pick `gitlab/dev` 的可公开内容，直接推送到 `gitlab/main`，再走 GitHub push 门禁推到 `github/main`。不要创建 `sync/dev-to-main`。
+   只能在用户明确说“内部 CR 已合入，继续同步”后执行，直接在本地 `main` 从 `gitlab/main` 开始，用真实 tree diff 找最小有效同步集并线性重放到 `main`，直接推送到 `gitlab/main`，再走 GitHub push 门禁推到 `github/main`。不要创建 `sync/dev-to-main`。
 
 禁止在 Prompt A 中 push GitHub。禁止跳过 Prompt A 直接做 `dev -> main`。
 Prompt A 禁止通过 merge 把 `github/main` 纳入 `gitlab/dev`；必须走 commitA + external PR commit cherry-pick 流程。
@@ -24,6 +24,13 @@ Prompt A 禁止通过 merge 把 `github/main` 纳入 `gitlab/dev`；必须走 co
 - 开始一次同步，或用户没有明确说“内部 CR 已合入”：读取并执行 [references/prompt-a-main-to-dev.md](references/prompt-a-main-to-dev.md)。
 - 用户明确说“内部 CR 已合入，继续同步”：读取并执行 [references/prompt-b-dev-to-main.md](references/prompt-b-dev-to-main.md)。Prompt B 直接更新并推送 `gitlab/main`；如果 `github/main` 落后于 `gitlab/main`，不要回退 `gitlab/main`，继续在 `gitlab/main` 基础上追加 `dev` 内容，最后停在 GitHub push 门禁。
 - 不确定阶段时，只做只读检查：`git status --porcelain`、`git status --porcelain --untracked-files=no`、`git fetch --all --prune`，再运行 `python skills/sync-github/scripts/plan_github_to_dev.py --github github/main --dev gitlab/dev` 判断是否还有未吸收的外部 PR commit。不要根据 `gitlab/main`/`github/main` 关系跳过 Prompt A。
+
+## Prompt B 效率硬规则
+
+- Prompt B 的工作队列必须先由真实 tree diff 驱动：先看 `git diff --stat gitlab/main..gitlab/dev` / `git diff --name-status gitlab/main..gitlab/dev`，再用 commit 历史解释这些路径来自哪些有效提交。
+- `git rev-list --right-only gitlab/main...gitlab/dev` 只用于审计和追溯，不能直接当作 cherry-pick 队列；GitLab merge 历史里有大量已被 main 吸收的旧 merge 噪音。
+- 遇到 `Merge branch main into dev`、Prompt A merge、已被 tree diff 证明吸收的旧 merge，直接记录跳过。不要为了这些历史 merge 解冲突。
+- 如果 Prompt A 已实际验证某个 GitHub external commit cherry-pick 到 `gitlab/dev` 为空/已吸收，而规划脚本仍报告 `not-in-dev`，按人工审计 false positive 记录后继续 Prompt B，不要再次要求用户确认。
 
 ## 全局硬规则
 
