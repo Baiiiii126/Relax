@@ -29,7 +29,7 @@ imageio[ffmpeg]
 colorlog
 loguru
 av==17.0.0
-transformers==5.3.0
+transformers
 huggingface_hub==1.7.2
 blessed==1.38.0
 gpustat

@@ -1,7 +1,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=lmsysorg/sglang:v0.5.9
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.12.post1-cu129
 ARG TRAIN_IMAGE=train
 FROM ${BASE_IMAGE} as base
 
@@ -29,10 +29,6 @@ RUN apt-get update && apt-get install -y locales tzdata && \
     locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-RUN cd /tmp && git clone -b update-transformers-v5 https://github.com/sgl-project/sglang.git && \
-    cd sglang && rsync -avP ./python/sglang/ /sgl-workspace/sglang/python/sglang/ && \
-    rm -rf /tmp/sglang
-
 FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
@@ -58,7 +54,7 @@ RUN MAX_JOBS=64 \
     rm -rf /opt/flash-attention/
 
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
-    TMS_CUDA_MAJOR=12 pip install git+https://github.com/redai-infra/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
+    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-infra/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
