@@ -163,8 +163,11 @@ processors/glm4v.py, processors/qwen_vl.py, eagle_info.py, eagle_worker.py
                +  C 类 5 个 Relax 独有功能文件（在新源码结构上重写）
                +  C 类 2 个改名文件的对位（多半已在骨架中）
 ```
-**真正需人工的 ≈ 26 处(B 的 21 + C 的 5)**,绝大多数是 4~10 行小增量;最费神的是
-`server_args.py`(40 行多节点逻辑)和 5 个 Relax 独有模型文件。
+> ⚠️ **以上 ≈26 处是"调研前的上限估算"**(仅按 Relax patch vs slime v0.2.3 的文件级差异得出,尚未核查 v0.5.12.post1 源码)。
+> 实际按第 5 节逐项 grep 目标源码后,**绝大多数 B/C 项已被上游原生实现或被 slime 骨架覆盖,真正需人工 port 的塌缩到 4 处**:
+> `utils/common.py`(SafeUnpickler `"Relax."`)、`multimodal/processors/base_processor.py`(gpu_id 设备)、
+> `models/kimi_k25.py`(post_load_weights)、`server_args.py`(PP+CP 断言放宽)。
+> **最终落地结果以第 7 节执行记录为准**,本节(第 4 节)保留为方法论/估算过程参考。
 
 产物:生成新的 `docker/patch/<日期戳>/sglang.patch`,更新 `latest` 软链。
 
@@ -219,7 +222,9 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 
 构建源码树:`/root/data/sglang`(tag `v0.5.12.post1`)。
 
-### 7.2 保留的 Relax 私有改动(已 port 进新 patch)
+### 7.2 保留的 Relax 私有改动(已 port 进新 patch,共 4 处)
+
+> 对照第 4 节调研前的 ≈26 处上限估算:逐项核查 v0.5.12.post1 源码后,大部分已上游/已被 slime 骨架覆盖,最终只需人工 port 下列 4 处。
 
 | 文件 | 内容 | 适配说明 |
 |---|---|---|
