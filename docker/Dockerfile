@@ -33,7 +33,7 @@ FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
 
-RUN pip install transformers==5.3.0 nvidia-cudnn-cu12==9.16.0.29
+RUN pip install nvidia-cudnn-cu12==9.16.0.29
 
 FROM base as train
 
