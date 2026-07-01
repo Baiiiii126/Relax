@@ -75,7 +75,7 @@ def is_command_safe(cmd: str) -> tuple[bool, Optional[str]]:
 
 
 @ray.remote
-def run_command(cmd: str) -> dict[str, Any]:
+def run_command(cmd: str, expose_gpus: bool = False) -> dict[str, Any]:
     """Run command on remote Ray node with timeout."""
     # Get timeout from environment variable
     timeout = int(os.environ.get("RAY_CMD_TIMEOUT", str(DEFAULT_TIMEOUT)))
@@ -94,6 +94,14 @@ def run_command(cmd: str) -> dict[str, Any]:
             "timed_out": False,
         }
 
+    # Ray sets CUDA_VISIBLE_DEVICES="" on workers that didn't request GPUs,
+    # which hides physical GPUs from the subprocess. Drop it so diagnostic
+    # commands (nvidia-smi, torch.cuda.device_count, py-spy on training procs)
+    # see all cards on the node without contending with training placement groups.
+    env = os.environ.copy()
+    if expose_gpus:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+
     try:
         # Use Popen for better control, with timeout
         process = subprocess.Popen(
@@ -102,6 +110,7 @@ def run_command(cmd: str) -> dict[str, Any]:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # Line buffered
+            env=env,
         )
 
         try:
@@ -303,6 +312,14 @@ Examples:
         help="Include CPU nodes (default: GPU nodes only)",
     )
 
+    parser.add_argument(
+        "--with-gpu",
+        action="store_true",
+        help="Expose the node's physical GPUs to the subprocess by clearing "
+        "CUDA_VISIBLE_DEVICES. Does NOT request GPU resources from Ray, so it "
+        "won't queue behind training placement groups.",
+    )
+
     return parser.parse_args()
 
 
@@ -388,13 +405,13 @@ def main():
         # Use NodeManagerAddress for resource binding
         node_address = node["NodeManagerAddress"]
         node_id_full = node["NodeID"]
+        gpu_count = int(node.get("Resources", {}).get("GPU", 0))
 
-        # Use node address as resource label for scheduling
-        task = run_command.options(resources={f"node:{node_address}": 1}).remote(cmd)
+        task = run_command.options(resources={f"node:{node_address}": 1}).remote(cmd, args.with_gpu)
         tasks.append(task)
         node_addresses.append(node_address)
 
-        logger.info(f"  📍 Node: {node_address} (ID: {node_id_full[:16]}...)")
+        logger.info(f"  📍 Node: {node_address} (ID: {node_id_full[:16]}..., GPUs: {gpu_count})")
 
     logger.info(f"✨ 已向 {len(tasks)} 个节点发送命令 (timeout={timeout}s)")
 
