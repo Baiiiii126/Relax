@@ -538,6 +538,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_rollout and dist.get_rank() == 0 and self.genrm_manager is not None:
             ray.get(self.genrm_manager.offload.remote())
 
+        # Gate all ranks behind rank-0's GenRM offload: otherwise other ranks
+        # wake_up() and reclaim GPU memory while colocated GenRM still holds its
+        # static pool, causing cuMemCreate OOM (mirrors the update_weights barrier).
+        if self.args.offload_rollout and self.genrm_manager is not None:
+            dist.barrier(group=get_gloo_group())
+
         if self.args.offload_train and self._per_step_rollout:
             self.wake_up()
 
@@ -1410,13 +1416,11 @@ class MegatronTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
 
         if self.args.offload_rollout and dist.get_rank() == 0:
-            # Onload rollout (weights) and genrm (KV resume only — genrm has no NCCL
-            # weight sync since the reward model is static) in parallel so both engines
-            # come back together before the next rollout step.
-            onload_handles = [self.rollout_manager.onload_weights.remote()]
-            if self.genrm_manager is not None:
-                onload_handles.append(self.genrm_manager.onload.remote())
-            ray.get(onload_handles)
+            # Onload rollout weights only. genRM (no NCCL weight sync — the reward
+            # model is static) is deferred to after the weight all-gather: in
+            # colocate mode its static pool would collide with the all-gather's
+            # temp buffers and OOM. See onload_kv below.
+            ray.get(self.rollout_manager.onload_weights.remote())
 
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
@@ -1481,9 +1485,16 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
         # RL warms KV here for the next per-step generate. SFT's /predict
-        # calls onload_kv itself.
-        if self.args.offload_rollout and dist.get_rank() == 0 and self._per_step_rollout:
-            ray.get(self.rollout_manager.onload_kv.remote())
+        # calls onload_kv itself. genRM (deferred from before the weight
+        # all-gather) is onloaded here too, in parallel.
+        if self.args.offload_rollout and dist.get_rank() == 0:
+            post_sync_handles = []
+            if self._per_step_rollout:
+                post_sync_handles.append(self.rollout_manager.onload_kv.remote())
+            if self.genrm_manager is not None:
+                post_sync_handles.append(self.genrm_manager.onload.remote())
+            if post_sync_handles:
+                ray.get(post_sync_handles)
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

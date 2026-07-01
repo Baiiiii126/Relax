@@ -6,6 +6,8 @@ This module provides a Ray Serve deployment for Generative Reward Model
 (genRM), which evaluates responses using LLM-based preference prediction.
 """
 
+import asyncio
+import os
 from argparse import Namespace
 from itertools import cycle
 from typing import Any, List, Optional, Union
@@ -23,6 +25,12 @@ from relax.utils.data.processing_utils import load_tokenizer
 
 
 app = FastAPI()
+
+# Max concurrent in-flight requests per GenRM Serve replica. Ray Serve's default
+# of 5 throttles judge dispatch and leaves the SGLang engines idle. The replica
+# is a pure-async CPU proxy (tokenize + forward), so a high cap lets one replica
+# saturate the engines. Override via env for tuning.
+GENRM_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("GENRM_SERVE_MAX_ONGOING_REQUESTS", "256"))
 
 
 class Message(BaseModel):
@@ -52,6 +60,7 @@ class GenerateResponse(BaseModel):
 
 
 @serve.deployment(
+    max_ongoing_requests=GENRM_SERVE_MAX_ONGOING_REQUESTS,
     logging_config=LoggingConfig(
         log_level="WARNING",
         enable_access_log=False,  # 关闭 HTTP 访问日志
@@ -164,7 +173,13 @@ class GenRM(Base):
 
         url = f"http://{host}:{port}/generate"
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
-        input_ids = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
+        # worker thread so it does not block this replica's event loop. Fast (Rust) tokenizers
+        # release the GIL during encode, so concurrent requests tokenize in parallel instead of
+        # serializing — without this a single replica throttles dispatch and starves the engines.
+        input_ids = await asyncio.to_thread(
+            self.tokenizer.apply_chat_template, messages, tokenize=True, add_generation_prompt=True
+        )
 
         if not isinstance(input_ids, list):
             input_ids = (
