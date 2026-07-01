@@ -267,10 +267,11 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 - ✅ **torch_memory_saver**:`TMS_CUDA_MAJOR` 自动探测;commit `afc13785`(已是 redai-infra HEAD,比 slime `a193d9dd` 新)。
 - `huggingface_hub==1.7.2`:保留(与 transformers 5.6.0 兼容);v0.5.12.post1 未固定 hf_hub。
 - `sglang-router>=0.2.3`:复核与新版兼容性(待定)。
-- ❓ **`pip install --ignore-installed PyJWT`**:slime v0.3.0 在 `pip install -r requirements.txt` 前加的一行。
+- ✅ **`pip install --ignore-installed PyJWT`**:slime v0.3.0 在 `pip install -r requirements.txt` 前加的一行。
   作用是规避 pip 卸载报错——当某依赖要升级/重装 PyJWT,但环境里已有的 PyJWT 是以 distutils/系统方式装的(缺 `RECORD`),
   pip 无法卸载会报 `Cannot uninstall 'PyJWT'`。`--ignore-installed` 让 pip 直接装新的、不尝试卸载旧的。
   **决策(2026-06-30):先不加**;待首次构建若真撞到该报错再补。
+  **更新(2026-07-01):首次构建确认撞到 `Cannot uninstall 'PyJWT'`,已在 `docker/Dockerfile` 的 requirements 安装前补上 `pip install --ignore-installed PyJWT`,与 slime 逐字一致。**
 - Megatron-Bridge commit:slime v0.3.0 换了源/commit,Relax 用 NeMo 官方源,是否同步待定。
 
 ### 7.6 验证状态

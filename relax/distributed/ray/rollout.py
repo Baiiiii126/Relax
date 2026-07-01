@@ -495,6 +495,7 @@ class EngineGroup:
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                    "SLIME_ENABLE_PROFILING": "true",
                 }.items()
             }
             if getattr(self.args, "fp16", False):
