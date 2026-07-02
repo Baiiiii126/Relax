@@ -9,16 +9,8 @@ import av
 import librosa
 import numpy as np
 import torch
-import torchvision
 from PIL import Image
 from torchvision import transforms
-
-
-try:
-    from torchvision.io.video import _read_from_stream
-except ImportError:
-    # torchvision >= 0.26 remove torchvision.io.video。
-    _read_from_stream = None
 from torchvision.transforms import InterpolationMode
 
 from relax.utils.logging_utils import get_logger
@@ -170,36 +162,31 @@ def load_video_from_path(
 
     Returns `(video_tensor, video_metadata, audio, audio_metadata)`.
     """
-    if "http://" in video or "https://" in video:
-        from packaging import version
+    from torchcodec.decoders import AudioDecoder, VideoDecoder
 
-        if version.parse(torchvision.__version__) < version.parse("0.19.0"):
-            logger.warning_once(
-                "torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0."
-            )
-    else:
-        if "file://" in video:
-            video = video[7:]
+    if "file://" in video:
+        video = video[7:]
+    if not ("http://" in video or "https://" in video):
         assert os.path.exists(video), f"Video path {video} does not exist."
 
-    video, _audio, read_info = torchvision.io.read_video(
-        video,
-        start_pts=0.0,
-        end_pts=None,
-        pts_unit="sec",
-        output_format="TCHW",
-    )
-    total_frames, video_fps = video.shape[0], read_info["video_fps"]
-    video_metadata = {"fps": video_fps, "total_num_frames": total_frames}
+    vdecoder = VideoDecoder(video)
+    frames = vdecoder.get_all_frames()
+    video_tensor = frames.data  # (T, C, H, W) uint8
+    video_fps = vdecoder.metadata.average_fps
+    video_metadata = {"fps": video_fps, "total_num_frames": len(video_tensor)}
 
     audio, audio_metadata = None, None
-    if use_audio_in_video and _audio.numel() > 0:
-        # Average across channels if multi-channel
-        audio = torch.mean(_audio, dim=0).numpy()
-        audio_fps = read_info["audio_fps"]
-        audio_metadata = {"fps": audio_fps, "total_num_frames": _audio.shape[0]}
+    if use_audio_in_video:
+        try:
+            adecoder = AudioDecoder(video)
+            samples = adecoder.get_all_samples()
+            audio = samples.data.mean(dim=0).numpy()  # (C, N) → (N,), float32 in [-1, 1]
+            audio_fps = samples.sample_rate
+            audio_metadata = {"fps": audio_fps, "total_num_frames": samples.data.shape[1]}
+        except Exception:
+            pass
 
-    return video, video_metadata, audio, audio_metadata
+    return video_tensor, video_metadata, audio, audio_metadata
 
 
 def load_video_from_bytes_list(
@@ -249,40 +236,26 @@ def load_video_from_bytes(
     use_audio_in_video: bool = True,
     **kwargs: Any,
 ) -> Tuple[torch.Tensor, Dict[str, int], Optional[np.ndarray], Optional[Dict[str, int]]]:
-    container = av.open(BytesIO(video))
-    video_frames = _read_from_stream(
-        container,
-        0.0,
-        float("inf"),
-        "sec",
-        container.streams.video[0],
-        {"video": 0},
-    )
-    video_fps = container.streams.video[0].average_rate
-    video_metadata = {"fps": video_fps, "total_num_frames": len(video_frames)}
-    vframes_list = [frame.to_rgb().to_ndarray() for frame in video_frames]
-    video = torch.as_tensor(np.stack(vframes_list)).permute(0, 3, 1, 2)  # t,c,h,w
+    from torchcodec.decoders import AudioDecoder, VideoDecoder
+
+    vdecoder = VideoDecoder(video)
+    frames = vdecoder.get_all_frames()
+    video_tensor = frames.data  # (T, C, H, W) uint8
+    video_fps = vdecoder.metadata.average_fps
+    video_metadata = {"fps": video_fps, "total_num_frames": len(video_tensor)}
 
     audio, audio_metadata = None, None
-    if use_audio_in_video and len(container.streams.audio) > 0:
-        audio_frames = _read_from_stream(
-            container,
-            0.0,
-            float("inf"),
-            "sec",
-            container.streams.audio[0],
-            {"audio": 0},
-        )
+    if use_audio_in_video:
+        try:
+            adecoder = AudioDecoder(video)
+            samples = adecoder.get_all_samples()
+            audio = samples.data.mean(dim=0).numpy()  # (C, N) → (N,), float32 in [-1, 1]
+            audio_fps = samples.sample_rate
+            audio_metadata = {"fps": audio_fps, "total_num_frames": samples.data.shape[1]}
+        except Exception:
+            pass
 
-        aframes_list = [frame.to_ndarray() for frame in audio_frames]
-        if len(aframes_list) > 0:
-            aframes = np.concatenate(aframes_list, 1)
-            aframes = np.mean(aframes, axis=0)
-            audio_fps = container.streams.audio[0].rate
-            audio_metadata = {"fps": audio_fps, "total_num_frames": len(aframes_list)}
-            audio = aframes
-
-    return video, video_metadata, audio, audio_metadata
+    return video_tensor, video_metadata, audio, audio_metadata
 
 
 def load_video(
