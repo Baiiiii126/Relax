@@ -18,7 +18,6 @@ from relax.utils import try_import_telemetry_hook
 try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
-from relax.utils import telemetry  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
@@ -110,11 +109,9 @@ def main(args):
     try:
         ctrl.training_loop()
     except Exception as e:
-        telemetry.mark_end(status="failed", error_type=type(e).__name__, error_message=str(e))
         logger.exception(f"Training loop failed with error: {e}")
         _graceful_shutdown(exit_code=1)
 
-    telemetry.mark_end(status="success")
     logger.info("Main func successfully")
     # Gracefully shut down SGLang engine processes before tearing down Ray Serve.
     _graceful_shutdown(exit_code=0)
@@ -122,5 +119,4 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    telemetry.mark_start(fields=vars(args))
     main(args)

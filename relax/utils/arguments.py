@@ -1788,7 +1788,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # tensorboard
         def add_tensorboard_arguments(parser):
             # tb_project_name, tb_experiment_name
-            parser.add_argument("--use-tensorboard", action="store_true", default=False)
+            parser.add_argument("--use-tensorboard", action=argparse.BooleanOptionalAction, default=True)
             parser.add_argument(
                 "--tb-project-name",
                 type=str,
