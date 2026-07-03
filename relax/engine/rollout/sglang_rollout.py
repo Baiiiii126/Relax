@@ -41,7 +41,7 @@ from relax.utils.timer import Timer
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
-from relax.utils.utils import CURRENT_ROLLOUT_BATCH, transfer_batch_to_data_system
+from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_batch_to_data_system
 
 
 __all__ = ["generate_rollout"]
@@ -957,18 +957,6 @@ async def generate_rollout_async(
     all_samples = [sample for group in data for sample in (group if isinstance(group, list) else [group])]
     timing_metrics = _aggregate_rollout_timing(all_samples, get_samples_times)
 
-    global CURRENT_ROLLOUT_BATCH
-    if CURRENT_ROLLOUT_BATCH:
-        save_debug_rollout_data(
-            args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
-        )
-        _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, timing_metrics, rollout_time)
-        if args.debug_rollout_only:
-            logger.info("Debug rollout only mode - data system cleanup")
-            await data_system_client.async_clear_partition(partition_id=f"train_{rollout_id}")
-        # Cleanup
-        CURRENT_ROLLOUT_BATCH.clear()
-
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
     new_aborted, completed_protected = await abort(args, rollout_id)
@@ -1001,6 +989,57 @@ async def generate_rollout_async(
         f"next_step_deficit={state.last_step_current_deficit} "
         f"oversample_surplus={len(oversample_surplus)} aborted={len(aborted_samples) - len(oversample_surplus)}"
     )
+
+    # When dynamic global batch size is enabled, extract fully-completed groups
+    # from aborted_samples and send them to training instead of carrying over.
+    if args.partial_rollout and args.use_dynamic_global_batch_size:
+        extra_completed = [
+            group
+            for group in aborted_samples
+            if all(s.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED) for s in group)
+        ]
+        if extra_completed:
+            aborted_samples = [
+                group
+                for group in aborted_samples
+                if not all(s.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED) for s in group)
+            ]
+            # Trim so total groups in TQ is divisible by dp_size (required by SeqlenBalancedSampler)
+            dp_size = compute_dp_size(args)
+            max_total = len(data) + len(extra_completed)
+            max_extra = max_total - (max_total % dp_size) - len(data)
+            accepted = extra_completed[:max_extra]
+            surplus = extra_completed[max_extra:]
+            aborted_samples.extend(surplus)
+            for group in accepted:
+                data.append(group)
+            if accepted:
+                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+            logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
+
+    global CURRENT_ROLLOUT_BATCH
+    if CURRENT_ROLLOUT_BATCH:
+        save_debug_rollout_data(
+            args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
+        )
+        rollout_metrics = dict(timing_metrics)
+        if args.partial_rollout:
+            assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
+                f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
+            )
+            staleness_gaps = [
+                rollout_id - s.metadata.get("start_rollout_id", rollout_id) for group in data for s in group
+            ]
+            rollout_metrics["rollout/staleness/avg"] = np.mean(staleness_gaps).item()
+            rollout_metrics["rollout/staleness/max"] = np.max(staleness_gaps).item()
+            rollout_metrics["rollout/staleness/min"] = np.min(staleness_gaps).item()
+            rollout_metrics["rollout/global_batch_size"] = len(data) * args.n_samples_per_prompt
+        _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
+        if args.debug_rollout_only:
+            logger.info("Debug rollout only mode - data system cleanup")
+            await data_system_client.async_clear_partition(partition_id=f"train_{rollout_id}")
+        # Cleanup
+        CURRENT_ROLLOUT_BATCH.clear()
 
     state.reset()
 

@@ -335,107 +335,91 @@ def _broadcast_routed_experts(
     NestedTensor jagged internals.  On non-source ranks they are None and
     will be allocated here.
 
-    Broadcasting mirrors the same pattern used by ``broadcast_object_list``
-    in this file: first across the TP group (src = tp_rank 0), then
-    optionally across the PP group (src = pp_rank 0).
+    Broadcast order: CP → PP → TP.  Only (TP=0, PP=0, CP=0) holds the
+    source data (``should_fetch`` requires all three ranks to be 0).
+    The CP step fans data to all CP partners of (TP=0, PP=0), then the
+    PP step (among tp_rank==0 peers) fans to all PP stages, and finally
+    the TP step fans from tp_rank==0 to the remaining TP ranks.
 
     Using ``dist.broadcast`` on contiguous GPU tensors is orders of magnitude
     faster than ``broadcast_object_list`` which pickles everything (~14 s for
     377 MB vs sub-second via NCCL).
-
-    TODO(yangrui6): missing CP broadcast. After the CP=0 guard added to
-    ``get_data_from_transfer_queue.should_fetch`` (to fix the CP fetch race
-    that hangs SFT/RL with CP>1), only (TP=0, PP=0, CP=0) holds the source
-    data. The PP→TP chain below assumes (TP=0, PP=0) — i.e. *all* CP partners
-    of (TP=0, PP=0) — has the data, but with the CP=0 guard only CP=0 of
-    (TP=0, PP=0) actually does. For RL paths that set
-    ``rollout_routed_experts`` in ``data_fields`` with CP>1, this routes wrong
-    data to CP=1..* partners (or hangs at the bcast meta exchange because
-    senders/receivers disagree on shape).
-    Fix: prepend a CP bcast step that fans the tensor from (TP=0, PP=0, CP=0)
-    to (TP=0, PP=0, CP=*) before the existing PP/TP bcasts, gated on
-    ``is_tp_rank0 and is_pp_rank0`` (mirror what we added at
-    ``get_data_from_transfer_queue`` for ``broadcast_object_list``). SFT does
-    NOT exercise this path (``rollout_routed_experts`` only set in RL with
-    ``--use-rollout-routing-replay``), so the bug is latent; user can
-    reproduce by running GRPO/GSPO + routing_replay + CP>1.
     """
 
     def _bcast_tensor(tensor, is_sender, dtype):
-        """Broadcast a tensor (any shape) across PP then TP groups.
+        """Broadcast a tensor (any shape) across CP, PP, then TP groups.
 
-        Order: PP first, then TP.  This is important because only
-        (tp_rank==0, pp_rank==0) has the data.  PP broadcast first
-        sends data to (tp_rank==0, pp_rank==1), then TP broadcast in
-        each PP stage sends from tp_rank==0 to other tp_ranks.
+        Order: CP first, then PP (among tp_rank==0), then TP.
+        Only (tp_rank==0, pp_rank==0, cp_rank==0) has the data initially.
         """
-        # Short-circuit: when both TP and PP groups are trivial (size 1),
+
+        def _bcast_unknown_shape(t, has_data, src_global, group):
+            """Broadcast a tensor whose shape is unknown to receivers.
+
+            Broadcasts ndim -> shape -> data in three NCCL calls. Returns the
+            broadcast tensor on *cuda_dev* with *dtype*.
+            """
+            if has_data and t is not None:
+                ndim_t = torch.tensor([t.ndim], dtype=torch.long, device=cuda_dev)
+            else:
+                ndim_t = torch.tensor([0], dtype=torch.long, device=cuda_dev)
+            dist.broadcast(ndim_t, src=src_global, group=group)
+            ndim = ndim_t.item()
+
+            if has_data and t is not None:
+                shape_t = torch.tensor(list(t.shape), dtype=torch.long, device=cuda_dev)
+            else:
+                shape_t = torch.empty(ndim, dtype=torch.long, device=cuda_dev)
+            dist.broadcast(shape_t, src=src_global, group=group)
+            shape = torch.Size(shape_t.tolist())
+
+            if has_data and t is not None:
+                buf = t.to(dtype=dtype, device=cuda_dev).contiguous()
+            else:
+                buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
+            dist.broadcast(buf, src=src_global, group=group)
+            return buf
+
+        # Short-circuit: when CP, TP and PP groups are all trivial (size 1),
         # skip the GPU round-trip entirely and return the source tensor.
+        cp_trivial = mpu.get_context_parallel_world_size() <= 1
         tp_trivial = mpu.get_tensor_model_parallel_world_size() <= 1
         pp_trivial = (not broadcast_pp) or mpu.get_pipeline_model_parallel_world_size() <= 1
-        if tp_trivial and pp_trivial:
+        if cp_trivial and tp_trivial and pp_trivial:
             if is_sender and tensor is not None:
                 return tensor.to(dtype=dtype).contiguous()
             # Shouldn't happen (sender has the tensor), but be safe.
             return torch.empty(0, dtype=dtype)
 
-        # After PP broadcast, every tp_rank==0 has the data.
-        # After TP broadcast, every rank has the data.
+        is_cp_rank0 = mpu.get_context_parallel_rank() == 0
+        is_pp_rank0 = mpu.get_pipeline_model_parallel_rank() == 0
         is_tp_rank0 = mpu.get_tensor_model_parallel_rank() == 0
 
+        # --- Step 0: CP broadcast (cp_rank==0 -> others in each CP group) ---
+        # Only the (TP=0, PP=0) CP group needs this: it fans data from
+        # CP=0 to all CP peers.  Other CP groups are skipped — their
+        # ranks receive data later via the PP and TP broadcasts (the
+        # PP/TP source ranks already have data from this CP step).
+        # All members of a CP group share the same TP/PP rank, so the
+        # guard is uniform within each group — no hang risk.
+        if not cp_trivial and is_tp_rank0 and is_pp_rank0:
+            cp_group = mpu.get_context_parallel_group()
+            cp_src_global = dist.get_global_rank(cp_group, 0)
+            tensor = _bcast_unknown_shape(tensor, is_cp_rank0, cp_src_global, cp_group)
+
         # --- Step 1: PP broadcast (only among tp_rank==0 ranks) ---
+        # After CP broadcast, every (TP=0, PP=0, CP=*) rank has data, so
+        # the PP sender is identified by pp_rank==0.
         if not pp_trivial and is_tp_rank0:
             pp_group = mpu.get_pipeline_model_parallel_group()
             pp_src_global = dist.get_global_rank(pp_group, 0)
-
-            # Broadcast shape metadata
-            if is_sender and tensor is not None:
-                ndim_t = torch.tensor([tensor.ndim], dtype=torch.long, device=cuda_dev)
-            else:
-                ndim_t = torch.tensor([0], dtype=torch.long, device=cuda_dev)
-            dist.broadcast(ndim_t, src=pp_src_global, group=pp_group)
-            ndim = ndim_t.item()
-
-            if is_sender and tensor is not None:
-                shape_t = torch.tensor(list(tensor.shape), dtype=torch.long, device=cuda_dev)
-            else:
-                shape_t = torch.empty(ndim, dtype=torch.long, device=cuda_dev)
-            dist.broadcast(shape_t, src=pp_src_global, group=pp_group)
-            shape = torch.Size(shape_t.tolist())
-
-            # Broadcast data
-            if is_sender and tensor is not None:
-                tensor = tensor.to(dtype=dtype, device=cuda_dev).contiguous()
-            else:
-                tensor = torch.empty(shape, dtype=dtype, device=cuda_dev)
-            dist.broadcast(tensor, src=pp_src_global, group=pp_group)
+            tensor = _bcast_unknown_shape(tensor, is_pp_rank0, pp_src_global, pp_group)
 
         # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
         if not tp_trivial:
             tp_group = mpu.get_tensor_model_parallel_group()
             tp_src_global = dist.get_global_rank(tp_group, 0)
-
-            # Now every tp_rank==0 has the tensor (from step 1 or original).
-            if is_tp_rank0 and tensor is not None:
-                ndim_t = torch.tensor([tensor.ndim], dtype=torch.long, device=cuda_dev)
-            else:
-                ndim_t = torch.tensor([0], dtype=torch.long, device=cuda_dev)
-            dist.broadcast(ndim_t, src=tp_src_global, group=tp_group)
-            ndim = ndim_t.item()
-
-            if is_tp_rank0 and tensor is not None:
-                shape_t = torch.tensor(list(tensor.shape), dtype=torch.long, device=cuda_dev)
-            else:
-                shape_t = torch.empty(ndim, dtype=torch.long, device=cuda_dev)
-            dist.broadcast(shape_t, src=tp_src_global, group=tp_group)
-            shape = torch.Size(shape_t.tolist())
-
-            if is_tp_rank0 and tensor is not None:
-                buf = tensor.to(dtype=dtype, device=cuda_dev).contiguous()
-            else:
-                buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
-            dist.broadcast(buf, src=tp_src_global, group=tp_group)
-            tensor = buf
+            tensor = _bcast_unknown_shape(tensor, is_tp_rank0, tp_src_global, tp_group)
 
         return tensor
 

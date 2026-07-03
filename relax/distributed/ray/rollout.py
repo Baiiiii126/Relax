@@ -756,6 +756,7 @@ class RolloutManager(ReloadableMixin):
     def __init__(self, args, pg, data_source=None):
         self.pg = pg
         self.args = args
+        self._dynamic_global_batch_size = None
 
         init_tracking(args, primary=False)
 
@@ -937,6 +938,17 @@ class RolloutManager(ReloadableMixin):
         """
         return self._weight_sync_lock
 
+    def get_dynamic_global_batch_size(self):
+        """Return the actual sample count from the last rollout step.
+
+        Used by training side to compute correct batch_size for TQ fetch when
+        use_dynamic_global_batch_size is enabled.
+        """
+        assert self._dynamic_global_batch_size is not None, (
+            "get_dynamic_global_batch_size called before first generate()"
+        )
+        return self._dynamic_global_batch_size
+
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
@@ -946,7 +958,7 @@ class RolloutManager(ReloadableMixin):
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        await asyncio.to_thread(
+        output = await asyncio.to_thread(
             call_rollout_fn,
             self.generate_rollout,
             self.args,
@@ -955,6 +967,8 @@ class RolloutManager(ReloadableMixin):
             self.data_system_client,
             evaluation=False,
         )
+        if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
+            self._dynamic_global_batch_size = len(output.samples) * self.args.n_samples_per_prompt
 
     async def eval(self, rollout_id):
         self.health_monitoring_resume()
