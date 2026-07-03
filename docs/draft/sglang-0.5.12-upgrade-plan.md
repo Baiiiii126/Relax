@@ -278,4 +278,72 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 
 - ✅ 新 patch 干净应用于 v0.5.12.post1(`git apply --check` exit 0)
 - ✅ 改动文件 Python 语法检查通过
-- ❌ 未打镜像、未实跑(需 GPU 构建环境)——7.4 各项均待镜像构建后验证
+- ⚠️ 已打镜像并首次实跑冒烟(Kimi-K2.6, 2026-07-02~03),暴露并修复了 5 个 bug,见 **第 8 节**;
+  7.4 中 BF16 MoE / transformers 5.6.0 等仍待更全面验证。
+
+---
+
+## 8. 首次实跑冒烟发现的 bug 与修复(2026-07-02 ~ 07-03)
+
+镜像按第 7 节改动打好后,以 **Kimi-K2.6**(MLA / INT4 QAT / colocate GRPO / TP2·PP1·CP2·EP8 / 8×GPU 单机)
+减层冒烟为载体首次实跑,依次暴露并修复了下列问题。代码类改动见 commit `256b030`;FA3 两处崩溃的完整排查见同目录
+`fa3-window-size-left-crash-postmortem.md` 与 `kimi-k2.6-cp-split-with-sizes-crash-investigation.md`。
+
+### 8.1 colocate 显存挤兑 OOM(NCCL calloc 失败)
+
+- **现象**:step 0 在 `_update_router_expert_bias` 的 all_reduce 处
+  `NCCL WARN Cuda failure 'out of memory' / Failed to CUDA calloc 10485760 bytes`。并非训练权重装不下——2 层模型 offload 后仅 ~2GB。
+- **根因**:colocate 下 SGLang 静态 KV 池(`--sglang-mem-fraction-static 0.7` ≈ 55GB/卡)+ Kimi 超大 MoE(EP=8 多 expert)激活
+  + seq 16k 动态 batch 叠加把卡榨干,NCCL 连 10MB 通信 buffer 都拿不到(报的是 NCCL calloc,而非 torch OOM)。
+- **修复/缓解**:上下文 16384 → 4096(`--rollout-max-response-len` / `--eval-max-response-len` / `--max-tokens-per-gpu`,见 run 脚本);
+  可选降 `--sglang-mem-fraction-static`、设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
+
+### 8.2 减层 checkpoint 与 `--num-layers` 不一致 → 训推 diff 0.7
+
+- **现象**:`train_rollout_logprob_abs_diff ≈ 0.757`(全量层历史值 ~0.04),稳定不发散。
+- **根因**:脚本 `--num-layers 3` 但 checkpoint `text_config.num_hidden_layers=2`;日志 `model_provider` 打印
+  `Override provider.num_layers: 2 -> 3`,bridge 只填 2 层权重、**第 3 层随机初始化** → 训练前向被污染,与干净 2 层的 SGLang 推理系统性偏离。
+- **信号/坑**:diff 稳定(非 NaN、不发散)= 结构性系统偏差;唯一日志线索是那条 **INFO 级** `Override provider.num_layers`,
+  混在十几条同款 Override 里、无告警、还被 `[repeated 7x]` 折叠,极易漏。
+- **修复**:`NLAYERS=2` 与 checkpoint 对齐;`scripts/models/kimi-k2.6.sh` 把 `NLAYERS` 改为可 env 覆盖(`${NLAYERS:=61}`)。
+  **教训:减层冒烟必须让 `--num-layers` == checkpoint 的 `num_hidden_layers`。**
+
+### 8.3 CP `split_with_sizes` 崩溃(is_vl_model padding 记账口径不一致)
+
+- **现象**:step 0 结尾指标上传阶段 `RuntimeError: split_with_sizes expects split_sizes to sum exactly to ...`;仅 `CP>1` + `qkv_format=thd` 触发。
+- **根因**:Kimi-K2.6 是纯文本 MoE,但 checkpoint 带 `preprocessor_config.json` → `actor.py:154` 误判 `is_vl_model=True`
+  → 打包/前向走 bridge VL+CP+thd unsplit 路径、按 pad 后长度切 token 级字段;而记账侧(`log_rollout_data` / loss / `stream_dataloader`)
+  调 `maybe_padded_total_lengths` 时 **漏传 `is_vl_model`** → 按未 pad 公式重算 → 每样本差 2 → 崩。
+- **修复**:5 处 `maybe_padded_total_lengths` 补 `is_vl_model`(actor.py / data.py×2 / loss.py / stream_dataloader.py)。
+  **与 sglang 升级无关**,dev 上同样存在,本次因启用 `--context-parallel-size 2` 才暴露。
+
+### 8.4 FA3 `window_size_left` TypeError(TE 2.14.1)
+
+- **现象**:CP flash 路径 `TypeError: _flash_attn_forward() got an unexpected keyword argument 'window_size_left'`。
+- **根因**:容器混装的残缺 FA3 beta(旧 `window_size` 元组签名)被 TE 2.14.1 选中,而 TE 2.14.1 假设较新 FA3 API(带 `window_size_left`)。详见 postmortem。
+- **修复**:`docker/Dockerfile` FA3 hopper commit `fbf24f67` → `0f82fead`(2026-03-18,TE 2.14.1 发布前最后一次 hopper 接口改动,含 `window_size_left`)。
+
+### 8.5 FA3 `schema_.has_value()` / `basic_string::_M_create`(custom op 重复注册 → use-after-free)
+
+- **现象**:换上 0f82fead 后,CP `cp_p2p_fwd_flash_attn → flash_attn_fwd` 处 8 个 rank 报三种不同错——
+  `schema_.has_value() ... Tried to access the schema for .`(空 op 名)/ `basic_string::_M_create` / `UnicodeDecodeError`,典型 use-after-free。参数全合法,abi3/非-abi3 都崩。
+- **根因**:被污染的容器 site-packages 里存在**两份**注册同名 torch custom op `flash_attn_3::_flash_attn_forward` 的文件:
+  包内 `flash_attn_3/flash_attn_interface.py`(TE import 时绑定)与游离顶层 `flash_attn_interface.py`。
+  第二个 importer(SGLang 依赖的 flashinfer `import flash_attn_interface`)触发 torch `get_library_allowing_overwrite`
+  → `_destroy()` 掉 TE 已注册的 Library → TE 旧句柄再 dispatch 时读到已释放/空 schema。
+- **要点**:**干净镜像不含游离顶层模块**(经用户确认),污染来自调试期间容器内手动 `setup.py install` FA3(疑 setuptools 版本差异)。故 **Dockerfile 无需改动**。
+- **修复**:删除游离顶层 `flash_attn_interface.py` / `flash_attn_config.py`、修正 egg `top_level.txt` 只留 `flash_attn_3`。
+  手动安装路径由仓库外的 `install_fa3_0f82fead.sh` 的 `strip_stray_modules()` 兜底(快/慢路径都调用,verify 断言顶层模块不可导入)。
+
+### 8.6 小结
+
+| # | bug | 落地位置 | 是否由 0.5.12 升级引入 |
+|---|---|---|---|
+| 8.1 | colocate OOM (NCCL calloc) | run 脚本上下文降到 4k | 否(colocate 通用) |
+| 8.2 | 层数不一致 → diff 0.7 | `NLAYERS=2` + 可 env 覆盖 | 否(减层冒烟配置) |
+| 8.3 | CP `split_with_sizes` | `is_vl_model`×5(commit `256b030`) | 否(dev 已存在,CP=2 暴露) |
+| 8.4 | FA3 `window_size_left` | Dockerfile FA3 → `0f82fead` | 是(TE 2.14.1 栈相关) |
+| 8.5 | FA3 重复注册崩溃 | 容器内清理 + tools 脚本兜底(镜像干净,不改 Dockerfile) | 否(容器污染) |
+
+> 结论:5 个中仅 **8.4** 真正源于本次 sglang/镜像升级栈(TE 2.14.1 需要更新的 FA3);8.5 是升级过程中**手动装 FA3** 的副作用而非升级本身;
+> 8.1/8.2 是 colocate 与减层冒烟的通用配置问题;8.3 是 dev 早已潜伏、被 CP=2 暴露的通用 bug。
