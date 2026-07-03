@@ -978,7 +978,7 @@ index c87ccd5ff..1111111aa 100644
  from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
  
  
-@@ -136,11 +139,18 @@
+@@ -136,11 +139,15 @@
              if not hasattr(MoonViT3dEncoder, "use_deterministic_attn"):
                  MoonViT3dEncoder.use_deterministic_attn = False
 
