@@ -1,0 +1,2 @@
+# Built SIF images are large binaries — never commit
+*.sif

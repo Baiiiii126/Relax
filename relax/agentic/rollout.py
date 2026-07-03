@@ -1303,6 +1303,10 @@ def _compute_rollout_metrics_from_samples(args, samples: list[Sample]) -> dict[s
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([has_repetition(sample.response) for sample in samples]).item()
     log_dict["truncated_ratio"] = np.mean([sample.status == Sample.Status.TRUNCATED for sample in samples]).item()
+    turns = [s.metadata.get("agentic_trace", {}).get("turn_count", 1) for s in samples]
+    log_dict["num_turn/mean"] = float(np.mean(turns))
+    log_dict["num_turn/max"] = float(np.max(turns))
+    log_dict["num_turn/min"] = float(np.min(turns))
     return log_dict
 
 
@@ -1484,15 +1488,25 @@ async def _run_eval_samples(
         eval_prepare_groups = [[sample] for sample in eval_samples]
     total_group_count = len(eval_prepare_groups)
     eval_group_size = dataset_cfg.n_samples_per_eval_prompt if args.group_rm else 1
+    train_prepare_pool_target_group_count = args.agentic_prepare_pool_size or args.over_sampling_batch_size
+    train_prepare_pool_target_session_count = train_prepare_pool_target_group_count * args.n_samples_per_prompt
     eval_prepare_pool_target_group_count = args.agentic_eval_prepare_pool_size
     if eval_prepare_pool_target_group_count is None:
-        train_prepare_pool_target_group_count = args.agentic_prepare_pool_size or args.over_sampling_batch_size
-        train_prepare_pool_target_session_count = train_prepare_pool_target_group_count * args.n_samples_per_prompt
         eval_prepare_pool_target_group_count = (
             train_prepare_pool_target_session_count + eval_group_size - 1
         ) // eval_group_size
     eval_prepare_pool_target_group_count = min(total_group_count, eval_prepare_pool_target_group_count)
-    eval_runtime_admission_group_count = total_group_count
+    # Cap runtime residency to training's steady-state in-flight session budget.
+    # Leaving it at total_group_count lets the whole eval set queue in runtime and
+    # can OOM the raylet on large eval datasets; training never hits this because
+    # `over_sampling_batch_size` bounds admission per step.
+    eval_runtime_admission_group_count = min(
+        total_group_count,
+        max(
+            eval_prepare_pool_target_group_count,
+            (train_prepare_pool_target_session_count + eval_group_size - 1) // eval_group_size,
+        ),
+    )
     pbar = tqdm(total=eval_sample_count, desc=f"Eval {dataset_cfg.name}", unit="sample")
     logger.info(
         "Agentic eval dataset=%s total_samples=%s total_group_count=%s "

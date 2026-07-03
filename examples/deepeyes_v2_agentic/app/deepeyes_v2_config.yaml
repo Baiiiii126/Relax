@@ -1,0 +1,22 @@
+max_turns: 9
+code_timeout_s: 200
+ensure_sandbox_timeout_s: 240
+sandbox_backend: apptainer_jupyter  # only backend in Phase 1
+
+# Single-token stops bypass the detokenizer entirely — SGLang matches them
+# on the GPU side against generated token ids, no subprocess round-trip.
+# Token ids below are for the Qwen3-VL / Qwen3.5 / Qwen3.6 tokenizer family
+# (vocab 248044 base + added special tokens 248045..). If you swap to a
+# different tokenizer, re-derive with:
+#   python -c "from transformers import AutoTokenizer; \
+#       t = AutoTokenizer.from_pretrained('<model>', trust_remote_code=True); \
+#       print(t.encode('</tool_call>', add_special_tokens=False))"
+#
+# <|im_end|> (248046) is the chat-template turn terminator. It's the only
+# clean stop for the <answer>...</answer> branch: </answer> tokenizes to
+# 3 tokens ([510, 8944, 29]) so it cannot be expressed as a stop_token_id.
+# extract_answer() (env_deepeyes_v2.py) regex-matches <answer>...</answer>
+# anywhere in the text, so trailing chat-template tokens don't hurt.
+stop_token_ids:
+  - 248059  # </tool_call>
+  - 248046  # <|im_end|>

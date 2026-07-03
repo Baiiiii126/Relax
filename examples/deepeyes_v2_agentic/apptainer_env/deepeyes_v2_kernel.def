@@ -1,0 +1,53 @@
+# Apptainer image definition for the DeepEyes V2 sandbox kernel.
+#
+# Build (prefer scripts/prepare.sh which wires in the right --build-arg flags):
+#   apptainer build deepeyes_v2_kernel.sif deepeyes_v2_kernel.def
+#
+# Produces a ~115 MiB SIF. Place it on a shared NFS path readable from every
+# training node and either set APPTAINER_IMAGE_PATH or edit apptainer_config.yaml.
+# Add --fakeroot if a plain build is refused.
+#
+# Packages installed:
+#   ipykernel    required — backend launches `python -m ipykernel_launcher`
+#   pillow       prompt.py — PIL.Image used in sandbox bootstrap
+#   matplotlib   prompt.py — plt.show() monkey-patch to dump figures to disk
+#   autopep8     env_deepeyes_v2.py — _fix_python_indentation
+#   numpy        almost every snippet the model writes needs it
+
+Bootstrap: docker
+From: {{ FROM_IMAGE }}
+
+%arguments
+    # Override at build time with `apptainer build --build-arg KEY=VALUE …`.
+    # Defaults use upstream docker hub + pypi.org; behind a corporate firewall,
+    # set FROM_IMAGE to an internal docker mirror and PIP_INDEX_URL /
+    # PIP_TRUSTED_HOST to an internal pypi mirror — see env.sh.example.
+    FROM_IMAGE=python:3.11-slim
+    PIP_INDEX_URL=
+    PIP_TRUSTED_HOST=
+
+%post
+    if [ -n "{{ PIP_INDEX_URL }}" ]; then
+        pip config set global.index-url "{{ PIP_INDEX_URL }}"
+        if [ -n "{{ PIP_TRUSTED_HOST }}" ]; then
+            pip config set global.trusted-host "{{ PIP_TRUSTED_HOST }}"
+        fi
+    fi
+
+    pip install --no-cache-dir \
+        ipykernel \
+        pillow \
+        matplotlib \
+        autopep8 \
+        numpy
+
+    # smoke test — build 时就能发现 ipykernel 装坏了
+    python -c "import ipykernel, PIL, matplotlib, autopep8, numpy; print('all OK')"
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export MPLBACKEND=Agg
+
+%labels
+    Purpose deepeyes_v2 sandbox kernel image
+    Source examples/deepeyes_v2/apptainer_env/deepeyes_v2_kernel.def
