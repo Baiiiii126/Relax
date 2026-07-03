@@ -30,6 +30,41 @@ Issues at this stage are typically Megatron / Transformer Engine related bugs. F
 
 - MoE models require `--moe-permute-fusion` to be enabled.
 
+## SGLang Runtime Crashes
+
+### 1. Stop Strings Trigger IMA Under Agentic High Concurrency
+
+**Symptom**: Mid-rollout (after the rollout has been running for tens of seconds to a few minutes), the SGLang scheduler raises an exception, followed by `SIGQUIT received. ... It usually means one child failed`. The engine is killed and the rollout stalls:
+
+```
+[TP0] Scheduler hit an exception: Traceback (most recent call last):
+  ...
+  File "sglang/srt/managers/scheduler_output_processor_mixin.py", line 371, in process_batch_result_decode
+    next_token_ids = next_token_ids.tolist()
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+```
+
+**Root cause**: The `stop` strings on an OpenAI-compatible request are handled by the SGLang detokenizer subprocess via per-token incremental decode plus substring match. Under agentic workloads with 100+ concurrent sessions (each running multiple chat completions), the detokenizer's per-token work scales linearly with the number of stop strings and can starve its 20s heartbeat. The GPU-side async kernel error then surfaces as an illegal memory access.
+
+**Workaround**: Prefer `stop_token_ids` over `stop` whenever possible. `stop_token_ids` is matched on the GPU against generated token ids and bypasses the detokenizer subprocess entirely.
+
+- Single-token terminators (e.g. `</tool_call>`, `<|im_end|>`): look up their ids via the tokenizer and pass them as `stop_token_ids`.
+- Multi-token sequences (e.g. `</answer>` = `[510, 8944, 29]`) cannot be expressed as `stop_token_ids`. Prefer terminating on the chat-template turn end (`<|im_end|>`) and extracting the answer via regex after generation, so `stop` can still be avoided.
+
+Pass `stop_token_ids` from the agent app via `extra_body`:
+
+```python
+extra_body = {"stop_token_ids": [248059, 248046]}  # </tool_call>, <|im_end|>
+resp = await client.chat.completions.create(
+    model=...,
+    messages=messages,
+    extra_body=extra_body,
+    ...
+)
+```
+
+See the comments in `examples/deepeyes_v2_agentic/app/agent.py` and `examples/deepeyes_v2_agentic/app/deepeyes_v2_config.yaml` for a working example.
+
 ## Isolated Debugging
 
 Relax supports running the training and inference components independently, which allows:

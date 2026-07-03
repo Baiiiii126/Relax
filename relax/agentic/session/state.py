@@ -809,6 +809,11 @@ class SessionForest:
             }
         )
         merged_metadata[TRACE_KEY] = trace
+        # Mirror the turn count to ``rollout_turns`` so consumers that predate
+        # the agentic trace (train_dump_utils, the non-agentic rollout metric
+        # path) see a single source of truth without having to know about
+        # ``agentic_trace``.
+        merged_metadata["rollout_turns"] = len(turns)
         if leaf.kind == "obs":
             status = Sample.Status.TRUNCATED.value
         else:

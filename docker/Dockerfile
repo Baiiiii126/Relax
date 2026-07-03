@@ -93,6 +93,12 @@ RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatro
     rsync -avP /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
     rm -rf /root/Megatron-Bridge
 
+RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/apptainer_1.4.1_amd64.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ./apptainer_1.4.1_amd64.deb \
+    && rm apptainer_1.4.1_amd64.deb \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt /tmp/requirements.txt
 
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \

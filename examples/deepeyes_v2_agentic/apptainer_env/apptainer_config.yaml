@@ -1,0 +1,64 @@
+# Apptainer Jupyter 后端的配置示例 (deepeyes_v2)
+#
+# 通过 SANDBOX_CONFIG_PATH 环境变量传给 examples.deepeyes_v2.env_deepeyes_v2._get_sandbox_executor
+# 这里所有字段直接作为 kwargs 传给 ApptainerJupyterBackend.__init__，
+# 字段名对应 examples/deepeyes_v2/sandboxes/backends/apptainer_jupyter_backend.py
+# 中的构造函数参数。
+
+# ─── image ────────────────────────────────────────────────────────────────────
+# 必填。容器镜像，三种写法任选其一：
+#   1) docker://<reg>/<repo>:<tag>   apptainer 会自动 pull 并缓存到 ~/.apptainer/cache
+#   2) /abs/path/to/your.sif         本地预先 build 好的 SIF 文件 (推荐生产用)
+#   3) library://...                 Sylabs Cloud 镜像
+#
+# 镜像内必须预装：ipykernel, pillow, matplotlib, autopep8, numpy
+# (没有 ipykernel 的话 `python -m ipykernel_launcher` 直接挂)
+#
+# 自己 build 一个最小 deepeyes_v2 内核镜像的方法：
+#   cat > kernel.def <<'EOF'
+#   Bootstrap: docker
+#   From: python:3.11-slim
+#   %post
+#       pip install --no-cache-dir ipykernel pillow matplotlib autopep8 numpy
+#   EOF
+#   apptainer build deepeyes_v2_kernel.sif kernel.def
+#
+# 这个集群对 registry-1.docker.io 出网受限 (timeout)，所以必须用本地预 build 的 .sif。
+image: ./deepeyes_v2_kernel.sif
+
+# ─── bind_paths ───────────────────────────────────────────────────────────────
+# { container_path: host_subdir_name }
+# 后端会在每个 session 自己的 host 临时目录下创建 <host_subdir_name>/，
+# 然后 apptainer -B host_path:container_path 把它挂进容器。
+#
+# deepeyes_v2 的 prompt.py 把这两个容器路径写死了，不要改 key：
+#   /tmp/_relax_imgs    每轮清空，存放 plt.show() 自动落盘的图
+#   /tmp/_relax_inputs  跨轮持久，存放 image_1.png + 各种别名 symlink
+bind_paths:
+  /tmp/_relax_imgs: imgs
+  /tmp/_relax_inputs: inputs
+
+# ─── extra_binds ──────────────────────────────────────────────────────────────
+# 额外的只读 mount，用 apptainer 原生的 "host:container[:ro]" 字符串。
+# 例：把 host 上的数据集目录以只读形式暴露给容器代码。
+# extra_binds:
+#   - /abs/path/to/datasets:/data:ro
+
+# ─── env ──────────────────────────────────────────────────────────────────────
+# 透传给 kernel 进程的环境变量 (会变成 apptainer --env KEY=VAL)。
+# 因为我们用了 --cleanenv，host 的环境变量默认 不会 进容器，需要的得在这里列。
+env:
+  PYTHONUNBUFFERED: "1"
+  MPLBACKEND: Agg
+
+# ─── 资源 / 行为开关 ─────────────────────────────────────────────────────────
+nv: false                       # --nv: NVIDIA GPU 透传 (deepeyes_v2 sandbox 不需要 GPU，false 即可)
+writable_tmpfs: true            # --writable-tmpfs: 容器 rootfs 可写 (临时 overlay)
+cleanenv: true                  # --cleanenv: 不继承 host 环境变量
+pid_isolation: true             # --pid: 独立 PID namespace
+home_dir: /root                 # --home: 容器内 $HOME (apptainer 1.4+ 必须用 --home 而不是 --env HOME=)
+
+# ─── 超时 / 重试 ────────────────────────────────────────────────────────────
+# 第一次 docker:// 拉镜像可能要几分钟，把这个调大才不会假死在 wait_for_ready
+kernel_ready_timeout_s: 120
+create_max_retries: 3

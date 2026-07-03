@@ -167,7 +167,14 @@ class SessionOutput:
             raise TypeError(f"SessionOutput payload must be a JSON object, got {type(payload)}")
         unknown_keys = set(payload) - {"metadata", "reward"}
         if unknown_keys:
-            raise TypeError("SessionOutput only supports 'metadata' and 'reward'")
+            # Be lenient: example agents often want to dump debug fields
+            # (messages, branch_counts, trajectory…). Warn once per call
+            # instead of crashing the whole session.
+            logger.warning(
+                "SessionOutput ignoring unknown top-level keys: %s. "
+                "Only 'metadata' and 'reward' are consumed by Relax.",
+                sorted(unknown_keys),
+            )
         metadata = payload.get("metadata", {})
         reward = payload.get("reward")
         if not isinstance(metadata, dict):
@@ -780,9 +787,15 @@ class ManagedSessionRunner:
             if session_handle in seen_handles:
                 continue
             if session_handle not in self._tasks_by_handle:
-                raise KeyError(f"Unknown managed session handle: {session_handle}")
+                # Handle can legitimately be missing if the runner actor was
+                # respawned (e.g. after OOM kill) between session start and
+                # release; treat cleanup of a dead session as a no-op.
+                logger.warning("release_sessions: unknown managed session handle %s; skipping", session_handle)
+                continue
             seen_handles.add(session_handle)
             unique_handles.append(session_handle)
+        if not unique_handles:
+            return 0
         tasks = [self._tasks_by_handle[session_handle] for session_handle in unique_handles]
         for session_handle in unique_handles:
             self._clear_session_timeout_clock(session_handle)

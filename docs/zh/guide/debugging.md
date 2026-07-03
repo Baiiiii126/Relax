@@ -30,6 +30,41 @@
 
 - MoE 模型需要开启 `--moe-permute-fusion`。
 
+## SGLang 运行时崩溃
+
+### 1. Stop string 在 agentic 高并发下触发 IMA
+
+**症状**：agentic rollout 跑到中段（rollout 已经运行了几十秒到几分钟）时，SGLang scheduler 抛异常，紧接着 `SIGQUIT received. ... It usually means one child failed`，engine 被 kill，整个 rollout 停摆：
+
+```
+[TP0] Scheduler hit an exception: Traceback (most recent call last):
+  ...
+  File "sglang/srt/managers/scheduler_output_processor_mixin.py", line 371, in process_batch_result_decode
+    next_token_ids = next_token_ids.tolist()
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+```
+
+**根因**：OpenAI-compatible request 里的 `stop` 字符串由 SGLang detokenizer 子进程按 per-token 增量解码 + 子串匹配处理。agentic 场景下 100+ session 并发（每个 session 内又有多轮 chat completion），detokenizer 的单 token 工作量随 stop string 数量线性放大，容易 starve 掉它的 20s 心跳，GPU 侧 async kernel 就会以 IMA 的形式浮现。
+
+**规避**：能用 `stop_token_ids` 就不要用 `stop`。`stop_token_ids` 走 GPU 侧 token id 匹配，完全绕过 detokenizer 子进程。
+
+- 单 token 就能表示的终止符（如 `</tool_call>`、`<|im_end|>`）：查 tokenizer 拿到 id 后直接传 `stop_token_ids`。
+- 多 token 序列（如 `</answer>` = `[510, 8944, 29]`）无法用 `stop_token_ids` 表达。这种情况优先用 chat-template 的 turn 终止符（`<|im_end|>`）作为停止条件，再在生成后 regex 提取答案，仍然可以避开 `stop`。
+
+在 agent app 里通过 `extra_body` 传 `stop_token_ids`：
+
+```python
+extra_body = {"stop_token_ids": [248059, 248046]}  # </tool_call>, <|im_end|>
+resp = await client.chat.completions.create(
+    model=...,
+    messages=messages,
+    extra_body=extra_body,
+    ...
+)
+```
+
+具体示例可参考 `examples/deepeyes_v2_agentic/app/agent.py` 与 `examples/deepeyes_v2_agentic/app/deepeyes_v2_config.yaml` 的注释。
+
 ## 训练推理单独调试
 
 Relax 支持将训练和推理组件分开独立运行，从而实现：
