@@ -17,7 +17,6 @@ from ray import serve
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_rollout_manager
-from relax.utils import telemetry
 from relax.utils.http_utils import _wrap_ipv6
 
 
@@ -376,11 +375,7 @@ class Rollout(Base):
         return self.rollout_manager
 
     async def _run_eval_with_mark(self, rollout_id: int) -> None:
-        telemetry.mark_eval_begin(rollout_id, role="rollout")
-        try:
-            await self.rollout_manager.eval.remote(rollout_id=rollout_id)
-        finally:
-            telemetry.mark_eval_end(rollout_id, role="rollout")
+        await self.rollout_manager.eval.remote(rollout_id=rollout_id)
 
     async def _async_run(self) -> None:
         from relax.engine.sft.runtime import is_sft_mode

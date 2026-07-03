@@ -14,7 +14,6 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import is_sft_mode, sft_partition_id, sft_task_name
-from relax.utils import telemetry
 from relax.utils.async_utils import run
 
 
@@ -151,7 +150,6 @@ class Actor(Base):
         thread-safe access to `self.step` and respects a stop event.
         """
 
-        telemetry.mark_step_begin(self.step, role="actor")
         try:
             while True:
                 if self._stop_event.is_set():
@@ -189,9 +187,6 @@ class Actor(Base):
                 # increment step with lock
                 with self._lock:
                     self.step += 1
-
-                # next step
-                telemetry.mark_step_begin(self.step, role="actor")
 
         except Exception as e:
             error_msg = f"Actor training failed at step {self.step}: {type(e).__name__}: {str(e)}"
@@ -280,8 +275,6 @@ class Actor(Base):
         metrics = {}
 
         try:
-            telemetry.mark_step_begin(self.step, role="actor")
-
             # Check if rollout data is available for this step
             partition_id = sft_partition_id(self.config, step)
             partition_list = run(self.data_system_client.async_get_partition_list())

@@ -41,7 +41,7 @@ from relax.engine.sft.runtime import (
     should_run_sft_predict,
 )
 from relax.utils import device as device_utils
-from relax.utils import telemetry, tracking_utils
+from relax.utils import tracking_utils
 from relax.utils.async_utils import run
 from relax.utils.data.stream_dataloader import (
     MicroBatchListIterator,
@@ -490,9 +490,6 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_sft:
             should_run_eval = should_run_sft_eval(self.args, rollout_id)
             should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
-            should_mark_eval = should_run_eval or should_run_predict
-            if should_mark_eval:
-                telemetry.mark_eval_begin(rollout_id, role="actor")
             try:
                 if should_run_eval:
                     if dist.get_rank() == 0:
@@ -509,9 +506,6 @@ class MegatronTrainRayActor(TrainRayActor):
             except Exception as e:
                 logger.warning(f"SFT eval/predict at rollout_id {rollout_id} failed: {e}")
                 raise
-            finally:
-                if should_mark_eval:
-                    telemetry.mark_eval_end(rollout_id, role="actor")
             return
 
         # RL path: trigger rollout-based evaluation if configured.
@@ -1369,7 +1363,6 @@ class MegatronTrainRayActor(TrainRayActor):
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
             return
-        telemetry.mark_save_begin(rollout_id, role=self.role)
 
         # torch dist may trigger nccl communication during saving; resume the
         # paused model (process groups + tms) so save can issue collectives and
@@ -1399,8 +1392,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train and self._per_step_rollout:
             self.sleep()
-
-        telemetry.mark_save_end(rollout_id, role=self.role)
 
     @timer
     def update_weights(self) -> None:
