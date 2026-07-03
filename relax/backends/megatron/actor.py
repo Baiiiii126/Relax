@@ -579,12 +579,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
                 num_rollout_minis = 1
             else:
-                plan = build_rollout_minibatch_plan(
-                    self.args,
-                    mpu.get_data_parallel_world_size(with_context_parallel=False),
-                )
-                batch_size = plan.mini_local_sample_request
-                num_rollout_minis = plan.num_rollout_minis
+                dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+                if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
+                    dynamic_size = ray.get(self.rollout_manager.get_dynamic_global_batch_size.remote())
+                    batch_size = dynamic_size // dp_size
+                    num_rollout_minis = 1
+                else:
+                    plan = build_rollout_minibatch_plan(self.args, dp_size)
+                    batch_size = plan.mini_local_sample_request
+                    num_rollout_minis = plan.num_rollout_minis
             batch_index = 0
             task_name = sft_task_name(self.args, component="backend")
             empty_poll_sleep_s = float(os.environ.get("RELAX_EMPTY_POLL_SLEEP_MS", "50")) / 1000.0

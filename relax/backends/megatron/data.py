@@ -275,7 +275,12 @@ def get_batch(
     if isinstance(data_iterator, DataIterator):
         batch = data_iterator.get_next(keys)
 
-        if "dynamic_global_batch_size" in data_iterator.rollout_data:
+        if getattr(get_args(), "partial_rollout", False) and getattr(
+            get_args(), "use_dynamic_global_batch_size", False
+        ):
+            dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+            batch["dynamic_global_batch_size"] = len(data_iterator.rollout_data["total_lengths"]) * dp_size
+        elif "dynamic_global_batch_size" in data_iterator.rollout_data:
             batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
     else:
         batch, _ = next(data_iterator)
@@ -650,7 +655,10 @@ def get_data_iterator(
     cp_size = mpu.get_context_parallel_world_size()
 
     num_local_samples = len(rollout_data["total_lengths"])
-    global_batch_size = rollout_data.get("dynamic_global_batch_size", args.global_batch_size)
+    if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
+        global_batch_size = num_local_samples * dp_size
+    else:
+        global_batch_size = rollout_data.get("dynamic_global_batch_size", args.global_batch_size)
     num_local_gbs = global_batch_size // dp_size
     step_local_sample_counts = rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)
 

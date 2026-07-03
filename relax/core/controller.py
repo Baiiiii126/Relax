@@ -115,8 +115,13 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
+        batch_size_for_capacity = (
+            self.config.over_sampling_batch_size
+            if self.config.partial_rollout and self.config.use_dynamic_global_batch_size
+            else self.config.rollout_batch_size
+        )
         total_storage_size = (
-            self.config.rollout_batch_size * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
+            batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
         )
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path streams data per DP via token

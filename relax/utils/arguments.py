@@ -2662,6 +2662,10 @@ def slime_validate_args(args):
                 "On-policy distillation with megatron teacher is not supported in fully-async mode (--fully-async)."
                 " Please set --opd-type to sglang or remove --use-opd."
             )
+            assert not args.use_dynamic_global_batch_size, (
+                "--use-dynamic-global-batch-size is only supported in colocate mode. "
+                "fully-async training does not support dynamic global batch size yet."
+            )
 
         # Auto-enable true_on_policy_mode when the per-step rollout output exactly fills
         # one global batch in fully-async mode. In this regime the train forward's

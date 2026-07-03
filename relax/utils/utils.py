@@ -341,7 +341,12 @@ def post_process_env(args, env):
             args.rollout_batch_size * args.n_samples_per_prompt
         )  ## * args.max_num_agents
     else:
-        env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(args.rollout_batch_size * args.n_samples_per_prompt)
+        batch_size_for_capacity = (
+            args.over_sampling_batch_size
+            if args.partial_rollout and args.use_dynamic_global_batch_size
+            else args.rollout_batch_size
+        )
+        env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(batch_size_for_capacity * args.n_samples_per_prompt)
     env["env_vars"]["TQ_ZERO_COPY_SERIALIZATION"] = "true"
     env["env_vars"]["SLIME_HOST_IP"] = _resolve_to_ip(os.getenv("MASTER_ADDR", "127.0.0.1"))
 
