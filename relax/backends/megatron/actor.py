@@ -2046,7 +2046,9 @@ class MegatronTrainRayActor(TrainRayActor):
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             self.args.qkv_format,
-            "multimodal_train_inputs" in rollout_data or getattr(self.args, "uses_unsplit_forward", False),
+            getattr(self.args, "is_vl_model", False)
+            or "multimodal_train_inputs" in rollout_data
+            or getattr(self.args, "uses_unsplit_forward", False),
         )
         if padded_total_lengths is None:
             padded_total_lengths = [None] * len(total_lengths)

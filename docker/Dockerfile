@@ -44,7 +44,7 @@ RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no
 RUN MAX_JOBS=64 \
     cd /opt && git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention/ && \
-    git checkout fbf24f67cf7f6442c5cfb2c1057f4bfc57e72d89 && \
+    git checkout 0f82fead0b2d59f6390c62a1d74e927159bc5a7b && \
     git submodule update --init && \
     cd hopper/ && \
     MAX_JOBS=96 python setup.py install && \
