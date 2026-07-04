@@ -1210,6 +1210,11 @@ def _aggregate_rollout_timing_from_agentic_trace(
 ) -> dict[str, float]:
     generate_values: list[float] = []
     post_generate_values: list[float] = []
+    phase_values: dict[str, list[float]] = {
+        "process_vision_info": [],
+        "image_processor": [],
+        "mm_encode": [],
+    }
     for sample in samples:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         agentic_trace = metadata.get(TRACE_KEY)
@@ -1223,6 +1228,7 @@ def _aggregate_rollout_timing_from_agentic_trace(
                 continue
             generation_elapsed_s = turn.get("generation_elapsed_s")
             wall_elapsed_s = turn.get("wall_elapsed_s")
+            events = turn.get("events")
             if isinstance(generation_elapsed_s, (int, float)):
                 generate_values.append(float(generation_elapsed_s))
             if (
@@ -1231,8 +1237,22 @@ def _aggregate_rollout_timing_from_agentic_trace(
                 and wall_elapsed_s >= generation_elapsed_s
             ):
                 post_generate_values.append(float(wall_elapsed_s) - float(generation_elapsed_s))
+            if not isinstance(events, dict):
+                continue
+            for event_key, phase in (
+                ("process_vision_info_elapsed_s", "process_vision_info"),
+                ("processor_elapsed_s", "image_processor"),
+                ("media_encode_elapsed_s", "mm_encode"),
+            ):
+                value = events.get(event_key)
+                if isinstance(value, (int, float)):
+                    phase_values[phase].append(float(value))
 
     metrics: dict[str, float] = {}
+    for phase, values in phase_values.items():
+        if values:
+            metrics[f"perf_detail/rollout/{phase}_time/mean"] = sum(values) / len(values)
+            metrics[f"perf_detail/rollout/{phase}_time/max"] = max(values)
     if generate_values:
         metrics["perf_detail/rollout/generate_time/mean"] = sum(generate_values) / len(generate_values)
         metrics["perf_detail/rollout/generate_time/max"] = max(generate_values)
