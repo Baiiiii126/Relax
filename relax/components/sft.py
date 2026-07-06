@@ -143,6 +143,7 @@ class SFT(Base):
                 pad_token_ids=pad_token_ids,
                 oversize_strategy=oversize_strategy,
                 oversize_custom_fn=oversize_custom_fn,
+                apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
             )
         else:
             self._dataset = dataset_cls.from_args(
@@ -201,6 +202,7 @@ class SFT(Base):
                 pad_token_ids=pad_token_ids,
                 oversize_strategy=oversize_strategy,
                 oversize_custom_fn=oversize_custom_fn,
+                apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
             )
 
         # Resume: align IndexManager with `start_rollout_id` so a restart sees

@@ -116,6 +116,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
+            apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
         )
         n_avail = len(dataset)
         n_eval = max(1, int(n_avail * eval_size_arg)) if eval_size_arg < 1 else int(eval_size_arg)
@@ -142,6 +143,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
+            apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
         )
         start, n_eval = 0, len(dataset)
     else:

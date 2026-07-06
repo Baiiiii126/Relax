@@ -21,8 +21,14 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
-_GENERATION_MARKER_RE = re.compile(r"{%\s*generation\s*%}")
+# `-?` accepts the dashed-whitespace-control variants `{%- generation -%}` and
+# `{%-generation-%}` that Jinja allows. The dashes only suppress surrounding
+# whitespace and are semantically identical to the plain `{% generation %}`
+# form for the purpose of marking assistant-token spans, so they should be
+# recognised as the same marker.
+_GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
 _FALLBACK_WARNED: set[int] = set()  # tokenizer id → warned once
+_TEMPLATE_LOGGED: set[int] = set()  # tokenizer id → effective-template logged once
 
 
 def HAS_GENERATION_MARKER(template_str: str | None) -> bool:  # noqa: N802
@@ -43,7 +49,12 @@ def _to_chat_messages(sample: CanonicalSample) -> list[dict[str, Any]]:
     return out
 
 
-def _render_with_assistant_mask(sample: CanonicalSample, *, tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+def _render_with_assistant_mask(
+    sample: CanonicalSample,
+    *,
+    tokenizer,
+    apply_chat_template_kwargs: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 1: ask tokenizer for the assistant-only mask directly."""
     result = tokenizer.apply_chat_template(
         _to_chat_messages(sample),
@@ -52,6 +63,7 @@ def _render_with_assistant_mask(sample: CanonicalSample, *, tokenizer) -> tuple[
         return_tensors="pt",
         return_dict=True,
         return_assistant_tokens_mask=True,
+        **(apply_chat_template_kwargs or {}),
     )
     input_ids = result["input_ids"]
     masks = result["assistant_masks"]
@@ -73,7 +85,12 @@ _TOOL_RESPONSE_OPEN = "<tool_response>\n"
 _TOOL_RESPONSE_CLOSE = "\n</tool_response>"
 
 
-def _render_per_message_fallback(sample: CanonicalSample, *, tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+def _render_per_message_fallback(
+    sample: CanonicalSample,
+    *,
+    tokenizer,
+    apply_chat_template_kwargs: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 2: single full render + char-level mask projected back through
     `offset_mapping`.
 
@@ -99,7 +116,8 @@ def _render_per_message_fallback(sample: CanonicalSample, *, tokenizer) -> tuple
     ``{% generation %}`` markers so Path 1 handles them natively.
     """
     msgs = _to_chat_messages(sample)
-    rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False)
+    extra_kwargs = apply_chat_template_kwargs or {}
+    rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
 
     tokenized = tokenizer(rendered_text, add_special_tokens=False, return_offsets_mapping=True)
     token_ids = tokenized["input_ids"]
@@ -110,7 +128,7 @@ def _render_per_message_fallback(sample: CanonicalSample, *, tokenizer) -> tuple
             "`return_offsets_mapping` support; got a slow tokenizer."
         )
 
-    expected = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=True)
+    expected = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=True, **extra_kwargs)
     if isinstance(expected, Mapping):
         expected = expected["input_ids"]
     if isinstance(expected, torch.Tensor):
@@ -179,16 +197,70 @@ def _render_per_message_fallback(sample: CanonicalSample, *, tokenizer) -> tuple
     return torch.tensor(token_ids, dtype=torch.long), torch.tensor(loss_mask, dtype=torch.long)
 
 
-def render_with_loss_mask(sample: CanonicalSample, *, tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+def _merge_per_sample_kwargs(sample: CanonicalSample, apply_chat_template_kwargs: dict | None) -> dict:
+    """Merge global apply_chat_template_kwargs with any per-sample override in
+    ``sample.metadata['apply_chat_template_kwargs']``. Per-sample wins.
+
+    Mirrors the pattern in ``relax/utils/data/data_utils.py`` so a sample can
+    override (e.g.) ``chat_template`` or ``enable_thinking`` on the fly. Most
+    callers leave this empty and rely on the launcher-supplied ``--apply-chat-
+    template-kwargs`` global.
+    """
+    per_sample = None
+    if sample.metadata is not None and isinstance(sample.metadata, dict):
+        per_sample = sample.metadata.get("apply_chat_template_kwargs")
+    return {**(apply_chat_template_kwargs or {}), **(per_sample or {})}
+
+
+def render_with_loss_mask(
+    sample: CanonicalSample,
+    *,
+    tokenizer,
+    apply_chat_template_kwargs: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Render a single sample.
 
     Returns 1D `(input_ids, loss_mask)` int64 tensors.
-    """
-    template = getattr(tokenizer, "chat_template", None)
-    if HAS_GENERATION_MARKER(template):
-        return _render_with_assistant_mask(sample, tokenizer=tokenizer)
 
+    ``apply_chat_template_kwargs`` is forwarded to
+    ``tokenizer.apply_chat_template`` so callers can pass e.g.
+    ``{"chat_template": "<custom jinja>"}`` to override the model's
+    native chat template — useful when the native template is designed
+    for inference and silently drops content needed for training
+    (e.g. DeepSeek-R1 distill templates strip ``<think>...</think>``).
+    """
+    merged = _merge_per_sample_kwargs(sample, apply_chat_template_kwargs)
+    # Effective template is the override if provided, else the tokenizer's
+    # bound template. We must consult the EFFECTIVE template (not the
+    # tokenizer's) to pick path 1 vs path 2 — passing a chat_template kwarg
+    # that has {% generation %} markers should still take the fast path
+    # even if the tokenizer's own bound template lacks them.
+    effective_template = merged.get("chat_template") or getattr(tokenizer, "chat_template", None)
+
+    # Log the effective template once per tokenizer instance so users can
+    # confirm an apply_chat_template_kwargs override is actually taking
+    # effect (sha256 + short prefix; the full template can be 1000s of chars).
     tok_id = id(tokenizer)
+    if tok_id not in _TEMPLATE_LOGGED:
+        import hashlib
+
+        bound = getattr(tokenizer, "chat_template", None) or ""
+        eff = effective_template or ""
+        source = "override (apply_chat_template_kwargs)" if merged.get("chat_template") else "tokenizer.chat_template"
+        eff_preview = eff[:120].replace("\n", "\\n")
+        logger.info(
+            f"SFT chat_template source={source} "
+            f"sha256={hashlib.sha256(eff.encode()).hexdigest()[:16]} "
+            f"len={len(eff)} "
+            f"matches_bound={eff == bound} "
+            f"has_generation_marker={HAS_GENERATION_MARKER(eff)} "
+            f"preview={eff_preview!r}"
+        )
+        _TEMPLATE_LOGGED.add(tok_id)
+
+    if HAS_GENERATION_MARKER(effective_template):
+        return _render_with_assistant_mask(sample, tokenizer=tokenizer, apply_chat_template_kwargs=merged)
+
     if tok_id not in _FALLBACK_WARNED:
         logger.warning(
             "Tokenizer chat_template does not contain {%% generation %%} tag — "
@@ -197,10 +269,15 @@ def render_with_loss_mask(sample: CanonicalSample, *, tokenizer) -> tuple[torch.
             "(This warning is shown once per tokenizer instance.)"
         )
         _FALLBACK_WARNED.add(tok_id)
-    return _render_per_message_fallback(sample, tokenizer=tokenizer)
+    return _render_per_message_fallback(sample, tokenizer=tokenizer, apply_chat_template_kwargs=merged)
 
 
-def render_to_text(sample: CanonicalSample, *, tokenizer) -> str:
+def render_to_text(
+    sample: CanonicalSample,
+    *,
+    tokenizer,
+    apply_chat_template_kwargs: dict | None = None,
+) -> str:
     """Render a sample to the chat-template text WITHOUT tokenizing.
 
     Used by the multimodal path: the text (containing un-expanded
@@ -208,8 +285,10 @@ def render_to_text(sample: CanonicalSample, *, tokenizer) -> str:
     expands those placeholders to per-image-grid token runs and produces the
     ``input_ids`` the model actually consumes.
     """
+    merged = _merge_per_sample_kwargs(sample, apply_chat_template_kwargs)
     return tokenizer.apply_chat_template(
         _to_chat_messages(sample),
         tools=sample.tools,
         tokenize=False,
+        **merged,
     )
