@@ -542,6 +542,8 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 | `--slime-router-timeout` | float | None | SlimeRouter HTTP request timeout in seconds |
 | `--slime-router-max-connections` | int | None | SlimeRouter HTTP client maximum connections |
 | `--slime-router-health-check-failure-threshold` | int | 3 | Mark worker as unhealthy after this many consecutive failures |
+| `--slime-router-sticky` | flag | False | Enable sticky-session routing: pin a routing key (read from the `X-SMG-Routing-Key` header) to a worker so repeated requests for the same key reuse that worker's prefix/KV cache. A live pin is never redistributed (only remapped when its worker leaves the healthy set). Requires `--use-slime-router` |
+| `--slime-router-sticky-idle-secs` | float | 600.0 | Evict a sticky key→worker assignment after it has been idle (not routed to) for this many seconds, bounding the map against unbounded routing-key cardinality. Requires `--slime-router-sticky` |
 
 ---
 
