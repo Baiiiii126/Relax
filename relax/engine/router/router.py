@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import time
 
 import httpx
 import uvicorn
@@ -40,6 +41,16 @@ class SlimeRouter:
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
         self.max_weight_version = None
+
+        # Sticky-session routing: pin a routing key (read from ``sticky_header``) to a
+        # worker URL so repeated requests for the same key reuse that worker's prefix/KV
+        # cache. Each entry is ``[worker_url, last_seen_monotonic]``; idle entries are
+        # evicted on the health-check cadence (see ``_evict_idle_sticky``).
+        self.sticky_enabled = getattr(args, "slime_router_sticky", False)
+        self.sticky_header = "X-SMG-Routing-Key"
+        self.sticky_idle_secs = getattr(args, "slime_router_sticky_idle_secs", 600.0)
+        self.sticky_map: dict[str, list] = {}
+        self.sticky_stats = {"hit": 0, "assigned": 0, "remap": 0, "evicted": 0, "no_routing_key": 0}
 
         max_connections = getattr(args, "slime_router_max_connections", None)
         if max_connections is None:
@@ -94,6 +105,8 @@ class SlimeRouter:
             try:
                 await asyncio.sleep(interval)
 
+                self._evict_idle_sticky()
+
                 urls = [u for u in self.worker_request_counts if u not in self.dead_workers]
                 if not urls:
                     continue
@@ -120,6 +133,13 @@ class SlimeRouter:
                     f"[slime-router] Health check complete. {len(self.worker_request_counts) - len(self.dead_workers)} workers healthy."
                 )
 
+                if self.sticky_enabled:
+                    logger.info(
+                        f"[slime-router] Sticky: keys={len(self.sticky_map)} hit={self.sticky_stats['hit']} "
+                        f"assigned={self.sticky_stats['assigned']} remap={self.sticky_stats['remap']} "
+                        f"evicted={self.sticky_stats['evicted']} no_routing_key={self.sticky_stats['no_routing_key']}"
+                    )
+
             except asyncio.CancelledError:
                 logger.warning("[slime-router] Background health check loop is being cancelled.")
                 raise
@@ -130,7 +150,8 @@ class SlimeRouter:
     async def proxy(self, request: Request, path: str):
         """Proxy all other requests to the SGLang router."""
         # Forward all other paths to SGLang router
-        worker_url = self._use_url()
+        routing_key = request.headers.get(self.sticky_header) if self.sticky_enabled else None
+        worker_url = self._use_url(routing_key)
         url = f"{worker_url}/{path}"
 
         # Get request body and headers
@@ -230,22 +251,65 @@ class SlimeRouter:
 
         return result
 
-    def _use_url(self):
-        """Select worker URL with minimal active requests."""
-
+    def _select_least_loaded(self):
+        """Return the worker URL with the fewest active requests (no
+        bookkeeping)."""
         if not self.dead_workers:
             # Healthy path: select from all workers
-            url = min(self.worker_request_counts, key=self.worker_request_counts.get)
-        else:
-            # Degraded path: select from workers not in dead_workers
-            valid_workers = (w for w in self.worker_request_counts if w not in self.dead_workers)
-            try:
-                url = min(valid_workers, key=self.worker_request_counts.get)
-            except ValueError:
-                raise RuntimeError("No healthy workers available in the pool") from None
+            return min(self.worker_request_counts, key=self.worker_request_counts.get)
+        # Degraded path: select from workers not in dead_workers
+        valid_workers = (w for w in self.worker_request_counts if w not in self.dead_workers)
+        try:
+            return min(valid_workers, key=self.worker_request_counts.get)
+        except ValueError:
+            raise RuntimeError("No healthy workers available in the pool") from None
 
+    def _pick_sticky_url(self, routing_key):
+        """Resolve a routing key to a worker, pinning new keys and remapping
+        dead ones.
+
+        True-sticky semantics: a live pin is never redistributed (even when
+        workers are added); it is only remapped when its worker leaves the
+        healthy set.
+        """
+        now = time.monotonic()
+        entry = self.sticky_map.get(routing_key)
+        if entry is not None and entry[0] in self.worker_request_counts and entry[0] not in self.dead_workers:
+            entry[1] = now  # refresh last_seen so the assignment survives idle eviction
+            self.sticky_stats["hit"] += 1
+            return entry[0]
+
+        # New key, or the pinned worker left the healthy set -> (re)assign via fallback.
+        url = self._select_least_loaded()
+        self.sticky_stats["remap" if entry is not None else "assigned"] += 1
+        self.sticky_map[routing_key] = [url, now]
+        return url
+
+    def _use_url(self, routing_key=None):
+        """Select a worker URL and account for the new in-flight request."""
+        if self.sticky_enabled and routing_key:
+            url = self._pick_sticky_url(routing_key)
+        else:
+            if self.sticky_enabled:
+                self.sticky_stats["no_routing_key"] += 1
+            url = self._select_least_loaded()
         self.worker_request_counts[url] += 1
         return url
+
+    def _evict_idle_sticky(self):
+        """Drop sticky assignments idle longer than ``sticky_idle_secs``.
+
+        Bounds the map against unbounded routing-key cardinality. An evicted
+        key is simply re-pinned (via fallback) the next time it is seen.
+        """
+        if not self.sticky_enabled or not self.sticky_map:
+            return
+        now = time.monotonic()
+        stale = [key for key, (_, last_seen) in self.sticky_map.items() if now - last_seen > self.sticky_idle_secs]
+        for key in stale:
+            del self.sticky_map[key]
+        if stale:
+            self.sticky_stats["evicted"] += len(stale)
 
     def _finish_url(self, url):
         """Mark the request to the given URL as finished."""

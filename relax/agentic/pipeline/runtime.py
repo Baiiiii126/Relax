@@ -3701,6 +3701,7 @@ class SGLangBackendAdapter:
         self._apply_chat_template_kwargs = args.apply_chat_template_kwargs
         self._use_rollout_routing_replay = args.use_rollout_routing_replay
         self._router_policy = args.sglang_router_policy
+        self._slime_router_sticky = getattr(args, "slime_router_sticky", False)
         resources = compiler_resources or get_agentic_runtime_resources(args).compiler
         self.tokenizer = resources.tokenizer
         self.compiler = SGLangMessageCompiler(
@@ -3744,7 +3745,9 @@ class SGLangBackendAdapter:
         if video_data:
             payload["video_data"] = list(video_data)
         headers = None
-        if self._router_policy == "consistent_hashing" and session_id:
+        if session_id and (self._router_policy == "consistent_hashing" or self._slime_router_sticky):
+            # Pin every turn of a session to the same engine so the growing
+            # conversation prefix reuses that engine's KV cache across turns.
             headers = {"X-SMG-Routing-Key": session_id}
         url = f"http://{router_ip}:{router_port}/generate"
         started = time.time()

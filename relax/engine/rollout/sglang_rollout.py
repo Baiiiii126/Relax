@@ -316,10 +316,15 @@ async def generate(
         if not sample.rollout_tokens:
             sample.rollout_tokens = tokenizer_prompt_ids
 
-    # Use session_id for consistent hashing routing if router uses consistent_hashing policy
+    # Provide a routing key so cache-affinity routers pin related requests to the same
+    # engine and reuse its prefix/KV cache.
     headers = None
     if args.sglang_router_policy == "consistent_hashing" and sample.session_id:
         headers = {"X-SMG-Routing-Key": sample.session_id}
+    elif getattr(args, "slime_router_sticky", False) and sample.group_index is not None:
+        # Pin all samples of one prompt group to the same engine so the shared prompt
+        # prefix is prefilled once and reused across the group.
+        headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
     _t_generate_start = monotonic()
     output = await post(url, payload, headers=headers)

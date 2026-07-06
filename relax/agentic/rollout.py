@@ -1316,12 +1316,25 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]) -> dict[str, fl
     }
 
 
+def _compute_prefix_cache_metrics(args, samples: list[Sample]) -> dict[str, float]:
+    num_samples = len(samples)
+    if num_samples == 0:
+        return {}
+    total_cached_tokens = sum(sample.prefix_cache_info.cached_tokens for sample in samples)
+    total_prompt_tokens = sum(sample.prefix_cache_info.total_prompt_tokens for sample in samples)
+    return {
+        "prefix_cache_hit_rate": (total_cached_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0),
+        "avg_cached_tokens_per_sample": total_cached_tokens / num_samples,
+    }
+
+
 def _compute_rollout_metrics_from_samples(args, samples: list[Sample]) -> dict[str, float]:
     response_lengths = [sample.effective_response_length for sample in samples]
     log_dict: dict[str, float] = {}
     log_dict |= _dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([has_repetition(sample.response) for sample in samples]).item()
     log_dict["truncated_ratio"] = np.mean([sample.status == Sample.Status.TRUNCATED for sample in samples]).item()
     turns = [s.metadata.get("agentic_trace", {}).get("turn_count", 1) for s in samples]

@@ -1710,6 +1710,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=3,
                 help="Number of consecutive failures before marking a worker as unhealthy.",
             )
+            parser.add_argument(
+                "--slime-router-sticky",
+                action="store_true",
+                default=False,
+                help="Enable sticky-session routing in SlimeRouter: pin a routing key (read from the "
+                "X-SMG-Routing-Key header) to a worker so repeated requests for the same key reuse that "
+                "worker's prefix/KV cache. Keyless requests and the initial pin fall back to least-load "
+                "selection; a live pin is never redistributed (only remapped when its worker leaves the "
+                "healthy set). Has no effect unless --use-slime-router is set.",
+            )
+            parser.add_argument(
+                "--slime-router-sticky-idle-secs",
+                type=float,
+                default=600.0,
+                help="Evict a sticky routing-key -> worker assignment after it has been idle (not routed to) "
+                "for this many seconds, bounding the map against unbounded routing-key cardinality. Scanned on "
+                "the SlimeRouter health-check cadence. Requires --slime-router-sticky.",
+            )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
