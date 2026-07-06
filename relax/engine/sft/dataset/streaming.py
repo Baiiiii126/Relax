@@ -218,6 +218,7 @@ class SFTStreamingDataset:
         pad_token_ids: Iterable[int] | None = None,
         oversize_strategy: str = "keep",
         oversize_custom_fn: Callable[..., Optional[tuple[torch.Tensor, torch.Tensor]]] | None = None,
+        apply_chat_template_kwargs: dict | None = None,
     ) -> None:
         self.path = path
         self.tokenizer = tokenizer
@@ -233,6 +234,12 @@ class SFTStreamingDataset:
         self.source_name = source_name
         self.require_response = require_response
         self._pad_token_ids: frozenset[int] = frozenset(pad_token_ids or ())
+        # Forwarded into tokenizer.apply_chat_template() via render_with_loss_mask
+        # / render_to_text. Lets callers (and per-sample metadata) override the
+        # tokenizer's bound chat_template — needed for models whose native
+        # template is inference-only and drops training-critical content
+        # (e.g. DeepSeek-R1 distill templates strip <think>...</think>).
+        self.apply_chat_template_kwargs = apply_chat_template_kwargs
 
         valid_strategies = {"skip", "keep", "truncate_left", "truncate_right", "custom"}
         if oversize_strategy not in valid_strategies:
@@ -456,7 +463,9 @@ class SFTStreamingDataset:
         if self.tokenizer is None:
             raise RuntimeError("SFTStreamingDataset: tokenizer is required for _render_one")
         sample = self.get_canonical_sample(idx)
-        short_ids, short_mask = render_with_loss_mask(sample, tokenizer=self.tokenizer)
+        short_ids, short_mask = render_with_loss_mask(
+            sample, tokenizer=self.tokenizer, apply_chat_template_kwargs=self.apply_chat_template_kwargs
+        )
         n = int(short_ids.shape[0])
         if self.capacity is not None and n > self.capacity and self._oversize_strategy == "skip":
             logger.warning(
@@ -464,7 +473,15 @@ class SFTStreamingDataset:
                 f"exceeds per-GPU capacity {self.capacity}; skipping."
             )
             return None
-        rendered_text = render_to_text(sample, tokenizer=self.tokenizer) if has_multimodal_content(sample) else None
+        rendered_text = (
+            render_to_text(
+                sample,
+                tokenizer=self.tokenizer,
+                apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+            )
+            if has_multimodal_content(sample)
+            else None
+        )
         return _RenderedSample(
             idx=idx,
             sample=sample,
