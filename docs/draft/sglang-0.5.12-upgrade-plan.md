@@ -48,7 +48,7 @@ slime 在 **v0.3.0** 做了与本次完全对应的跳变(v0.5.9 → v0.5.12.pos
 | 5 | Megatron-Bridge 换源 `fzyzcjy/dev_rl`→`radixark/bridge` | ⚠️ Relax 用的是 NeMo 官方源,自行决定 |
 | 6 | 新增 FlashQLA(Qwen3.5/Next GDN backend,SM90+) | 可选 |
 | 7 | requirements 前加 `pip install --ignore-installed PyJWT` | ✅ 大概率需要(解依赖冲突) |
-| 8 | sgl-router 装 **slime 私有 wheel** + 断言 `'slime' in __version__` | ❌ **不要照搬**,Relax 用官方 `sglang-router` |
+| 8 | sgl-router 装 **slime 私有 wheel** + 断言 `'slime' in __version__` | ⚠️ **原判"不要照搬"有误**——该 wheel(`zhuzilin/sgl-router` v0.3.2-9daabcd)含 **r3(routing replay)透传 patch**,官方 `sglang-router` 无;用官方会导致 R3 死锁,见 §8.7 |
 | 9 | tilelang 用 cu128 wheel 源 | ✅ 跟随,保持 cu128 |
 | 10 | `latest` patch 指向重写过的 **v0.5.12.post1** 那套 | ✅ 见第 4 节 |
 
@@ -260,13 +260,15 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 2. **server_args 多节点 PortArgs 块**:多节点 PD-prefill colocate 任务验证(启动期失败,反馈快)。
 3. **kimi `post_load_weights`**:Kimi K2.5 colocate train→rollout,验证 MLA absorb `w_kc`/`w_vc` 正常。
 4. **transformers 5.3.0 → 5.6.0**:验证 model-integration 代码无 breaking。
+5. **R3 rollout routing replay**(`--use-rollout-routing-replay`):❌ **已验证失败** —— 官方 sgl-router 不透传 routed_experts,step 0 死锁,根因与修复见 §8.7。
 
 ### 7.5 依赖类改动状态
 
 - ✅ **`requirements.txt`:`transformers==5.3.0` → `transformers`(不固定)** — 已改,与 slime 一致。
 - ✅ **torch_memory_saver**:`TMS_CUDA_MAJOR` 自动探测;commit `afc13785`(已是 redai-infra HEAD,比 slime `a193d9dd` 新)。
 - `huggingface_hub==1.7.2`:保留(与 transformers 5.6.0 兼容);v0.5.12.post1 未固定 hf_hub。
-- `sglang-router>=0.2.3`:复核与新版兼容性(待定)。
+- ⚠️ **`sglang-router`**:官方 `sglang-router`(实测 0.3.2)**不支持 routing replay 透传** —— 请求经 router 转发后,响应 `meta_info` 丢失 `routed_experts`,导致 R3 死锁(见 §8.7)。
+  修复:改装 slime 私有 fork wheel `zhuzilin/sgl-router` v0.3.2-9daabcd(版本号 `0.3.2+slime`,含 `support r3` patch)。**此即 §2 item 8 "用官方 router" 判断需推翻的点。**
 - ✅ **`pip install --ignore-installed PyJWT`**:slime v0.3.0 在 `pip install -r requirements.txt` 前加的一行。
   作用是规避 pip 卸载报错——当某依赖要升级/重装 PyJWT,但环境里已有的 PyJWT 是以 distutils/系统方式装的(缺 `RECORD`),
   pip 无法卸载会报 `Cannot uninstall 'PyJWT'`。`--ignore-installed` 让 pip 直接装新的、不尝试卸载旧的。
@@ -280,6 +282,7 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 - ✅ 改动文件 Python 语法检查通过
 - ⚠️ 已打镜像并首次实跑冒烟(Kimi-K2.6, 2026-07-02~03),暴露并修复了 5 个 bug,见 **第 8 节**;
   7.4 中 BF16 MoE / transformers 5.6.0 等仍待更全面验证。
+- ❌ 后续单独开 R3 冒烟(2026-07-03 晚)发现第 6 个问题:`--use-rollout-routing-replay` step 0 死锁,根因=官方 sgl-router 无 routed_experts 透传,**修复待落地**,见 **§8.7**。
 
 ---
 
@@ -344,6 +347,54 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 | 8.3 | CP `split_with_sizes` | `is_vl_model`×5(commit `256b030`) | 否(dev 已存在,CP=2 暴露) |
 | 8.4 | FA3 `window_size_left` | Dockerfile FA3 → `0f82fead` | 是(TE 2.14.1 栈相关) |
 | 8.5 | FA3 重复注册崩溃 | 容器内清理 + tools 脚本兜底(镜像干净,不改 Dockerfile) | 否(容器污染) |
+| 8.7 | R3 routing replay 死锁 | 换 slime 私有 router wheel(见 §8.7,待落地) | **是**(官方 sgl-router 无 r3 透传) |
 
-> 结论:5 个中仅 **8.4** 真正源于本次 sglang/镜像升级栈(TE 2.14.1 需要更新的 FA3);8.5 是升级过程中**手动装 FA3** 的副作用而非升级本身;
+> 结论:8.1-8.5 中仅 **8.4** 真正源于本次 sglang/镜像升级栈(TE 2.14.1 需要更新的 FA3);8.5 是升级过程中**手动装 FA3** 的副作用而非升级本身;
 > 8.1/8.2 是 colocate 与减层冒烟的通用配置问题;8.3 是 dev 早已潜伏、被 CP=2 暴露的通用 bug。
+> **8.7** 是后续单独开 R3 冒烟(2026-07-03 晚)才发现的,**直接由本次升级的 router 依赖决策引入**(用官方 sgl-router 而非 slime 私有 fork)。
+
+---
+
+## 8.7 R3(rollout routing replay)在官方 sgl-router 下 step 0 死锁(2026-07-03)
+
+在 Kimi-K2.6 冒烟脚本(`run-kimi-k2.6-2layers-8xgpu-int4.sh`)开启 `--use-rollout-routing-replay` 后,任务在 **step 0 死锁**(非崩溃)。
+
+### 现象
+- Actor 每分钟 ~2000 次空轮询 `GET_META`/`GET_CONSUMPTION`(TransferQueueController 统计),始终拿不到可消费 batch。
+- Rollout 侧无限 `waiting for data system to catch up`。
+- Rollout 实际已生成完 256/256、`PUT_DATA` 一次;但 `NOTIFY_DATA_UPDATE` 仅 1 次,消费方永远等不齐字段。
+
+### 根因链(逐层实证)
+1. 开 R3 后 Actor 的 `build_data_fields`(`relax/engine/sft/runtime.py:92`)把 `rollout_routed_experts` 列为**必需字段**。
+2. 但生产侧写进 TransferQueue 的 TensorDict **没有这一列**(日志中 `Transferring batch rollout_batch: TensorDict(...)` 只有 tokens/loss_masks/rollout_log_probs/... 9 列)。
+3. `convert_samples_to_train_data` 仅当 `samples[0].rollout_routed_experts is not None` 才写该列(`relax/utils/utils.py:147`)。
+4. sample 只在 sglang 响应 `meta_info` 含 `routed_experts` 时才被赋值(`relax/engine/rollout/sglang_rollout.py:394`)。
+5. → **sglang 响应里没有 `routed_experts`。**
+
+### 真凶 = 官方 sgl-router(实测 0.3.2)转发时丢字段
+用 `tools/repro_routed_experts/` 隔离复现(2 层 Kimi INT4):
+
+| 探测 | routed_experts |
+|---|---|
+| 引擎直连 `/generate`,text | **PRESENT**(base64 len≈1452) |
+| 引擎直连 `/generate`,input_ids | **PRESENT** |
+| **经 sgl-router**,text | **ABSENT** |
+| **经 sgl-router**,input_ids(==relax 实际路径) | **ABSENT** |
+
+排除项:dp-attention(tp2/dp2/ep2 直连正常)、EP、请求 flag 传递(离线构造 `GenerateReqInput(..., return_routed_experts=True)` 字段保留)、sglang 引擎侧 capturer(`HostCache[routed_experts]` 正确分配、`get_topk` 恒返回张量)。
+relax rollout 恰恰 POST 到 sgl-router(`sglang_rollout.py:251`,router 由 `distributed/ray/rollout.py:_start_router` 启动),**router 在转发请求/回传响应时丢掉了 routed_experts** → `sample.rollout_routed_experts=None` → 列缺失 → Actor 死等。
+
+### 为什么 slime 能用而 relax 不能
+- slime Dockerfile 装的是**私有 fork wheel**:`zhuzilin/sgl-router` `v0.3.2-9daabcd`(`sglang_router-0.3.2-...whl`),并断言 `'slime' in sglang_router.__version__`。
+- 该 fork 提交史明确含 R3 patch:`4596bd4 support r3` / `9b66be3 Support r3 with pd` / PR#7 / PR#12(`9daabcd`)/ `f70eff0 set version to 0.3.2+slime`。
+- 即 **routed_experts 的 router 透传是 slime fork 新增的,官方 sgl-router 0.3.2 没有。** relax 当初(§2 item 8)决定"用官方、不照搬 slime 私有 wheel",正是本 bug 的直接原因。
+
+### 社区佐证
+- sglang [#12075](https://github.com/sgl-project/sglang/issues/12075):RL routing replay 从 MoE 取 router 输出的功能诉求(closed,指向引擎侧 [PR #9499](https://github.com/sgl-project/sglang/pull/9499),已进 0.5.12)。
+- [#8791](https://github.com/sgl-project/sglang/issues/8791):router 只 merge **显式处理过**的 meta_info 字段(如 logprobs),其余丢弃。
+- [#9621](https://github.com/sgl-project/sglang/issues/9621):router **丢弃 extra 参数**,直连 worker 才生效。
+
+### 修复(待落地)
+把 `docker/Dockerfile` 的 sgl-router 换成 slime 私有 fork wheel `zhuzilin/sgl-router` v0.3.2-9daabcd(`0.3.2+slime`),或把其 `support r3` patch 移植到自建 router。**注意与 relax 现有依赖/镜像的兼容性需复核(§7.5)。** 尚未细究 router 是"请求进"还是"响应出"丢字段——换 fork 即可绕过,无需细分。
+
+> 复现脚本:`tools/repro_routed_experts/serve_and_probe.sh`(单机直连)、`serve_router_probe.sh`(引擎+router 对照)。

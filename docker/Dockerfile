@@ -102,6 +102,16 @@ RUN pip install --ignore-installed PyJWT && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
 
+# sgl-router: override the official wheel (pulled by requirements.txt above) with
+# slime's r3-capable fork. The official sglang-router drops the routed_experts
+# field on the /generate round-trip, breaking R3 (rollout routing replay,
+# --use-rollout-routing-replay) with a step-0 deadlock; this fork carries the
+# `support r3` passthrough patch. Must run AFTER the requirements install so it
+# wins.
+RUN pip install --no-cache-dir --force-reinstall \
+        https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl && \
+    python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
+
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
