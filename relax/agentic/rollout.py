@@ -126,7 +126,7 @@ def _shutdown_resident_pipeline_after_deferred_eval(rollout_id: int) -> None:
 
 
 class RolloutProgress:
-    def __init__(self, *, total_sessions: int) -> None:
+    def __init__(self, *, total_sessions: int, rollout_id: int) -> None:
         if total_sessions <= 0:
             raise RuntimeError(f"RolloutProgress requires a positive total_sessions, got {total_sessions}.")
         self.total_sessions = total_sessions
@@ -135,7 +135,7 @@ class RolloutProgress:
         self._scored_samples = 0
         self._bar = tqdm(
             total=self.total_sessions,
-            desc="Rollout generation",
+            desc=f"Rollout {rollout_id} generation",
             unit="session",
             disable=False,
             mininterval=0.0,
@@ -599,7 +599,8 @@ class AgenticResidentPipeline:
             await runtime_domain.release_partial_resume_gate()
             transfer_start_snapshot = transfer_domain.accounting_snapshot()
         progress = RolloutProgress(
-            total_sessions=transfer_domain.target_group_count() * transfer_start_snapshot["group_size"]
+            total_sessions=transfer_domain.target_group_count() * transfer_start_snapshot["group_size"],
+            rollout_id=rollout_id,
         )
         step_handle = _AgenticStepHandle(
             rollout_id=rollout_id,

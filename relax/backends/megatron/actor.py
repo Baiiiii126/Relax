@@ -1553,11 +1553,15 @@ class MegatronTrainRayActor(TrainRayActor):
         # RL warms KV here for the next per-step generate. SFT's /predict
         # calls onload_kv itself. genRM (deferred from before the weight
         # all-gather) is onloaded here too, in parallel.
+        # When --defer-reward-to-post-process is set the userland
+        # custom_reward_post_process function owns GenRM lifecycle, so skip
+        # onloading GenRM here (it must stay offloaded for rollout to have
+        # all GPUs during generate in shared-bundles mode).
         if self.args.offload_rollout and dist.get_rank() == 0:
             post_sync_handles = []
             if self._per_step_rollout:
                 post_sync_handles.append(self.rollout_manager.onload_kv.remote())
-            if self.genrm_manager is not None:
+            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
                 post_sync_handles.append(self.genrm_manager.onload.remote())
             if post_sync_handles:
                 ray.get(post_sync_handles)

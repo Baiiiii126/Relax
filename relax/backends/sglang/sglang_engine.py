@@ -930,6 +930,23 @@ def _compute_genrm_server_args(
             kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
         unused_keys.discard(attr.name)
 
+    # Per-genrm overrides from --genrm-engine-config. Applied after base args
+    # and sglang_* defaults so user-supplied keys take highest priority. Keys
+    # not recognized by the installed SGLang ServerArgs are dropped with a
+    # warning rather than causing a TypeError at ServerArgs(**kwargs).
+    server_arg_fields = {f.name for f in dataclasses.fields(ServerArgs)}
+    for key, value in (args.genrm_engine_config or {}).items():
+        if key not in server_arg_fields:
+            logger.info(
+                f"Warning: --genrm-engine-config key {key!r} is not a ServerArgs field in the "
+                f"installed SGLang; dropping."
+            )
+            continue
+        if key in kwargs and kwargs[key] != value:
+            logger.info(f"genrm_engine_config: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
+        kwargs[key] = value
+        unused_keys.discard(key)
+
     # for compatibility with old args
     if len(unused_keys) > 0:
         logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")

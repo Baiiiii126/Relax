@@ -149,6 +149,10 @@ class RewardExecutor:
     _ASYNC_RM_DISPATCH = {
         "remote_rm": lambda args, sample: remote_rm(args, sample),
         "dapo-genrm": lambda args, sample: async_compute_score_genrm(args, sample),
+        # `dummy` returns 0 without any computation. Use it when the real
+        # reward is produced elsewhere (e.g., --custom-reward-post-process-path
+        # does batched GenRM scoring after all rollout finishes).
+        "dummy": lambda args, sample: _dummy_reward(args),
     }
 
     # CPU-bound / thread-unsafe rm_types dispatched to the Ray worker pool.
@@ -211,6 +215,17 @@ class RewardExecutor:
 # ---------------------------------------------------------------------------
 # Public API (backward-compatible)
 # ---------------------------------------------------------------------------
+
+
+async def _dummy_reward(args):
+    # No-op reward. Paired with --custom-reward-post-process-path when real
+    # scoring is deferred to a post-rollout batch pass. Returns a dict when
+    # reward_key is set so downstream sample.reward[reward_key] access does
+    # not KeyError before the post-process step overwrites everything.
+    reward_key = getattr(args, "reward_key", None)
+    if reward_key:
+        return {reward_key: 0.0}
+    return 0.0
 
 
 async def remote_rm(args, sample: Sample, max_retries: int = 10):

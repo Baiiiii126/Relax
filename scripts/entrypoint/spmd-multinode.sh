@@ -47,6 +47,14 @@ pkill -9 python 2>/dev/null || true
 
 set -x
 
+# Reserve two ranges:
+#   15000-16800 — sglang port range. SGLang's dp-attention schedulers use ports
+#                 starting from ~15100 (base_port + offsets for DP/TP ranks), so
+#                 the range must start well below 15400 to cover all scheduler
+#                 input/output/NCCL bootstrap ports.
+#   30000-32768 — secondary safe zone (fallback if sglang port_base needs adjustment)
+sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768
+
 # ── environment setup ───────────────────────────────────────────────────────
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 export PYTHONUNBUFFERED=1
