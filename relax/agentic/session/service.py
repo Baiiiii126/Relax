@@ -43,10 +43,9 @@ from relax.agentic.session.state import (
     RequestKind,
     SessionForest,
     TrainingFieldArtifact,
+    _messages_tools_template_state_hash,
     _multimodal_inputs_from_messages,
     check_messages,
-    iter_message_content_parts,
-    messages_tools_template_state_hash,
     normalize_template_kwargs,
     normalize_tools,
 )
@@ -425,13 +424,13 @@ def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
         fail("stop must be a string or list of strings", param="stop")
 
     try:
-        normalized_messages = check_messages(messages)
+        messages = check_messages(messages)
     except (TypeError, ValueError) as exc:
         fail(str(exc), param="messages")
 
     return {
-        "messages": normalized_messages,
-        "tools": normalize_tools(tools) if tools is not None else None,
+        "messages": messages,
+        "tools": normalize_tools(tools),
         "chat_template_kwargs": normalize_template_kwargs(chat_template_kwargs),
         "model": payload.get("model"),
         "temperature": payload.get("temperature"),
@@ -481,29 +480,6 @@ def _last_token_is_stop_token(*, token_ids: list[int], tokenizer: Any, sampling_
     _extend_token_id_set(stop_token_ids, getattr(tokenizer, "additional_stop_token_ids", None))
     _extend_token_id_set(stop_token_ids, sampling_params.get("stop_token_ids"))
     return int(token_ids[-1]) in stop_token_ids
-
-
-def _message_multimodal_inputs(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
-    from relax.utils.multimodal.image_utils import load_image
-
-    normalized_messages = check_messages(messages)
-    for message in normalized_messages:
-        if message.get("role") != "tool":
-            continue
-        for item in iter_message_content_parts(message):
-            item_type = item.get("type")
-            if item_type == "image_url":
-                image_url = item.get("image_url")
-                payload = image_url.get("url") if isinstance(image_url, dict) else None
-                if isinstance(payload, str) and payload.startswith("data:image/"):
-                    load_image(payload)
-                    continue
-                raise AgenticChatRequestError(
-                    "Tool image payloads must use type='image_url' with image_url.url set to a data:image/...;base64,... value.",
-                    code="invalid_image_payload",
-                    param="messages",
-                )
-    return _multimodal_inputs_from_messages(normalized_messages)
 
 
 def _stable_tool_call_id(*, parent_state_hash: str, token_ids: list[int], call_index: int) -> str:
@@ -1129,20 +1105,18 @@ class AgenticSessionShard:
         *,
         forest: SessionForest,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict[str, Any]],
         chat_template_kwargs: dict[str, Any],
     ) -> tuple[str, list[dict[str, Any]]]:
-        normalized_messages = check_messages(messages)
-        normalized_tools = normalize_tools(tools)
-        for prefix_len in range(len(normalized_messages), 0, -1):
-            prefix_hash = messages_tools_template_state_hash(
-                normalized_messages[:prefix_len],
-                normalized_tools,
+        for prefix_len in range(len(messages), 0, -1):
+            prefix_hash = _messages_tools_template_state_hash(
+                messages[:prefix_len],
+                tools,
                 chat_template_kwargs,
             )
             if prefix_hash in forest.nodes_by_hash:
-                return prefix_hash, normalized_messages[prefix_len:]
-        return forest.root_state_hash, normalized_messages
+                return prefix_hash, messages[prefix_len:]
+        return forest.root_state_hash, messages
 
     def _raise_if_observation_exceeds_context(
         self,
@@ -1172,17 +1146,16 @@ class AgenticSessionShard:
         *,
         forest: SessionForest,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict[str, Any]],
         chat_template_kwargs: dict[str, Any],
         rollout_id: int,
     ) -> tuple[str, dict[str, float] | None]:
-        normalized_messages = check_messages(messages)
         root_state_hash = forest.root_state_hash
         encoded = await self._encode_messages(
-            messages=normalized_messages,
-            tools=normalize_tools(tools),
+            messages=messages,
+            tools=tools,
             chat_template_kwargs=chat_template_kwargs,
-            multimodal_inputs=_message_multimodal_inputs(normalized_messages),
+            multimodal_inputs=_multimodal_inputs_from_messages(messages),
         )
         self._raise_if_observation_exceeds_context(
             forest=forest,
@@ -1193,14 +1166,14 @@ class AgenticSessionShard:
             parent_state_hash=root_state_hash,
             rollout_id=rollout_id,
             abort_count=0,
-            messages_delta=normalized_messages,
+            messages_delta=messages,
             train_token_delta=list(encoded.train_prompt_ids),
             rollout_token_delta=list(encoded.backend_prompt_ids),
             multimodal_train_inputs_delta=copy.deepcopy(encoded.multimodal_train_inputs),
             backend_image_data_delta=list(encoded.backend_image_data),
             backend_audio_data_delta=list(encoded.backend_audio_data),
             backend_video_data_delta=list(encoded.backend_video_data),
-            tools=normalize_tools(tools),
+            tools=tools,
             chat_template_kwargs=chat_template_kwargs,
         )
         return subtree_root.state_hash, dict(encoded.timing)
@@ -1211,7 +1184,7 @@ class AgenticSessionShard:
         forest: SessionForest,
         parent_state_hash: str,
         obs_delta: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict[str, Any]],
         chat_template_kwargs: dict[str, Any],
         rollout_id: int,
     ) -> tuple[str, dict[str, float] | None]:
@@ -1229,7 +1202,7 @@ class AgenticSessionShard:
             obs_delta,
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
-            multimodal_inputs=_message_multimodal_inputs(obs_delta),
+            multimodal_inputs=_multimodal_inputs_from_messages(obs_delta),
         )
         self._raise_if_observation_exceeds_context(
             forest=forest,
@@ -1237,15 +1210,13 @@ class AgenticSessionShard:
             observation_rollout_tokens=list(encoded_obs.backend_prompt_ids),
         )
         parent_subtree_root = forest.subtree_root_node(parent_state_hash)
-        parent_tools = normalize_tools(parent_subtree_root.tools) if parent_subtree_root is not None else []
-        if normalize_tools(tools) != parent_tools:
+        parent_tools = parent_subtree_root.tools if parent_subtree_root is not None else []
+        if tools != parent_tools:
             raise RuntimeError(f"Session {forest.session_id!r} tools diverged inside an existing subtree")
         parent_chat_template_kwargs = (
-            normalize_template_kwargs(parent_subtree_root.chat_template_kwargs)
-            if parent_subtree_root is not None
-            else {}
+            parent_subtree_root.chat_template_kwargs if parent_subtree_root is not None else {}
         )
-        if normalize_template_kwargs(chat_template_kwargs) != parent_chat_template_kwargs:
+        if chat_template_kwargs != parent_chat_template_kwargs:
             raise RuntimeError(
                 f"Session {forest.session_id!r} chat_template_kwargs diverged inside an existing subtree"
             )
@@ -2122,14 +2093,13 @@ class AgenticSessionShard:
                 raise _session_discarded_error(session_id)
             async with lock:
                 chat_lock_acquired_at = time.time()
-                normalized_messages = check_messages(messages)
                 existing_record = self._session_records.get(session_id)
-                normalized_tools = normalize_tools(tools)
-                chat_template_kwargs = {**self._template_kwargs(), **normalize_template_kwargs(chat_template_kwargs)}
+                tools = tools or []
+                chat_template_kwargs = {**self._template_kwargs(), **(chat_template_kwargs or {})}
                 existing_rollout_id = existing_record.rollout_id if existing_record is not None else 0
                 record, bootstrap_compiler_timing = await self._ensure_record(
                     session_id=session_id,
-                    messages=normalized_messages,
+                    messages=messages,
                     rollout_id=existing_rollout_id,
                 )
                 sampling_params: dict[str, Any] = copy.deepcopy(record.session_sampling_params)
@@ -2145,15 +2115,15 @@ class AgenticSessionShard:
                     sampling_params["sampling_seed"] = int(seed)
                 parent_state_hash, obs_delta = self._match_parent_state_hash(
                     forest=record.forest,
-                    messages=normalized_messages,
-                    tools=normalized_tools,
+                    messages=messages,
+                    tools=tools,
                     chat_template_kwargs=chat_template_kwargs,
                 )
                 generation_parent_hash, observation_compiler_timing = await self._append_observation_if_needed(
                     forest=record.forest,
                     parent_state_hash=parent_state_hash,
                     obs_delta=obs_delta,
-                    tools=normalized_tools,
+                    tools=tools,
                     chat_template_kwargs=chat_template_kwargs,
                     rollout_id=record.rollout_id,
                 )
@@ -2194,8 +2164,6 @@ class AgenticSessionShard:
             messages,
             tools,
             chat_template_kwargs,
-            normalized_messages,
-            normalized_tools,
             existing_record,
             record,
             sampling_params,

@@ -46,11 +46,10 @@ from relax.agentic.session.state import (
     FinalizedResultTransport,
     TrainingFieldArtifact,
     check_messages,
-    normalize_template_kwargs,
-    normalize_tools,
 )
 from relax.utils.http_utils import post
 from relax.utils.logging_utils import get_logger
+from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.types import Sample
 
 
@@ -1254,9 +1253,8 @@ def _transport_image_payload(payload: Any) -> str:
 
 
 def _transport_dataset_message_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    normalized_messages = check_messages(messages)
     rendered_messages: list[dict[str, Any]] = []
-    for message in normalized_messages:
+    for message in messages:
         content = message["content"]
         if isinstance(content, str):
             rendered_messages.append(message)
@@ -3228,46 +3226,34 @@ def _processing_utils():
     return processing_utils
 
 
-def _normalize_multimodal_inputs_sync(multimodal_inputs: dict[str, Any] | None) -> dict[str, Any] | None:
+def _normalize_multimodal_inputs_sync(
+    multimodal_inputs: dict[str, Any] | None,
+    processor: Any,
+    use_audio_in_video: bool,
+    multimodal_config: Any | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, float]]:
     if not multimodal_inputs:
-        return None
+        return None, {}
 
-    normalized: dict[str, Any] = {}
     images = list(multimodal_inputs.get("images") or [])
-    if images:
-        from PIL import Image
-
-        from relax.utils.multimodal.image_utils import load_image
-
-        normalized_images = []
-        for image in images:
-            if image is None:
-                continue
-            if isinstance(image, Image.Image):
-                normalized_images.append(image)
-                continue
-            if isinstance(image, dict):
-                image_bytes = image.get("bytes")
-                image_path = image.get("path")
-                if isinstance(image_bytes, (bytes, bytearray)):
-                    normalized_images.append(load_image(bytes(image_bytes)))
-                    continue
-                if isinstance(image_path, str) and image_path:
-                    normalized_images.append(load_image(image_path))
-                    continue
-            normalized_images.append(load_image(image))
-        if normalized_images:
-            normalized["images"] = normalized_images
-
     videos = list(multimodal_inputs.get("videos") or [])
-    if videos:
-        normalized["videos"] = videos
-
     audio_items = list(multimodal_inputs.get("audio") or [])
-    if audio_items:
-        normalized["audio"] = audio_items
+    content = [
+        {"type": modality, modality: value}
+        for modality, values in (("image", images), ("video", videos), ("audio", audio_items))
+        for value in values
+        if value is not None
+    ]
+    if not content:
+        return None, {}
+    if processor is None:
+        raise RuntimeError("Agentic multimodal inputs require a processor loaded from the model checkpoint.")
+    from relax.utils.data.processing_utils import process_vision_info
 
-    return normalized or None
+    started_at = time.monotonic()
+    return process_vision_info(
+        [{"role": "user", "content": content}], processor, use_audio_in_video, multimodal_config
+    ), {"process_vision_info_elapsed_s": time.monotonic() - started_at}
 
 
 @dataclass
@@ -3303,6 +3289,7 @@ class SGLangMessageCompiler:
         processor_pool: Any | None = None,
         apply_chat_template_kwargs: dict[str, Any] | None = None,
         use_audio_in_video: bool = False,
+        multimodal_config: Any | None = None,
         cpu_executor: Any | None = None,
     ):
         self.tokenizer = tokenizer
@@ -3310,6 +3297,7 @@ class SGLangMessageCompiler:
         self.processor_pool = processor_pool
         self.apply_chat_template_kwargs = apply_chat_template_kwargs or {}
         self.use_audio_in_video = use_audio_in_video
+        self.multimodal_config = multimodal_config
         self.cpu_executor = cpu_executor
 
     @staticmethod
@@ -3328,13 +3316,9 @@ class SGLangMessageCompiler:
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None,
     ) -> str:
-        chat_template_kwargs = (
-            self.apply_chat_template_kwargs
-            if chat_template_kwargs is None
-            else normalize_template_kwargs(chat_template_kwargs)
-        )
+        chat_template_kwargs = chat_template_kwargs or {}
         return self.tokenizer.apply_chat_template(
-            check_messages(messages),
+            messages,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
@@ -3343,14 +3327,14 @@ class SGLangMessageCompiler:
 
     def _build_prompt_sync(
         self,
-        normalized_messages: list[dict[str, Any]],
-        normalized_tools: list[dict[str, Any]] | None,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None,
-    ) -> tuple[str, list[int], dict[str, float]]:
+    ) -> tuple[str, list[int], int, dict[str, float]]:
         template_started_at = time.monotonic()
         prompt_text = self._apply_chat_template(
-            normalized_messages,
-            tools=normalized_tools,
+            messages,
+            tools=tools,
             chat_template_kwargs=chat_template_kwargs,
         )
         template_elapsed_s = time.monotonic() - template_started_at
@@ -3361,6 +3345,7 @@ class SGLangMessageCompiler:
         return (
             prompt_text,
             backend_prompt_ids,
+            0,
             {
                 "apply_chat_template_elapsed_s": template_elapsed_s,
                 "tokenizer_encode_elapsed_s": tokenize_elapsed_s,
@@ -3369,26 +3354,22 @@ class SGLangMessageCompiler:
 
     def _build_observation_prompt_sync(
         self,
-        normalized_messages: list[dict[str, Any]],
-        normalized_tools: list[dict[str, Any]] | None,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None,
     ) -> tuple[str, list[int], int, dict[str, float]]:
-        chat_template_kwargs = (
-            self.apply_chat_template_kwargs
-            if chat_template_kwargs is None
-            else normalize_template_kwargs(chat_template_kwargs)
-        )
+        chat_template_kwargs = chat_template_kwargs or {}
         template_started_at = time.monotonic()
         dummy_prompt = self.tokenizer.apply_chat_template(
-            check_messages(_DUMMY_MESSAGES),
-            tools=normalized_tools,
+            _DUMMY_MESSAGES,
+            tools=tools,
             tokenize=False,
             add_generation_prompt=False,
             **chat_template_kwargs,
         ).rstrip("\n")
         formatted_prompt = self.tokenizer.apply_chat_template(
-            check_messages(_DUMMY_MESSAGES + normalized_messages),
-            tools=normalized_tools,
+            _DUMMY_MESSAGES + messages,
+            tools=tools,
             tokenize=False,
             add_generation_prompt=True,
             **chat_template_kwargs,
@@ -3410,23 +3391,6 @@ class SGLangMessageCompiler:
                 "tokenizer_encode_elapsed_s": tokenize_elapsed_s,
             },
         )
-
-    async def _compute_multimodal_inputs_async(
-        self,
-        normalized_messages: list[dict[str, Any]],
-    ) -> tuple[dict[str, Any], dict[str, float]]:
-        from relax.utils.data.processing_utils import process_vision_info
-
-        started_at = time.monotonic()
-        loop = asyncio.get_running_loop()
-        multimodal_inputs = await loop.run_in_executor(
-            self.cpu_executor,
-            process_vision_info,
-            normalized_messages,
-            self.processor,
-            self.use_audio_in_video,
-        )
-        return multimodal_inputs, {"process_vision_info_elapsed_s": time.monotonic() - started_at}
 
     async def _run_processor_async(
         self,
@@ -3546,44 +3510,48 @@ class SGLangMessageCompiler:
         audio_data = list(results[offset:])
         return image_data, audio_data, video_data, {"media_encode_elapsed_s": time.monotonic() - started_at}
 
-    async def encode_messages(
+    async def _encode_with_prompt_builder(
         self,
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None = None,
         multimodal_inputs: dict[str, Any] | None = None,
+        prompt_builder: Callable[
+            [list[dict[str, Any]], list[dict[str, Any]] | None, dict[str, Any] | None],
+            tuple[str, list[int], int, dict[str, float]],
+        ],
     ) -> EncodedMessages:
         total_started_at = time.monotonic()
-        normalized_messages = check_messages(messages)
-        normalized_tools = normalize_tools(tools)
         loop = asyncio.get_running_loop()
 
         prompt_future = loop.run_in_executor(
             self.cpu_executor,
-            self._build_prompt_sync,
-            normalized_messages,
-            normalized_tools,
+            prompt_builder,
+            messages,
+            tools,
             chat_template_kwargs,
         )
-        if self.processor and multimodal_inputs is None:
-            multimodal_future = asyncio.create_task(self._compute_multimodal_inputs_async(normalized_messages))
-        else:
-            multimodal_future = None
-        normalized_override_future = None
         if multimodal_inputs is not None:
-            normalized_override_future = loop.run_in_executor(
+            multimodal_future = loop.run_in_executor(
                 self.cpu_executor,
                 _normalize_multimodal_inputs_sync,
                 multimodal_inputs,
+                self.processor,
+                self.use_audio_in_video,
+                self.multimodal_config,
             )
-        prompt_text, backend_prompt_ids, prompt_timing = await prompt_future
+        else:
+            multimodal_future = None
+
+        prompt_text, backend_prompt_ids, trim_length, prompt_timing = await prompt_future
         multimodal_inputs = None
         multimodal_timing: dict[str, float] = {}
         if multimodal_future is not None:
             multimodal_inputs, multimodal_timing = await multimodal_future
-        elif normalized_override_future is not None:
-            multimodal_inputs = await normalized_override_future
+        has_media = multimodal_inputs is not None and any(
+            multimodal_inputs.get(key) for key in ("images", "videos", "audio")
+        )
 
         train_prompt_ids = list(backend_prompt_ids)
         multimodal_train_inputs = None
@@ -3595,9 +3563,11 @@ class SGLangMessageCompiler:
 
         processor_task = None
         media_task = None
-        if self.processor:
-            processor_task = asyncio.create_task(self._run_processor_async(prompt_text, multimodal_inputs or {}))
-        if multimodal_inputs:
+        if has_media:
+            processor_task = asyncio.create_task(
+                self._run_processor_async(prompt_text, multimodal_inputs or {}, trim_length=trim_length)
+            )
+        if has_media:
             media_task = asyncio.create_task(self._encode_media_async(multimodal_inputs))
 
         if processor_task is not None:
@@ -3615,6 +3585,22 @@ class SGLangMessageCompiler:
             backend_video_data=video_data,
             multimodal_train_inputs=multimodal_train_inputs,
             timing=timing,
+        )
+
+    async def encode_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        multimodal_inputs: dict[str, Any] | None = None,
+    ) -> EncodedMessages:
+        return await self._encode_with_prompt_builder(
+            messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            multimodal_inputs=multimodal_inputs,
+            prompt_builder=self._build_prompt_sync,
         )
 
     async def encode_observation_delta(
@@ -3625,70 +3611,12 @@ class SGLangMessageCompiler:
         chat_template_kwargs: dict[str, Any] | None = None,
         multimodal_inputs: dict[str, Any] | None = None,
     ) -> EncodedMessages:
-        total_started_at = time.monotonic()
-        normalized_messages = check_messages(messages_delta)
-        normalized_tools = normalize_tools(tools)
-        loop = asyncio.get_running_loop()
-
-        prompt_future = loop.run_in_executor(
-            self.cpu_executor,
-            self._build_observation_prompt_sync,
-            normalized_messages,
-            normalized_tools,
-            chat_template_kwargs,
-        )
-        if self.processor and multimodal_inputs is None:
-            multimodal_future = asyncio.create_task(self._compute_multimodal_inputs_async(normalized_messages))
-        else:
-            multimodal_future = None
-        normalized_override_future = None
-        if multimodal_inputs is not None:
-            normalized_override_future = loop.run_in_executor(
-                self.cpu_executor,
-                _normalize_multimodal_inputs_sync,
-                multimodal_inputs,
-            )
-
-        formatted_prompt, backend_prompt_ids, trim_length, prompt_timing = await prompt_future
-        multimodal_inputs = None
-        multimodal_timing: dict[str, float] = {}
-        if multimodal_future is not None:
-            multimodal_inputs, multimodal_timing = await multimodal_future
-        elif normalized_override_future is not None:
-            multimodal_inputs = await normalized_override_future
-
-        train_prompt_ids = list(backend_prompt_ids)
-        multimodal_train_inputs = None
-        processor_timing: dict[str, float] = {}
-        media_timing: dict[str, float] = {}
-        image_data: list[str] = []
-        audio_data: list[str] = []
-        video_data: list[str] = []
-
-        processor_task = None
-        media_task = None
-        if self.processor:
-            processor_task = asyncio.create_task(
-                self._run_processor_async(formatted_prompt, multimodal_inputs or {}, trim_length=trim_length)
-            )
-        if multimodal_inputs:
-            media_task = asyncio.create_task(self._encode_media_async(multimodal_inputs))
-
-        if processor_task is not None:
-            train_prompt_ids, multimodal_train_inputs, processor_timing = await processor_task
-        if media_task is not None:
-            image_data, audio_data, video_data, media_timing = await media_task
-
-        timing = self._merge_timing(prompt_timing, multimodal_timing, processor_timing, media_timing)
-        timing["total_elapsed_s"] = time.monotonic() - total_started_at
-        return EncodedMessages(
-            train_prompt_ids=train_prompt_ids,
-            backend_prompt_ids=backend_prompt_ids,
-            backend_image_data=image_data,
-            backend_audio_data=audio_data,
-            backend_video_data=video_data,
-            multimodal_train_inputs=multimodal_train_inputs,
-            timing=timing,
+        return await self._encode_with_prompt_builder(
+            messages_delta,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            multimodal_inputs=multimodal_inputs,
+            prompt_builder=self._build_observation_prompt_sync,
         )
 
 
@@ -3781,6 +3709,7 @@ class SGLangBackendAdapter:
             processor_pool=resources.processor_pool,
             apply_chat_template_kwargs=self._apply_chat_template_kwargs,
             use_audio_in_video=args.use_audio_in_video,
+            multimodal_config=MultimodalConfig.from_args(args),
             cpu_executor=resources.cpu_executor,
         )
 

@@ -188,16 +188,16 @@ def normalize_template_kwargs(template_kwargs: dict[str, Any] | None) -> dict[st
     return _normalize(template_kwargs or {})
 
 
-def messages_tools_template_state_hash(
-    messages: list[dict[str, Any]] | None,
-    tools: list[dict[str, Any]] | None,
-    template_kwargs: dict[str, Any] | None,
+def _messages_tools_template_state_hash(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    template_kwargs: dict[str, Any],
 ) -> str:
     payload = json.dumps(
         {
-            "messages": check_messages(messages),
-            "tools": normalize_tools(tools),
-            "template_kwargs": normalize_template_kwargs(template_kwargs),
+            "messages": messages,
+            "tools": tools,
+            "template_kwargs": template_kwargs,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -285,17 +285,22 @@ def _copy_dict_of_lists(data: dict[str, Any] | None) -> dict[str, Any] | None:
     return copy.deepcopy(data) if data is not None else None
 
 
-def _merge_multimodal_train_inputs(base: dict[str, Any] | None, delta: dict[str, Any] | None) -> dict[str, Any] | None:
-    if base is None and delta is None:
+def _merge_multimodal_train_inputs(deltas: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not deltas:
         return None
-    merged = copy.deepcopy(base or {})
-    for key, value in (delta or {}).items():
-        if value is None:
-            continue
-        if key in merged and isinstance(merged[key], torch.Tensor) and isinstance(value, torch.Tensor):
-            merged[key] = torch.cat([merged[key], value], dim=0)
+    values_by_key: dict[str, list[Any]] = {}
+    for delta in deltas:
+        for key, value in delta.items():
+            if value is not None:
+                values_by_key.setdefault(key, []).append(value)
+    if not values_by_key:
+        return None
+    merged: dict[str, Any] = {}
+    for key, values in values_by_key.items():
+        if all(isinstance(value, torch.Tensor) for value in values):
+            merged[key] = torch.cat(values, dim=0) if len(values) > 1 else copy.deepcopy(values[0])
         else:
-            merged[key] = copy.deepcopy(value)
+            merged[key] = copy.deepcopy(values[-1])
     return merged
 
 
@@ -338,7 +343,7 @@ def _multimodal_inputs_from_messages(messages: list[dict[str, Any]]) -> dict[str
         # "videos": [],
         # "audio": [],
     }
-    for message in check_messages(messages):
+    for message in messages:
         for item in iter_message_content_parts(message):
             item_type = item.get("type")
             if item_type == "image_url" and item.get("image_url") is not None:
@@ -586,14 +591,14 @@ class SessionForest:
         chat_template_kwargs: dict[str, Any] | None,
     ) -> str:
         parent_messages = self.full_messages(parent_state_hash) if parent_state_hash is not None else []
-        full_messages = parent_messages + check_messages(messages_delta)
-        current_tools = normalize_tools(tools) if tools is not None else self.subtree_tools(parent_state_hash)
+        full_messages = parent_messages + messages_delta
+        current_tools = tools if tools is not None else self.subtree_tools(parent_state_hash)
         current_chat_template_kwargs = (
-            normalize_template_kwargs(chat_template_kwargs)
+            chat_template_kwargs
             if chat_template_kwargs is not None
             else self.subtree_chat_template_kwargs(parent_state_hash, self.static_metadata.get("chat_template_kwargs"))
         )
-        return messages_tools_template_state_hash(full_messages, current_tools, current_chat_template_kwargs)
+        return _messages_tools_template_state_hash(full_messages, current_tools, current_chat_template_kwargs)
 
     def append_obs(
         self,
@@ -626,7 +631,7 @@ class SessionForest:
                 parent_state_hash=parent_state_hash,
                 rollout_id=rollout_id,
                 abort_count=abort_count,
-                messages_delta=check_messages(messages_delta),
+                messages_delta=messages_delta,
                 train_token_delta=list(train_token_delta),
                 rollout_token_delta=list(rollout_token_delta),
                 loss_mask_delta=[],
@@ -635,10 +640,8 @@ class SessionForest:
                 backend_image_data_delta=list(backend_image_data_delta or []),
                 backend_audio_data_delta=list(backend_audio_data_delta or []),
                 backend_video_data_delta=list(backend_video_data_delta or []),
-                tools=normalize_tools(tools) if tools is not None else None,
-                chat_template_kwargs=(
-                    normalize_template_kwargs(chat_template_kwargs) if chat_template_kwargs is not None else None
-                ),
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
                 wall_elapsed_s=float(wall_elapsed_s),
                 generation_elapsed_s=float(generation_elapsed_s),
             )
@@ -680,7 +683,7 @@ class SessionForest:
                 parent_state_hash=parent_state_hash,
                 rollout_id=rollout_id,
                 abort_count=abort_count,
-                messages_delta=check_messages(messages_delta),
+                messages_delta=messages_delta,
                 train_token_delta=list(train_token_delta),
                 rollout_token_delta=list(rollout_token_delta),
                 loss_mask_delta=list(loss_mask_delta)
@@ -741,7 +744,7 @@ class SessionForest:
         rollout_log_probs: list[float] = []
         messages: list[dict[str, Any]] = []
         turns: list[dict[str, Any]] = []
-        multimodal_train_inputs: dict[str, Any] | None = None
+        multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
@@ -756,9 +759,8 @@ class SessionForest:
             messages.extend(node.messages_delta)
             wall_elapsed_s += float(node.wall_elapsed_s)
             generation_elapsed_s += float(node.generation_elapsed_s)
-            multimodal_train_inputs = _merge_multimodal_train_inputs(
-                multimodal_train_inputs, node.multimodal_train_inputs_delta
-            )
+            if node.multimodal_train_inputs_delta is not None:
+                multimodal_train_inputs_buffer.append(node.multimodal_train_inputs_delta)
             if node.kind == "resp":
                 if first_response_node is None:
                     first_response_node = node
@@ -827,7 +829,7 @@ class SessionForest:
             tokens=tokens,
             rollout_tokens=rollout_tokens,
             multimodal_inputs=_multimodal_inputs_from_messages(messages),
-            multimodal_train_inputs=multimodal_train_inputs,
+            multimodal_train_inputs=_merge_multimodal_train_inputs(multimodal_train_inputs_buffer),
             response=_decode_tokens(tokenizer=tokenizer, token_ids=continuation_train_tokens),
             response_length=len(continuation_train_tokens),
             label=self.label,
