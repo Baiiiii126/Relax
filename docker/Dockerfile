@@ -41,6 +41,17 @@ RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no
     pip install --no-cache-dir flash-linear-attention==0.4.1 && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
+# FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
+# window_size_left/right to match TE 2.14.1 (docs/draft/sglang-0.5.12-upgrade-plan.md §8.4).
+# The `cp` exposes flash_attn_3.flash_attn_interface, which is what TE imports. BUT this commit's
+# setup.py (py_modules=["flash_attn_interface"]) ALSO installs a *top-level* flash_attn_interface.py
+# (into the egg root). That top-level module and the copied flash_attn_3/flash_attn_interface.py
+# both register the torch custom op flash_attn_3::_flash_attn_forward; a second import in the same
+# process _destroy()s the Library TE bound to, so a later dispatch reads an empty schema
+# (use-after-free) and every actor forward crashes with `schema_.has_value() INTERNAL ASSERT
+# FAILED` (§8.5). Strip the stray top-level module (site-packages root + egg root). Keep
+# flash_attn_config.py: flash_attn_3/flash_attn_interface.py does `from flash_attn_config import
+# CONFIG` at forward time, so deleting it would break the forward with ModuleNotFoundError.
 RUN MAX_JOBS=64 \
     cd /opt && git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention/ && \
@@ -51,6 +62,9 @@ RUN MAX_JOBS=64 \
     export python_path=`python -c "import site; print(site.getsitepackages()[0])"` && \
     mkdir -p $python_path/flash_attn_3 && \
     cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py && \
+    find $python_path -maxdepth 1 -name flash_attn_interface.py -delete && \
+    find $python_path -maxdepth 2 -path '*.egg/flash_attn_interface.py' -delete && \
+    cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
     rm -rf /opt/flash-attention/
 
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \

@@ -328,15 +328,12 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 
 ### 8.5 FA3 `schema_.has_value()` / `basic_string::_M_create`(custom op 重复注册 → use-after-free)
 
-- **现象**:换上 0f82fead 后,CP `cp_p2p_fwd_flash_attn → flash_attn_fwd` 处 8 个 rank 报三种不同错——
-  `schema_.has_value() ... Tried to access the schema for .`(空 op 名)/ `basic_string::_M_create` / `UnicodeDecodeError`,典型 use-after-free。参数全合法,abi3/非-abi3 都崩。
-- **根因**:被污染的容器 site-packages 里存在**两份**注册同名 torch custom op `flash_attn_3::_flash_attn_forward` 的文件:
-  包内 `flash_attn_3/flash_attn_interface.py`(TE import 时绑定)与游离顶层 `flash_attn_interface.py`。
-  第二个 importer(SGLang 依赖的 flashinfer `import flash_attn_interface`)触发 torch `get_library_allowing_overwrite`
+- **现象**:换上 0f82fead 后,`flash_attn_fwd → _flash_attn_forward` 处报三种不同错——
+  `schema_.has_value() ... Tried to access the schema for .`(空 op 名)/ `basic_string::_M_create` / `UnicodeDecodeError`,典型 use-after-free。参数全合法,abi3/非-abi3 都崩。CP 路径(`cp_p2p_fwd_flash_attn`)与**非 CP 路径**(`flash_attn_varlen_func`,`qwen3-4b-GRPO-gpu8` CP=1 复现)都触发——即任何 `--attention-backend flash` 的前向都会中招。
+- **根因**:site-packages 里存在**两份内容完全相同**、都注册同名 torch custom op `flash_attn_3::_flash_attn_forward` 的文件:copy-hack 的包内 `flash_attn_3/flash_attn_interface.py`(TE import 时绑定)与 `setup.py install` 落到 egg 根的**游离顶层** `flash_attn_interface.py`。第二个 importer 触发 torch `get_library_allowing_overwrite`
   → `_destroy()` 掉 TE 已注册的 Library → TE 旧句柄再 dispatch 时读到已释放/空 schema。
-- **要点**:**干净镜像不含游离顶层模块**(经用户确认),污染来自调试期间容器内手动 `setup.py install` FA3(疑 setuptools 版本差异)。故 **Dockerfile 无需改动**。
-- **修复**:删除游离顶层 `flash_attn_interface.py` / `flash_attn_config.py`、修正 egg `top_level.txt` 只留 `flash_attn_3`。
-  手动安装路径由仓库外的 `install_fa3_0f82fead.sh` 的 `strip_stray_modules()` 兜底(快/慢路径都调用,verify 断言顶层模块不可导入)。
+- **订正(2026-07-06,`qwen3-4b-GRPO-gpu8` 干净重打镜像实测)**:原判「干净镜像不含游离顶层模块、纯属容器污染、Dockerfile 无需改动」**已被推翻**。`0f82fead` 的 hopper `setup.py` 用 `py_modules=["flash_attn_interface"]`,**每次干净构建都会把顶层 `flash_attn_interface.py` 种进 egg 根**(实测 `import flash_attn_interface` 落在 `flash_attn_3-3.0.0-…egg/flash_attn_interface.py`,与包内那份字节相同、各注册 3 处 custom op);叠加 copy-hack → 干净镜像天然自带重复注册。**故 Dockerfile 必须加 strip 步骤**(已落地,见 `docker/Dockerfile` FA3 块)。
+- **修复**:**只删**游离顶层 `flash_attn_interface.py`——`find $python_path -maxdepth 1 -name flash_attn_interface.py -delete` + `find $python_path -maxdepth 2 -path '*.egg/flash_attn_interface.py' -delete`(此二式不误伤 FA2 的 `flash_attn/flash_attn_interface.py` 与 copy-hack 的 `flash_attn_3/flash_attn_interface.py`);**`flash_attn_config.py` 必须保留**——包内 `flash_attn_3/flash_attn_interface.py` 在 `round_up_headdim()` 里 `from flash_attn_config import CONFIG`,删掉会在前向 `ModuleNotFoundError`(原「删 flash_attn_interface.py / flash_attn_config.py」说法有误,已订正)。verify:`assert find_spec('flash_attn_interface') is None` 且 `import flash_attn_config` 成功。
 
 ### 8.6 小结
 
@@ -346,12 +343,12 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 | 8.2 | 层数不一致 → diff 0.7 | `NLAYERS=2` + 可 env 覆盖 | 否(减层冒烟配置) |
 | 8.3 | CP `split_with_sizes` | `is_vl_model`×5(commit `256b030`) | 否(dev 已存在,CP=2 暴露) |
 | 8.4 | FA3 `window_size_left` | Dockerfile FA3 → `0f82fead` | 是(TE 2.14.1 栈相关) |
-| 8.5 | FA3 重复注册崩溃 | 容器内清理 + tools 脚本兜底(镜像干净,不改 Dockerfile) | 否(容器污染) |
+| 8.5 | FA3 重复注册崩溃 | Dockerfile FA3 块加 strip(删顶层 `flash_attn_interface.py`,留 `flash_attn_config.py`) | **是**(`0f82fead` setup.py 布局,干净镜像即复现) |
 | 8.7 | R3 routing replay 死锁 (Bug A) | 换 slime 私有 router wheel(见 §8.7,已落地) | **是**(官方 sgl-router 无 r3 透传) |
 | 8.8 | R3 CP fan-out 缺失 0-d crash (Bug B) | `_broadcast_routed_experts` CP→PP→TP(见 §8.8) | 否(relax 潜伏,R3+CP>1 暴露) |
 | 8.9 | R3 `is_vl_model` CP 对齐错位 diff 6× (Bug C) | `fill_routing_replay` 按 `tp*cp*2` 对齐(见 §8.9) | 否(§8.3 同源遗漏,R3+CP>1 暴露) |
 
-> 结论:8.1-8.5 中仅 **8.4** 真正源于本次 sglang/镜像升级栈(TE 2.14.1 需要更新的 FA3);8.5 是升级过程中**手动装 FA3** 的副作用而非升级本身;
+> 结论:8.1-8.5 中 **8.4 与 8.5** 均源于本次 sglang/镜像升级栈——8.4 是 TE 2.14.1 需要更新的 FA3,8.5 是该更新 commit(`0f82fead`)`setup.py` 布局的副作用(干净镜像即复现,需 Dockerfile strip;2026-07-06 订正,原判「容器污染、不改 Dockerfile」有误);
 > 8.1/8.2 是 colocate 与减层冒烟的通用配置问题;8.3 是 dev 早已潜伏、被 CP=2 暴露的通用 bug。
 > **8.7** 是后续单独开 R3 冒烟(2026-07-03 晚)才发现的,**直接由本次升级的 router 依赖决策引入**(用官方 sgl-router 而非 slime 私有 fork);修好后又串联暴露 **8.8/8.9**(均为 relax 侧潜伏、与升级无关,`R3 + CP>1` 才触发)。R3 在 CP>1 端到端跑通至此达成。
 
