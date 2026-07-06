@@ -347,11 +347,13 @@ CLI flag `--disable-indexer-rope-neox-style` 只在 slime patch 代码里存在�
 | 8.3 | CP `split_with_sizes` | `is_vl_model`×5(commit `256b030`) | 否(dev 已存在,CP=2 暴露) |
 | 8.4 | FA3 `window_size_left` | Dockerfile FA3 → `0f82fead` | 是(TE 2.14.1 栈相关) |
 | 8.5 | FA3 重复注册崩溃 | 容器内清理 + tools 脚本兜底(镜像干净,不改 Dockerfile) | 否(容器污染) |
-| 8.7 | R3 routing replay 死锁 | 换 slime 私有 router wheel(见 §8.7,待落地) | **是**(官方 sgl-router 无 r3 透传) |
+| 8.7 | R3 routing replay 死锁 (Bug A) | 换 slime 私有 router wheel(见 §8.7,已落地) | **是**(官方 sgl-router 无 r3 透传) |
+| 8.8 | R3 CP fan-out 缺失 0-d crash (Bug B) | `_broadcast_routed_experts` CP→PP→TP(见 §8.8) | 否(relax 潜伏,R3+CP>1 暴露) |
+| 8.9 | R3 `is_vl_model` CP 对齐错位 diff 6× (Bug C) | `fill_routing_replay` 按 `tp*cp*2` 对齐(见 §8.9) | 否(§8.3 同源遗漏,R3+CP>1 暴露) |
 
 > 结论:8.1-8.5 中仅 **8.4** 真正源于本次 sglang/镜像升级栈(TE 2.14.1 需要更新的 FA3);8.5 是升级过程中**手动装 FA3** 的副作用而非升级本身;
 > 8.1/8.2 是 colocate 与减层冒烟的通用配置问题;8.3 是 dev 早已潜伏、被 CP=2 暴露的通用 bug。
-> **8.7** 是后续单独开 R3 冒烟(2026-07-03 晚)才发现的,**直接由本次升级的 router 依赖决策引入**(用官方 sgl-router 而非 slime 私有 fork)。
+> **8.7** 是后续单独开 R3 冒烟(2026-07-03 晚)才发现的,**直接由本次升级的 router 依赖决策引入**(用官方 sgl-router 而非 slime 私有 fork);修好后又串联暴露 **8.8/8.9**(均为 relax 侧潜伏、与升级无关,`R3 + CP>1` 才触发)。R3 在 CP>1 端到端跑通至此达成。
 
 ---
 
@@ -394,7 +396,22 @@ relax rollout 恰恰 POST 到 sgl-router(`sglang_rollout.py:251`,router 由 `dis
 - [#8791](https://github.com/sgl-project/sglang/issues/8791):router 只 merge **显式处理过**的 meta_info 字段(如 logprobs),其余丢弃。
 - [#9621](https://github.com/sgl-project/sglang/issues/9621):router **丢弃 extra 参数**,直连 worker 才生效。
 
-### 修复(待落地)
-把 `docker/Dockerfile` 的 sgl-router 换成 slime 私有 fork wheel `zhuzilin/sgl-router` v0.3.2-9daabcd(`0.3.2+slime`),或把其 `support r3` patch 移植到自建 router。**注意与 relax 现有依赖/镜像的兼容性需复核(§7.5)。** 尚未细究 router 是"请求进"还是"响应出"丢字段——换 fork 即可绕过,无需细分。
+### 修复(已落地)
+把 `docker/Dockerfile` 的 sgl-router 换成 slime 私有 fork wheel `zhuzilin/sgl-router` v0.3.2-9daabcd(`0.3.2+slime`)。**修好 A 后 routed_experts 流到训练侧,又串联暴露出 B、C 两个 relax 侧潜伏 bug(见 §8.8/§8.9)——R3 在 CP>1 端到端跑通实为"三连击"。** 尚未细究 router 是"请求进"还是"响应出"丢字段——换 fork 即可绕过,无需细分。
 
 > 复现脚本:`tools/repro_routed_experts/serve_and_probe.sh`(单机直连)、`serve_router_probe.sh`(引擎+router 对照)。
+
+---
+
+## 8.8 R3 Bug B:CP>1 下 routed_experts 广播缺 CP fan-out(2026-07-06)
+
+- **现象**:修好 A 后 CP2 实跑,训练侧 `stream_dataloader.py` `for i in range(len(routed_experts_offsets)-1)` 报 `TypeError: len() of a 0-d tensor`。
+- **根因**:`_broadcast_routed_experts` 只做 PP→TP 广播,假设 (TP0,PP0) 的所有 CP partner 都持有源数据;但 `should_fetch` 的 CP=0 guard 使只有 (TP0,PP0,CP0) 真正持有 → CP≠0 rank 收 0-d offsets。`GRPO + R3 + CP>1` 才触发,SFT 不碰。
+- **修复**:`stream_dataloader.py` `_broadcast_routed_experts` 重构为 CP→PP→TP 三段广播(补短路 `cp_trivial`)。**与 sglang 升级无关,是 relax 早已潜伏、被 R3+CP>1 暴露的通用 bug。** 详见 investigation doc §3.4。
+
+## 8.9 R3 Bug C:`is_vl_model` 下 `fill_routing_replay` CP 对齐用错(2026-07-06)
+
+- **现象**:修好 A、B 后 CP2 开 R3,`train_rollout_logprob_abs_diff` 从不开 R3 的 0.028 涨到 **0.17**(6×,所有训推一致性指标同步恶化);CP=1 开 R3 正常(0.012)。**非崩溃,静默数值错。**
+- **根因**:与 **§8.3 同源** —— Kimi-K2.6 是 VL 模型(`is_vl_model=True`,检测正确),CP>1+thd 走 bridge unsplit 路径,bridge 按**每样本 `tp*cp*2`** 对齐做 CP 切分。§8.3(commit `256b030`/`2edaade`)已把 `maybe_padded_total_lengths(is_vl_model)` 补进 loss/metric 侧 5 处,**却漏了 routing-replay 这第 6 处**:`fill_routing_replay` 仍用 `slice_with_cp` 的 `2*cp` 对齐 + 全局 `tp*dpm` pad → 每样本 chunk 边界与 bridge 不一致 → routed_experts 挂错 token、SP rank>0 整体平移。`_align_top_indices` 静默截断只遮丑。
+- **定位**:env `R3_DEBUG_ALIGN` 探针 —— 广播指纹探针未触发(证 §8.8 广播 OK),`_align_top_indices` firing 探针狂刷 `recorded=1152 vs scores=1064`。
+- **修复**:`actor.py` `fill_routing_replay` 按 `maybe_padded_total_lengths` 分支——VL 路径每样本 pad 到 `tp*cp*2`、去掉全局 pad(与 bridge 一致),非-VL 维持原逻辑。**与 sglang 升级无关。** 实跑验证 diff 0.17→**0.013**、`R3DBG-C`=0。详见 investigation doc §3.5;防复发建议(抽共享 CP 切分 helper)见 §3.6。
