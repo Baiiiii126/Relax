@@ -6,12 +6,21 @@ This module provides an async client to communicate with the GenRM service for
 generative reward model evaluations.
 """
 
+import asyncio
 from typing import Dict, List, Optional
 
 import httpx
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url
+
+
+# Retry policy for transient network failures against the GenRM service.
+# Judge calls are cheap (short generations) so a bounded retry with modest
+# backoff is safe. 5xx and transport-level errors are retried; 4xx is a
+# client bug and re-raised immediately.
+_GENRM_MAX_ATTEMPTS = 3
+_GENRM_INITIAL_BACKOFF_SEC = 0.5
 
 
 logger = get_logger(__name__)
@@ -74,18 +83,39 @@ class GenRMClient:
         if sampling_params is not None:
             payload["sampling_params"] = sampling_params
 
-        try:
-            resp = await self._async_client.post(url, json=payload)
-            resp.raise_for_status()
-            result = resp.json()
-            # Return the raw response string
-            return result.get("response", "")
-        except httpx.HTTPError as e:
-            logger.error(f"GenRM generate request failed: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in GenRM generate: {e}")
-            raise
+        backoff = _GENRM_INITIAL_BACKOFF_SEC
+        for attempt in range(1, _GENRM_MAX_ATTEMPTS + 1):
+            try:
+                resp = await self._async_client.post(url, json=payload)
+                resp.raise_for_status()
+                result = resp.json()
+                return result.get("response", "")
+            except httpx.HTTPStatusError as e:
+                # 4xx is a client bug — don't retry.
+                if e.response.status_code < 500:
+                    logger.error(f"GenRM generate 4xx (not retrying): {e}")
+                    raise
+                if attempt >= _GENRM_MAX_ATTEMPTS:
+                    logger.error(f"GenRM generate 5xx after {attempt} attempts: {e}")
+                    raise
+                logger.warning(
+                    f"GenRM generate 5xx attempt {attempt}/{_GENRM_MAX_ATTEMPTS}, retrying in {backoff:.2f}s: {e}"
+                )
+            except httpx.HTTPError as e:
+                # Transport-level errors (ReadError, ConnectError, timeouts, ...).
+                if attempt >= _GENRM_MAX_ATTEMPTS:
+                    logger.error(f"GenRM generate transport error after {attempt} attempts ({type(e).__name__}): {e}")
+                    raise
+                logger.warning(
+                    f"GenRM generate transport error attempt {attempt}/{_GENRM_MAX_ATTEMPTS} "
+                    f"({type(e).__name__}), retrying in {backoff:.2f}s: {e}"
+                )
+            except Exception as e:
+                logger.error(f"Unexpected error in GenRM generate: {e}")
+                raise
+
+            await asyncio.sleep(backoff)
+            backoff *= 2
 
     def health_check(self) -> Dict:
         """Check health status of GenRM service (sync, safe to call at init).

@@ -177,8 +177,17 @@ class GenRM(Base):
         # worker thread so it does not block this replica's event loop. Fast (Rust) tokenizers
         # release the GIL during encode, so concurrent requests tokenize in parallel instead of
         # serializing — without this a single replica throttles dispatch and starves the engines.
+        # Forward chat_template_kwargs from --genrm-sampling-config through to
+        # the jinja template — e.g. `{"enable_thinking": false}` for Qwen3+ to
+        # suppress the default <think> block. Keys unused by the template are
+        # silently dropped by transformers, so this is safe across model families.
+        chat_template_kwargs = self.config.genrm_sampling_config.get("chat_template_kwargs", {}) or {}
         input_ids = await asyncio.to_thread(
-            self.tokenizer.apply_chat_template, messages, tokenize=True, add_generation_prompt=True
+            self.tokenizer.apply_chat_template,
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
         )
 
         if not isinstance(input_ids, list):

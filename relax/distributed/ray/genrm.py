@@ -49,6 +49,10 @@ class GenRMManager:
         self.num_new_engines = init_genrm_engines(args, pg, self.all_genrm_engines, self._engine_addr_and_ports)
         self.nodes_per_engine = max(1, args.genrm_num_gpus_per_engine // args.num_gpus_per_node)
         self.genrm_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        # Track memory-occupation state so repeated onload/offload calls become
+        # safe no-ops. Engines start onloaded; the caller (placement_group.py)
+        # may immediately offload if offload_rollout is set.
+        self._onloaded = True
 
     @property
     def genrm_engines(self):
@@ -81,23 +85,34 @@ class GenRMManager:
                   Available tags: GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE,
                                  GPU_MEMORY_TYPE_CUDA_GRAPH
         """
+        if self._onloaded and tags is None:
+            logger.info("GenRM engines already onloaded; skipping")
+            return
         logger.info(f"GenRM engines onload started with tags={tags}")
         onload_handles = [
             engine.resume_memory_occupation.remote(tags=tags) for engine in self.genrm_engines if engine is not None
         ]
         if onload_handles:
             ray.get(onload_handles)
+        self._onloaded = True
         logger.info("GenRM engines onload completed")
 
     def offload(self):
         """Offload genRM model weights from GPU to free memory."""
+        if not self._onloaded:
+            logger.info("GenRM engines already offloaded; skipping")
+            return
         logger.info("GenRM engines offload started")
         offload_handles = [
             engine.release_memory_occupation.remote() for engine in self.genrm_engines if engine is not None
         ]
         if offload_handles:
             ray.get(offload_handles)
+        self._onloaded = False
         logger.info("GenRM engines offload completed")
+
+    def is_onloaded(self):
+        return self._onloaded
 
     def get_engine_hosts_ports(self):
         """Return a list of (host, port) tuples for each live genRM engine.

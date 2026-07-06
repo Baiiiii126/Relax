@@ -16,12 +16,18 @@ Both scripts in this example train **Qwen3-4B** with **GRPO** on the `dapo-math-
 
 ## Architecture
 
-In the recommended **colocate mode**, all GPUs are owned by the Actor (training). During the inference phase, the Actor offloads its weights and the GPUs are time-shared by Rollout and GenRM. Once inference is complete, GenRM and Rollout offload their weights back, and all GPUs are reclaimed for training. The GenRM GPUs are therefore not wasted — they directly accelerate training when not evaluating.
+Relax supports two top-level deployment modes for GenRM:
 
-Two colocate sub-modes are auto-detected from your GPU allocation:
+- **Colocate** (`--colocate`, recommended) — all roles (Actor / Rollout / GenRM) share one placement group. The Actor reclaims all GPUs during training, so GenRM GPUs are never wasted.
+- **Fully Async** (`--fully-async`) — each role has its own dedicated GPU pool. Rollout and training run fully in parallel; GenRM GPUs are dedicated and idle during training.
 
-- **Split mode** (`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`): Rollout and GenRM occupy disjoint GPU bundles. Best when both engines are small enough that giving each a dedicated slice is more efficient than sharing.
-- **Shared mode** (`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`): Rollout and GenRM occupy the **same** GPU bundles, splitting each GPU's memory via SGLang `mem_fraction_static`. Best when GenRM is large (e.g., 30B) and benefits from full-cluster TP, while still leaving room for Rollout. Requires no extra CLI flag — it activates automatically.
+Under `--colocate`, how Rollout and GenRM cohabit the shared bundles has three flavors — pick based on GenRM size and rollout length variance:
+
+| Sub-mode                    | Bundles                | Concurrency during inference     | Inline reward | Trigger                                                                                                        | Best for                                                                                       |
+| :-------------------------- | :--------------------- | :------------------------------- | :------------ | :------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------- |
+| **Split**                   | Disjoint bundles       | Parallel (dedicated slice each)  | ✅ per sample | Auto — `rollout_num_gpus + genrm_num_gpus == actor_total`                                                      | Small GenRM; long-tail rollout (agentic, high-variance response length)                        |
+| **Shared / Co-resident**    | Same bundles           | Parallel (mem_fraction split)    | ✅ per sample | Auto — `rollout_num_gpus == genrm_num_gpus == actor_total`                                                     | Medium GenRM that benefits from full-cluster TP but still fits alongside Rollout               |
+| **Shared / Defer-swap**     | Same bundles           | Serialized (sleep-wake sequence) | ❌ deferred   | Opt-in — Shared bundles + `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` | GenRM much larger than policy; short-response RLVR / math (no rollout tail to hide GenRM behind) |
 
 ```
                  8-GPU Colocate (Split)
@@ -42,7 +48,7 @@ Two colocate sub-modes are auto-detected from your GPU allocation:
  └─────────────────────────────────────────────────┘
 
 
-              8-GPU Colocate (Shared)
+         8-GPU Colocate (Shared / Co-resident)
 
  ┌──────────── Placement Group (8 GPU) ────────────┐
  │                                                 │
@@ -59,38 +65,80 @@ Two colocate sub-modes are auto-detected from your GPU allocation:
  │  │         Megatron Training               │    │
  │  └─────────────────────────────────────────┘    │
  └─────────────────────────────────────────────────┘
+
+
+        16-GPU Colocate (Shared / Defer-swap)
+
+ ┌──────────── Placement Group (16 GPU) ───────────┐
+ │                                                 │
+ │  Phase A — rollout (all 16 GPU):                │
+ │  ┌─────────────────────────────────────────┐    │
+ │  │  Rollout awake  (mem_fraction ≈ 0.85)   │    │
+ │  │  GenRM asleep   (release_memory_occ.)   │    │
+ │  │  --rm-type dummy  → inline reward = 0   │    │
+ │  └─────────────────────────────────────────┘    │
+ │                    │                            │
+ │        post_process_genrm_swap.py               │
+ │  offload rollout ─►│─► onload GenRM             │
+ │                    ▼                            │
+ │  Phase B — score (all 16 GPU):                  │
+ │  ┌─────────────────────────────────────────┐    │
+ │  │  Rollout asleep                         │    │
+ │  │  GenRM awake  (batch score every sample)│    │
+ │  └─────────────────────────────────────────┘    │
+ │                    │                            │
+ │              offload GenRM                      │
+ │                    ▼                            │
+ │  Phase C — train (all 16 GPU):                  │
+ │  ┌─────────────────────────────────────────┐    │
+ │  │        Actor  (Megatron Training)       │    │
+ │  │  GenRM stays offloaded via              │    │
+ │  │  --defer-reward-to-post-process         │    │
+ │  └─────────────────────────────────────────┘    │
+ └─────────────────────────────────────────────────┘
 ```
 
-All components live in the same placement group. Rollout generates candidate responses and sends them with the ground-truth label to GenRM over HTTP; GenRM returns a binary score (1 = consistent, 0 = inconsistent). After reward computation, inference weights are offloaded and all GPUs are reclaimed by the Actor for training.
+All three colocate sub-modes reclaim every GPU for the Actor during training. Rollout produces candidate responses and (for Split and Shared / Co-resident) sends each one over HTTP to GenRM inline. In Shared / Defer-swap the HTTP call is batched once per rollout step from a userland `custom_reward_post_process` function; see [`examples/generate_reward_model/README.md`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/README.md) for the split-vs-defer trade-off matrix.
 
 ## Scripts
 
-| Script                             | Mode                    | Description                                                                    |
-| :--------------------------------- | :---------------------- | :----------------------------------------------------------------------------- |
-| `run-qwen3-4B-8xgpu-colocated.sh` | Colocate (recommended)  | All 8 GPUs for training; rollout & GenRM time-share via offload                |
-| `run-qwen3-4B-8xgpu-async.sh`     | Fully Async             | Independent GPU pools per role; rollout & training fully overlapped             |
+| Script                                          | Colocate sub-mode          | Description                                                                    |
+| :---------------------------------------------- | :------------------------- | :----------------------------------------------------------------------------- |
+| `run-qwen3-4B-8xgpu-colocated.sh`               | Split (small GenRM)        | Qwen3-4B policy + small GenRM on 8 GPU; disjoint bundles, inline reward        |
+| `run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh` | Split (large GenRM)        | 35B-A3B policy + 397B FP8 GenRM on 16 GPU; 8+8 disjoint shards, inline reward  |
+| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap        | 35B-A3B policy + 397B FP8 GenRM on 16 GPU; shared bundles, two-phase sleep-wake swap, batched reward via [`post_process_genrm_swap.py`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) |
+| `run-qwen3-4B-8xgpu-async.sh`                   | (Fully Async)              | Independent GPU pools per role; rollout & training fully overlapped             |
 
 ### Resource Layout
 
-**Colocate / Split** (`--colocate`, recommended for small GenRM):
+Under `--colocate`, all three sub-modes reclaim every GPU for the Actor during training. They differ only in how Rollout / GenRM cohabit during the inference phase:
+
+**Split** (disjoint bundles):
 
 ```
-Actor (training):  8 GPU  (all GPUs participate in training)
-Rollout:           4 GPU  (bundles 0..3, time-shared with actor)
-GenRM:             4 GPU  (bundles 4..7, time-shared with actor)
+Actor:      8 GPU  (all)
+Rollout:    4 GPU  (bundles 0..3, mem_fraction default)
+GenRM:      4 GPU  (bundles 4..7, mem_fraction default)
 ```
 
-**Colocate / Shared** (`--colocate`, recommended for large GenRM):
+**Shared / Co-resident** (same bundles, both resident, mem_fraction split):
 
 ```
-Actor (training):  8 GPU  (all GPUs participate in training)
-Rollout:           8 GPU  (bundles 0..7, mem_fraction_static = 0.6)
-GenRM:             8 GPU  (bundles 0..7, mem_fraction_static = 0.3)
+Actor:      8 GPU  (all)
+Rollout:    8 GPU  (bundles 0..7, mem_fraction_static = 0.6)
+GenRM:      8 GPU  (bundles 0..7, mem_fraction_static = 0.3)
+                    └── sum ≤ 0.9; remainder for cuda / activations
 ```
 
-In both colocate sub-modes, GenRM GPUs are offloaded back to the Actor for gradient computation during training, giving training full 8-GPU parallelism. Shared mode additionally lets GenRM use a larger TP (e.g., TP=8 for a 30B model) without giving up Rollout throughput.
+**Shared / Defer-swap** (same bundles, sequenced):
 
-**Async mode** (`--fully-async`):
+```
+Actor:     16 GPU  (all)
+Rollout:   16 GPU  (bundles 0..15, mem_fraction_static ≈ 0.85; asleep during scoring)
+GenRM:     16 GPU  (bundles 0..15, mem_fraction_static ≈ 0.85; asleep during rollout / train)
+```
+
+**Async mode** (`--fully-async`, dedicated pools):
 
 ```
 Actor (training):  2 GPU  (dedicated)
@@ -212,17 +260,19 @@ python3 relax/entrypoints/train.py \
 ```
 
 ::: tip Auto-detected colocate sub-mode
-On `--colocate` with GenRM, the GPU layout determines the sub-mode automatically:
+On `--colocate` with GenRM, the GPU layout picks Split vs Shared automatically:
 
 | Allocation                                           | Sub-mode                            |
 | :--------------------------------------------------- | :---------------------------------- |
-| `rollout_num_gpus + genrm_num_gpus == actor_total`   | **Split** (rollout and genrm on disjoint bundles) |
-| `rollout_num_gpus == genrm_num_gpus == actor_total`  | **Shared** (rollout and genrm on the same bundles) |
+| `rollout_num_gpus + genrm_num_gpus == actor_total`   | **Split** (disjoint bundles) |
+| `rollout_num_gpus == genrm_num_gpus == actor_total`  | **Shared** (same bundles) |
 | Anything else                                        | Rejected at startup with a clear error |
+
+Within Shared, the default is **Co-resident** (both engines held via `mem_fraction_static` split). Adding `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` switches it to **Defer-swap** — sequenced sleep-wake, one engine holds full memory at a time. See the [example README](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/README.md) for when to prefer defer-swap.
 :::
 
-::: warning Set `mem_fraction_static` in shared mode
-In shared mode the two SGLang engines live on the same GPUs. You **must** size their `mem_fraction_static` so that the sum is < 1.0 (≤ 0.9 recommended; the rest covers cuda graphs and activations). Rollout reads `--sglang-mem-fraction-static` (or YAML overrides via `--sglang-config`); GenRM reads `mem_fraction_static` inside `--genrm-engine-config`.
+::: warning Set `mem_fraction_static` in Shared / Co-resident
+In Shared / Co-resident mode the two SGLang engines live on the same GPUs concurrently. You **must** size their `mem_fraction_static` so that the sum is < 1.0 (≤ 0.9 recommended; the rest covers cuda graphs and activations). Rollout reads `--sglang-mem-fraction-static` (or YAML overrides via `--sglang-config`); GenRM reads `mem_fraction_static` inside `--genrm-engine-config`. Shared / Defer-swap does not need the split — each engine can take ≈ 0.85 alone since they are never resident together.
 :::
 
 **Fully-Async mode**:
@@ -411,9 +461,12 @@ The DAPO-GenRM reward function uses strict equality to parse responses — only 
 
 ```
 examples/generate_reward_model/
-├── README.md                            # Example overview
-├── run-qwen3-4B-8xgpu-colocated.sh     # Colocate mode launch script
-└── run-qwen3-4B-8xgpu-async.sh         # Fully async mode launch script
+├── README.md                                              # Example overview + split-vs-defer decision guide
+├── post_process_genrm_swap.py                             # Custom hook used by the defer script (sleep-wake swap + batch score)
+├── run-qwen3-4B-8xgpu-colocated.sh                        # 4B colocate mode
+├── run-qwen3-4B-8xgpu-async.sh                            # 4B fully async mode
+├── run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh          # 35B + 397B, split-bundle inline reward
+└── run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh          # 35B + 397B, shared-bundle two-phase swap
 ```
 
 ## Further Reading

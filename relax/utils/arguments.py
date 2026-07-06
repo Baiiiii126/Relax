@@ -2003,6 +2003,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--defer-reward-to-post-process",
+                action="store_true",
+                default=False,
+                help=(
+                    "When set, actor.update_weights will NOT re-onload GenRM at the end of "
+                    "weight sync. Use this with --rm-type dummy + --custom-reward-post-process-path "
+                    "when the post-process function manages GenRM sleep/wake itself (shared-bundles "
+                    "colocate: rollout owns all GPUs during generate, GenRM owns them during scoring)."
+                ),
+            )
+            parser.add_argument(
                 "--custom-convert-samples-to-train-data-path",
                 type=str,
                 default=None,

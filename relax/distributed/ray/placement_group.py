@@ -154,7 +154,12 @@ def create_genrm_manager(args, pg, runtime_env=None):
     """
     from .genrm import GenRMManager
 
+    # `name` (with no explicit namespace) lets user code inside other actors of
+    # the same Ray job look this up via ray.get_actor("relax_genrm_manager").
+    # Used by custom_reward_post_process_path when GenRM lifecycle is managed
+    # from userland.
     genrm_manager = GenRMManager.options(
+        name="relax_genrm_manager",
         num_cpus=1,
         num_gpus=0,
         runtime_env=runtime_env,

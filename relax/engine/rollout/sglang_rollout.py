@@ -723,7 +723,7 @@ async def generate_rollout_async(
 
     data = []
     do_print = True
-    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
     transfer_tasks = []
     batch_to_transfer = []
     aborted_samples = []
