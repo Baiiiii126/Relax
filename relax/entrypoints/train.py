@@ -20,6 +20,7 @@ try_import_telemetry_hook()
 from relax.core.controller import Controller  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
 
@@ -97,6 +98,11 @@ def main(args):
             )
         except RuntimeError:
             pass
+
+    # init_tracking must run after serve.start() (metrics adapter probes Ray
+    # Serve for the /metrics endpoint) and before Controller() (wandb primary
+    # writes wandb_run_id into args, which then propagates to remote actors).
+    init_tracking(args)
 
     ctrl = Controller(args, runtime_env)
     _ctrl = ctrl
