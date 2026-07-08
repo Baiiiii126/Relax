@@ -10,13 +10,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from megatron.core import mpu
 from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
+from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import timer
 
 
@@ -902,10 +902,9 @@ def post_process_rollout_data(args, rollout_data):
         "log_probs",
         "ref_log_probs",
         "rollout_log_probs",
-        "teacher_log_probs",
         "advantages",
         "returns",
-        "opd_reverse_kl",
+        *iter_opd_cp_float_fields(),
     ]:
         if key not in rollout_data:
             continue
@@ -932,44 +931,10 @@ def post_process_rollout_data(args, rollout_data):
             )
         ]
 
-    if "teacher_topk_token_ids" in rollout_data:
-        teacher_topk_k = rollout_data.get("teacher_topk_k", None)
-        if isinstance(teacher_topk_k, torch.Tensor):
-            teacher_topk_k = teacher_topk_k.tolist()
+    if args.use_opd:
+        from relax.utils.opd.opd_main_worker import restore_opd_topk_rollout_fields
 
-        topk_tensors = []
-        for i, (flat_topk_ids, total_length, response_length) in enumerate(
-            zip(
-                rollout_data["teacher_topk_token_ids"],
-                rollout_data["total_lengths"],
-                rollout_data["response_lengths"],
-                strict=False,
-            )
-        ):
-            k = int(teacher_topk_k[i]) if teacher_topk_k is not None else 0
-            if k <= 0:
-                topk_tensors.append(torch.empty((response_length, 0), dtype=torch.long, device=cuda_dev))
-                continue
-
-            topk_tensor = torch.tensor(flat_topk_ids, dtype=torch.long, device=cuda_dev)
-            expected = response_length * k
-            if topk_tensor.numel() < expected:
-                topk_tensor = F.pad(topk_tensor, (0, expected - topk_tensor.numel()), value=-1)
-            elif topk_tensor.numel() > expected:
-                topk_tensor = topk_tensor[:expected]
-
-            topk_tensor = topk_tensor.reshape(response_length, k)
-            topk_tensor = slice_log_prob_with_cp(
-                topk_tensor,
-                total_length,
-                response_length,
-                args.qkv_format,
-                rollout_data["max_seq_lens"][i] if args.qkv_format == "bshd" else None,
-                padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
-            )
-            topk_tensors.append(topk_tensor)
-
-        rollout_data["teacher_topk_token_ids"] = topk_tensors
+        restore_opd_topk_rollout_fields(rollout_data, args, cuda_dev)
 
     if "rollout_routed_experts" in rollout_data:
         from tensordict.tensorclass import NonTensorData

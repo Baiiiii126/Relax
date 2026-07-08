@@ -474,6 +474,15 @@ class EngineGroup:
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                    # OPD per-position token_ids logprob patch: default off, enabled
+                    # via env (affects the student engine too, like the teacher).
+                    "RELAX_OPD_PER_POS_TOKEN_IDS": "0",
+                    # OPD pre-expanded multimodal patch: passed through to the
+                    # student engine too, because advantage mode sends
+                    # opd_preexpanded_raw requests to the student (student-at-
+                    # teacher-topk prefill).  The patch makes the student SGLang
+                    # skip retokenize/detokenize for expanded input_ids + image_data.
+                    "RELAX_OPD_PREEXPANDED_PATCH": "0",
                     # The TP memory-imbalance check is overly conservative under
                     # colocate (the actor occupies GPUs at engine init and is
                     # offloaded before rollout), so disable it. Recent SGLang reads
