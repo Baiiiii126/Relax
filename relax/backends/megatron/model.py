@@ -318,6 +318,32 @@ def disable_forward_pre_hook(model_chunks: Sequence[DDP], param_sync: bool = Tru
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
+def _unwrap_module(module: torch.nn.Module) -> torch.nn.Module:
+    """Unwrap common DDP/precision wrappers to inspect model-local flags."""
+    seen: set[int] = set()
+    while hasattr(module, "module") and id(module) not in seen:
+        seen.add(id(module))
+        module = module.module
+    return module
+
+
+def has_conditional_branch_sync(model_chunks: Sequence[DDP]) -> bool:
+    """Return whether any model chunk installed a conditional branch sync
+    adapter."""
+    return any(
+        getattr(_unwrap_module(model_chunk), "_relax_conditional_branch_sync_installed", False)
+        for model_chunk in model_chunks
+    )
+
+
+def force_param_sync(model_chunks: Sequence[DDP]) -> None:
+    """Synchronize distributed-optimizer parameters without changing hook
+    state."""
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.start_param_sync(force_sync=True)
+
+
 @torch.no_grad()
 def forward_only(
     f: Callable[..., dict[str, list[torch.Tensor]]],
@@ -831,6 +857,8 @@ def train(
     config.finalize_model_grads_func = finalize_model_grads
 
     pre_hook_enabled = False
+    param_sync_func = None
+    keep_forward_pre_hook_disabled = False
     if args.reset_optimizer_states:
         if (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -870,6 +898,12 @@ def train(
         param_sync_func = config.param_sync_func
         config.param_sync_func = None
         pre_hook_enabled = False
+        keep_forward_pre_hook_disabled = has_conditional_branch_sync(model)
+        if keep_forward_pre_hook_disabled:
+            logger.info(
+                "Keeping forward pre-hook disabled for all training sub-steps because "
+                "conditional multimodal branch sync is installed."
+            )
 
     num_steps_per_rollout = len(num_microbatches)
     use_step_iterators = (
@@ -896,12 +930,14 @@ def train(
                 opt_param_scheduler,
                 num_microbatches[step_id],
             )
+        if keep_forward_pre_hook_disabled:
+            force_param_sync(model)
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
             # forward passes will use the forward pre-hook / `param_sync_func` in
             # `forward_backward_func`.
-            if should_disable_forward_pre_hook(args):
+            if should_disable_forward_pre_hook(args) and not keep_forward_pre_hook_disabled:
                 enable_forward_pre_hook(model)
                 config.param_sync_func = param_sync_func
                 pre_hook_enabled = True
@@ -992,6 +1028,11 @@ def train(
         # to rollout engines. this is important for --overlap-grad-reduce --overlap-param-gather
         disable_forward_pre_hook(model, param_sync=True)
         enable_forward_pre_hook(model)
+    elif keep_forward_pre_hook_disabled:
+        # Forward pre-hooks stayed disabled for the whole rollout to preserve a stable
+        # branch/parameter-gather order. Per-step sync above has made weights current.
+        enable_forward_pre_hook(model)
+        config.param_sync_func = param_sync_func
 
 
 def save(

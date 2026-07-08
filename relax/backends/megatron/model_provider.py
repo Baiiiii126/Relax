@@ -27,6 +27,8 @@ from relax.utils.device import is_npu_available
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 
+from .conditional_branch_sync import install_conditional_branch_sync
+
 
 logger = get_logger(__name__)
 
@@ -231,6 +233,7 @@ def get_model_provider_func(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
                 )
             _maybe_mark_unsplit_forward(args, model)
+            install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
             return model
 
@@ -352,6 +355,7 @@ def get_model_provider_func(
         def provide_with_cp_probe(*p_args, **p_kwargs):
             model = original_provide(*p_args, **p_kwargs)
             _maybe_mark_unsplit_forward(args, model)
+            install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
             return model
 
@@ -463,6 +467,7 @@ def get_model_provider_func(
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
         _maybe_mark_unsplit_forward(args, model)
+        install_conditional_branch_sync(args, model)
         _install_cp_probe(model)
         return model
 
