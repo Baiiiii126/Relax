@@ -21,6 +21,7 @@ from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step
+from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.flops_counter import FlopsCounter
@@ -805,43 +806,6 @@ def log_rollout_data(
             rollout_data.get("multimodal_train_inputs") is not None or getattr(args, "uses_unsplit_forward", False),
         )
 
-        # OPD dynamic metric: overlap ratio on top-k token sets.
-        student_topk_ids = rollout_data.get("topk_token_ids", None)
-        teacher_topk_ids = rollout_data.get("teacher_topk_token_ids", None)
-        if isinstance(student_topk_ids, list) and isinstance(teacher_topk_ids, list):
-            assert len(student_topk_ids) == len(teacher_topk_ids)
-
-            overlap_ratio_per_sample = []
-            for s_ids, t_ids in zip(student_topk_ids, teacher_topk_ids, strict=False):
-                if not isinstance(s_ids, torch.Tensor) or not isinstance(t_ids, torch.Tensor):
-                    continue
-                if s_ids.ndim < 2 or t_ids.ndim < 2:
-                    continue
-                k = min(int(s_ids.size(-1)), int(t_ids.size(-1)))
-                if k <= 0:
-                    continue
-                s_ids = s_ids[:, :k].long()
-                t_ids = t_ids[:, :k].long()
-                overlap_matrix = s_ids.unsqueeze(-1).eq(t_ids.unsqueeze(-2))
-                overlap_ratio = overlap_matrix.any(dim=-1).float().sum(dim=-1) / float(k)
-                overlap_ratio_per_sample.append(overlap_ratio)
-
-            if overlap_ratio_per_sample:
-                loss_masks_t = loss_masks
-                total_lengths_i = total_lengths
-                response_lengths_i = response_lengths
-                overlap_ratio_flat = torch.cat(overlap_ratio_per_sample).clone().detach().to(loss_masks_t[0].device)
-                sum_of_sample_mean = get_sum_of_sample_mean(
-                    total_lengths_i,
-                    response_lengths_i,
-                    loss_masks_t,
-                    qkv_format=args.qkv_format,
-                    max_seq_lens=max_seq_lens,
-                    padded_total_lengths=padded_total_lengths,
-                )
-                overlap_ratio_value = cp_size * sum_of_sample_mean(overlap_ratio_flat) / len(loss_masks_t)
-                log_dict["opd_overlap_ratio"] = overlap_ratio_value.item()
-
         for key, val in rollout_data.items():
             if key in [
                 "tokens",
@@ -851,11 +815,6 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
-                "topk_token_ids",
-                "topk_log_probs",
-                "teacher_topk_token_ids",
-                "teacher_topk_log_probs",
-                "teacher_topk_k",
                 "packed_seq_params",
                 "vlm_packed_seq_params",
                 "__loss_scale__",
@@ -864,6 +823,8 @@ def log_rollout_data(
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,
             ]:
                 continue
+            if args.use_opd and key in OPD_ROLLOUT_LOG_SKIP_FIELDS:
+                continue
             # Upload per sample mean for each rollout value
             # There are the following assumptions:
             # - Each dp rank has the same number of samples
@@ -871,7 +832,7 @@ def log_rollout_data(
                 if isinstance(val[0], torch.Tensor):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
-                    if key in [
+                    use_sample_mean = key in [
                         "log_probs",
                         "ref_log_probs",
                         "rollout_log_probs",
@@ -879,8 +840,9 @@ def log_rollout_data(
                         "advantages",
                         "values",
                         "teacher_log_probs",
-                        "opd_reverse_kl",
-                    ]:
+                        "opd_kl_term",
+                    ]
+                    if use_sample_mean:
                         val = torch.cat(val).clone().detach()
                         val = val.to(loss_masks[0].device)
                         sum_of_sample_mean = get_sum_of_sample_mean(

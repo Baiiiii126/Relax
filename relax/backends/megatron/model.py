@@ -30,6 +30,7 @@ from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory
+from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.timer import timer
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -599,6 +600,9 @@ def train_one_step(
         sft_chunked = _should_use_sft_chunked(args)
         # Get the batch.
         with timer(f"get_data_batch_{uuid.uuid4().hex[:8]}", keep=False):
+            _opd_keys: list[str] = []
+            if args.use_opd:
+                consume_opd_train_data(_opd_keys, args)
             batch = get_batch(
                 data_iterator,
                 [
@@ -615,7 +619,7 @@ def train_one_step(
                     "returns",
                     "rollout_log_probs",
                     "max_seq_lens",
-                    "teacher_log_probs",
+                    *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
                 args.qkv_format,
@@ -976,7 +980,10 @@ def train(
                 f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
                 for key, val in loss_dict.items()
             }
-            log_dict[f"train/{role_tag}grad_norm"] = grad_norm
+
+            log_dict[f"train/{role_tag}grad_norm"] = (
+                grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            )
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
 
