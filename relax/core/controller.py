@@ -817,7 +817,28 @@ class Controller:
         shutdown_async_loop()
         logger.info("[Global Restart] Async event loop stopped")
 
-        # --- 1.9 Shutdown Ray Serve and Ray to kill all processes ---
+        # --- 1.9 Terminate router processes and reset cached endpoint ---
+        # The router runs as a daemon subprocess of this main process, so it
+        # survives ray.shutdown().  If we don't kill it, the pre-restart engine
+        # URLs stay in its worker list forever (endless "Connection refused"
+        # health WARNs on dead ports), and post-restart `_start_router` also
+        # short-circuits because `sglang_router_ip`/`_port` were written back
+        # to the config on first launch.
+        try:
+            from relax.distributed.ray.rollout import stop_launched_routers
+
+            killed = stop_launched_routers()
+            # Only clear cached endpoint if we actually owned & killed a router.
+            # An externally-provided router (--sglang-router-ip) was never in
+            # our launched list, so we leave the endpoint set to reuse it.
+            if killed > 0:
+                self.config.sglang_router_ip = None
+                self.config.sglang_router_port = None
+                logger.info(f"[Global Restart] Terminated {killed} router process(es), endpoint reset")
+        except Exception as e:
+            logger.warning(f"[Global Restart] Failed to terminate router: {e}")
+
+        # --- 1.10 Shutdown Ray Serve and Ray to kill all processes ---
         try:
             serve.shutdown()
             logger.info("[Global Restart] Ray Serve shutdown completed")
@@ -842,7 +863,7 @@ class Controller:
         time.sleep(5)
         logger.info("[Global Restart] Waited 5s for resource release")
 
-        # --- 1.10 Re-initialize Ray and Ray Serve (same as train.py) ---
+        # --- 1.11 Re-initialize Ray and Ray Serve (same as train.py) ---
         ray.init(runtime_env=runtime_env)
         logger.info("[Global Restart] Ray re-initialized")
         try:

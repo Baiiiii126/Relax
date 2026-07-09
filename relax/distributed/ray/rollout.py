@@ -3660,9 +3660,47 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     process.start()
     time.sleep(3)
     assert process.is_alive()
+    _LAUNCHED_ROUTER_PROCESSES.append(process)
     logger.info(f"Router launched locally at {bind_ip}:{router_port} (connection address: {router_ip})")
 
     return router_ip, router_port
+
+
+# Router processes launched via `_start_router`. Retained so
+# `Controller._global_restart` can terminate them before re-initializing —
+# otherwise the daemon router survives with stale pre-restart engine URLs and
+# spams "Connection refused" health-check WARNs against dead ports forever.
+_LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
+
+
+def stop_launched_routers() -> int:
+    """Terminate every router process launched in this Controller lifetime.
+
+    Returns the number of processes that were alive and successfully killed —
+    callers use this to decide whether to reset cached router endpoint state.
+    """
+    global _LAUNCHED_ROUTER_PROCESSES
+    killed = 0
+    survivors: list[multiprocessing.Process] = []
+    for proc in _LAUNCHED_ROUTER_PROCESSES:
+        try:
+            if not proc.is_alive():
+                continue
+            logger.info(f"Terminating router process pid={proc.pid}")
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2)
+            if proc.is_alive():
+                logger.warning(f"Router pid={proc.pid} still alive after kill; leaking")
+                survivors.append(proc)
+            else:
+                killed += 1
+        except Exception as e:
+            logger.warning(f"Failed to terminate router pid={getattr(proc, 'pid', None)}: {e}")
+    _LAUNCHED_ROUTER_PROCESSES = survivors
+    return killed
 
 
 def _wait_engine_init_with_progress(
