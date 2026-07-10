@@ -282,7 +282,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--warm-hf-checkpoint-page-cache",
                 action="store_true",
                 default=False,
-                help="Pre-read HF checkpoint files into OS page cache before bridge loading to speed up NFS-backed mmap.",
+                help=(
+                    "Pre-read HF checkpoint files into OS page cache before mmap-based loading, "
+                    "to speed up NFS-backed reads. Applies uniformly to the main model (bridge), "
+                    "and to genrm / teacher SGLang engines. Coordinated per node per checkpoint path, "
+                    "so each unique checkpoint is streamed at most once per node."
+                ),
             )
             parser.add_argument(
                 "--custom-model-provider-path",

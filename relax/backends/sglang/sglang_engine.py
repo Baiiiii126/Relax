@@ -458,6 +458,15 @@ class SGLangEngine(RayActor):
                 os.environ["SGLANG_EXTERNAL_MM_MODEL_ARCH"] = arch
             logger.info(f"Set SGLANG_EXTERNAL_MODEL_PACKAGE={external_pkg}, SGLANG_EXTERNAL_MM_MODEL_ARCH={arch}")
 
+        # Warm the OS page cache for this engine's HF checkpoint before the SGLang
+        # subprocess mmaps the safetensors. Applies uniformly to rollout / genrm /
+        # teacher because they all take this path; the shared marker keyed by
+        # abs_path collapses repeated calls on the same node to a single read.
+        if getattr(self.args, "warm_hf_checkpoint_page_cache", False):
+            from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
+
+            warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
+
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         bootstrap_port = (
