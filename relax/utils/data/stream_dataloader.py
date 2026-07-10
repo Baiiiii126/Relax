@@ -908,6 +908,18 @@ def post_process_rollout_data(args, rollout_data):
     ]:
         if key not in rollout_data:
             continue
+        # Dynamic CP: keep per-sample log-prob fields FULL-length at ingestion.
+        # Each micro-batch picks its own CP size at train time and get_batch
+        # re-slices these fields per-mb (data.py dynamic-CP reslice); log_rollout_data
+        # / compute_advantages consume them as full (cp_size=1). Slicing here with the
+        # static max-CP zig-zag would leave rollout_log_probs (never recomputed) mis-
+        # sharded — log_probs/ref_log_probs happen to be overwritten by the merged
+        # forward, but rollout_log_probs is not, so it would reach logging CP-split.
+        if getattr(args, "dynamic_context_parallel", False):
+            rollout_data[key] = [
+                torch.as_tensor(log_prob, device=cuda_dev, dtype=torch.float32) for log_prob in rollout_data[key]
+            ]
+            continue
         rollout_data[key] = [
             torch.as_tensor(
                 slice_log_prob_with_cp(

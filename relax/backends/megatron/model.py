@@ -268,6 +268,11 @@ def setup_model_and_optimizer(
         if active_replays:
             RoutingReplay.all_routing_replays = active_replays
 
+    if getattr(args, "dynamic_context_parallel", False):
+        # Global, idempotent GatedDeltaNet patch — apply for every Megatron model built
+        # under dynamic CP (incl. weight-only roles that still run forward).
+        _patch_gdn_for_dynamic_cp()
+
     if args.only_load_weight:
         return model, None, None
     # Optimizer
@@ -294,6 +299,46 @@ def setup_model_and_optimizer(
     )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
+
+
+def _patch_gdn_for_dynamic_cp() -> None:
+    """Monkey-patch GatedDeltaNet.forward to support dynamic CP.
+
+    GatedDeltaNet (linear attention) reads its CP degree from ``self.cp_size``
+    / ``self.pg_collection.cp``, which are fixed to the static CP group at
+    build time. Under dynamic CP each micro-batch carries its own CP size/group
+    on ``packed_seq_params`` (set in get_batch); swap them in for the forward
+    and restore afterwards. Idempotent and avoids editing upstream Megatron
+    source.
+    """
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return
+
+    if getattr(GatedDeltaNet, "_dcp_patched", False):
+        return
+
+    _orig_forward = GatedDeltaNet.forward
+
+    def _dcp_gdn_forward(
+        self, hidden_states, attention_mask, inference_context=None, packed_seq_params=None, *args, **kwargs
+    ):
+        _orig_cp_size = self.cp_size
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and getattr(packed_seq_params, "local_cp_size", None) is not None:
+            self.cp_size = packed_seq_params.local_cp_size
+            self.pg_collection.cp = packed_seq_params.cp_group
+        try:
+            return _orig_forward(
+                self, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
+            )
+        finally:
+            self.cp_size = _orig_cp_size
+            self.pg_collection.cp = _orig_cp_group
+
+    GatedDeltaNet.forward = _dcp_gdn_forward
+    GatedDeltaNet._dcp_patched = True
 
 
 def enable_forward_pre_hook(model_chunks: Sequence[DDP]) -> None:
@@ -451,6 +496,21 @@ def forward_only(
             forward_attention_mask = None
             forward_loss_mask = batch["full_loss_masks"]
 
+        # Dynamic CP: the VL bridge (Qwen3VLModel.forward) reads pg_collection.cp
+        # directly, so point it at this mb's dynamic CP sub-group for the forward and
+        # restore afterwards. Swap every mb (incl. cp==1 -> size-1 group): new's base
+        # pg is the static max_cp group, so cp==1 mbs must be switched down too, else
+        # the bridge would CP-split cp==1 data by max_cp. (TE / GDN read cp from
+        # packed_seq_params.)
+        _orig_cp_group = None
+        dynamic_cp_size = batch.get("dynamic_cp_size")
+        if dynamic_cp_size is not None and needs_unsplit:
+            inner = model
+            while hasattr(inner, "module"):
+                inner = inner.module
+            _orig_cp_group = inner.pg_collection.cp
+            inner.pg_collection.cp = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
+
         forward_kwargs = {
             "input_ids": forward_input_ids,
             "position_ids": None,
@@ -462,7 +522,10 @@ def forward_only(
         }
         output_tensor = model(**forward_kwargs)
 
-        return output_tensor, partial(
+        if _orig_cp_group is not None:
+            inner.pg_collection.cp = _orig_cp_group
+
+        f_partial = partial(
             f,
             args=args,
             unconcat_tokens=unconcat_tokens,
@@ -472,7 +535,31 @@ def forward_only(
             max_seq_lens=batch.get("max_seq_lens", None),
             padded_total_lengths=batch.get("padded_total_lengths", None),
             loss_masks=batch.get("loss_masks", None),
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
+
+        if getattr(args, "dynamic_context_parallel", False):
+            # Carry per-mb dynamic-CP metadata on the result so
+            # dynamic_cp_merge_output can reconstruct the full mb (CP
+            # all-gather + cross-sub-group gather + reorder) before the write-back.
+            dcp_meta = {
+                "dynamic_cp_size": batch["dynamic_cp_size"],
+                "dynamic_cp_rank": batch["dynamic_cp_rank"],
+                "total_lengths": total_lengths,
+                "response_lengths": response_lengths,
+                "padded_total_lengths": batch.get("padded_total_lengths"),
+                "partition_order": batch.get("_dcp_partition_order"),
+            }
+
+            def _inject_meta(logits, *, _orig=f_partial, _meta=dcp_meta):
+                empty, res = _orig(logits)
+                res["_dcp_meta"] = _meta
+                return empty, res
+
+            return output_tensor, _inject_meta
+
+        return output_tensor, f_partial
 
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
@@ -507,6 +594,18 @@ def forward_only(
     rollout_data = {}
     # Store the results on the last stage
     if mpu.is_pipeline_last_stage():
+        if getattr(args, "dynamic_context_parallel", False):
+            # Reconstruct each mb's full sample set (CP all-gather + cross-sub-group
+            # gather + reorder) so the per-sample outputs line up with the full
+            # micro_batch_indices used by the write-back below.
+            from .cp_utils import dynamic_cp_merge_output
+
+            forward_data_store = dynamic_cp_merge_output(
+                forward_data_store,
+                static_cp_size=mpu.get_context_parallel_world_size(),
+                static_cp_rank=mpu.get_context_parallel_rank(),
+            )
+
         keys = forward_data_store[0].keys()
         for key in keys:
             values = []
@@ -682,6 +781,17 @@ def train_one_step(
             if is_vl_model and mm_inputs:
                 forward_kwargs.update(mm_inputs)
 
+            # Dynamic CP: point pg_collection.cp at this mb's dynamic CP sub-group for
+            # the VL bridge forward. Set every mb (incl. size 1) to avoid a stale group
+            # leaking from a previous mb; restored once after forward_backward (below).
+            # GDN / TE read cp from packed_seq_params, so 1F1B interleaving stays correct.
+            dynamic_cp_size = batch.get("dynamic_cp_size")
+            if dynamic_cp_size is not None and needs_unsplit:
+                inner = model
+                while hasattr(inner, "module"):
+                    inner = inner.module
+                inner.pg_collection.cp = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
+
             # SFT: defer lm_head into the loss (sft_loss_function_chunked)
             # so the full [B, S, V/TP] fp32 logits tensor never materializes.
             if sft_chunked:
@@ -698,6 +808,15 @@ def train_one_step(
         # routes to sft_loss_function_chunked when both --sft-chunked-logits
         # and lm_head_forward are set.
         return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
+
+    # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);
+    # save the original static CP group here and restore after forward+backward.
+    _dcp_orig_cp_group = None
+    if getattr(args, "dynamic_context_parallel", False):
+        inner = model[0]
+        while hasattr(inner, "module"):
+            inner = inner.module
+        _dcp_orig_cp_group = inner.pg_collection.cp
 
     # Forward pass.
     use_streaming = (
@@ -732,6 +851,9 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+
+    if _dcp_orig_cp_group is not None:
+        inner.pg_collection.cp = _dcp_orig_cp_group
 
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
@@ -794,7 +916,12 @@ def train_one_step(
         values = values.tolist()
         num_samples_or_tokens = values[0]
         for key, value in zip(keys, values[1:], strict=False):
-            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+            # No cp_size factor: num_samples_or_tokens is the all-reduced CP-local
+            # token count (per-token) or sample count, so each token/sample is
+            # already counted once. A `* cp_size` here would over-weight metrics by
+            # CP degree under dynamic CP (and is a no-op under static CP, where the
+            # count previously carried the cancelling cp factor).
+            loss_reduced[key] = value / num_samples_or_tokens
         return loss_reduced, grad_norm
     return {}, grad_norm
 

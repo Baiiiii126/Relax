@@ -36,6 +36,7 @@ from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
     all_gather_with_cp,
+    get_cp_local_num_tokens,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
     maybe_padded_total_lengths,
@@ -52,6 +53,8 @@ def get_responses(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -93,7 +96,7 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     end = 0
     seq_start = 0
     for i, (tokens, total_length, response_length) in enumerate(
@@ -143,7 +146,13 @@ def get_responses(
         else:
             # TODO: this is super ugly... do better abstraction.
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length, qkv_format, max_seq_len, padded_total_length
+                total_length,
+                response_length,
+                qkv_format,
+                max_seq_len,
+                padded_total_length,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
             )
 
             logits_0, logits_1 = logits[end : end + chunk_size], logits[end + chunk_size : end + 2 * chunk_size]
@@ -282,6 +291,8 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
     **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
@@ -361,6 +372,8 @@ def get_log_probs_and_entropy(
             response_lengths=response_lengths,
             max_seq_lens=max_seq_lens,
             padded_total_lengths=padded_total_lengths,
+            dynamic_cp_size=dynamic_cp_size,
+            dynamic_cp_rank=dynamic_cp_rank,
         )
     ):
         if lm_head_forward is not None:
@@ -612,7 +625,11 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
     if args.normalize_advantages:
         all_advs = torch.cat(advantages)
-        cp_size = mpu.get_context_parallel_world_size()
+        # Under dynamic CP, rollout_data was merged back to full-length responses
+        # (dynamic_cp_merge_output), so advantages/masks are already full — use cp=1
+        # (no zig-zag chunking). The whitening stats are unchanged by the CP-group
+        # replication (uniform duplication doesn't move mean/std).
+        cp_size = 1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size()
         if cp_size == 1:
             all_masks = torch.cat(loss_masks)
         else:
@@ -789,6 +806,8 @@ def policy_loss_function(
         gather_topk_token_ids=resolve_opd_gather_topk_token_ids(args, batch),
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -810,14 +829,40 @@ def policy_loss_function(
             padded_iter = [None] * len(log_probs)
         else:
             padded_iter = padded_total_lengths
+        # OPSM supports CP: reconstruct each sample's full response from its CP-local
+        # zig-zag shards. Under dynamic CP, gather over this mb's dynamic CP sub-group
+        # (size/rank/group), not the static CP group. (GSPO does not support CP.)
+        dynamic_cp_size = batch.get("dynamic_cp_size", None)
+        dynamic_cp_rank = batch.get("dynamic_cp_rank", None)
+        dynamic_cp_group = (
+            mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
+            if dynamic_cp_size is not None
+            else None
+        )
         full_log_probs = [
-            all_gather_with_cp(log_prob, total_length, response_length, padded_total_length)
+            all_gather_with_cp(
+                log_prob,
+                total_length,
+                response_length,
+                padded_total_length,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
+                dynamic_cp_group=dynamic_cp_group,
+            )
             for log_prob, total_length, response_length, padded_total_length in zip(
                 log_probs, total_lengths, response_lengths, padded_iter, strict=False
             )
         ]
         full_old_log_probs = [
-            all_gather_with_cp(old_log_prob, total_length, response_length, padded_total_length)
+            all_gather_with_cp(
+                old_log_prob,
+                total_length,
+                response_length,
+                padded_total_length,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
+                dynamic_cp_group=dynamic_cp_group,
+            )
             for old_log_prob, total_length, response_length, padded_total_length in zip(
                 old_log_probs, total_lengths, response_lengths, padded_iter, strict=False
             )
@@ -916,6 +961,8 @@ def policy_loss_function(
             args.qkv_format,
             max_seq_lens,
             padded_total_lengths,
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
@@ -1201,7 +1248,22 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+    # CP-local token count (tokens whose loss this rank actually contributes).
+    # Summed across the CP group in finalize_model_grads / the metric all-reduce,
+    # it counts every token exactly once regardless of CP degree, so the per-token
+    # normalizer is correct even when CP differs across micro-batches (dynamic CP).
+    # Under static CP it equals the old full-sample count distributed across ranks,
+    # so the final loss/grad/metric are unchanged after all-reduce.
+    num_tokens = get_cp_local_num_tokens(
+        batch["total_lengths"],
+        batch["response_lengths"],
+        batch["loss_masks"],
+        args.qkv_format,
+        batch.get("max_seq_lens", None),
+        batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+    )
     num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
@@ -1212,6 +1274,8 @@ def loss_function(
         args.qkv_format,
         batch.get("max_seq_lens", None),
         batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
     match args.loss_type:
@@ -1251,7 +1315,10 @@ def loss_function(
     is_dummy = batch.get("__is_dummy__", False)
     explicit_loss_scale = batch.get("__loss_scale__", None)
 
-    # Here we need to divide by cp_size because to cancel the multiply in Megatron.
+    # Rescale the loss for Megatron's gradient accumulation. The non-per-token
+    # branch folds in the DP(+CP) world size (cancelled by DDP's 1/dp_cp grad
+    # scaling); the per-token branch does NO CP scaling (normalization is the
+    # all-reduced CP-local token count in finalize_model_grads).
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
     if not args.calculate_per_token_loss:
         if is_dummy:
@@ -1270,8 +1337,12 @@ def loss_function(
     else:
         if is_dummy:
             loss = 0.0 * loss
-        else:
-            loss = loss * mpu.get_context_parallel_world_size()
+        # Non-dummy per-token path: do NOT scale by cp_size. `loss` is the
+        # CP-local token-sum; finalize_model_grads normalizes the summed gradient
+        # by the all-reduced CP-local `num_tokens`. A `* cp_size` here would weight
+        # each sample by its CP degree — wrong when CP differs across micro-batches
+        # (dynamic CP). Under static CP the removed factor exactly cancels the old
+        # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
     log_values = torch.tensor(

@@ -2657,7 +2657,7 @@ def slime_validate_args(args):
         if max_ctx_len is not None:
             cp_size = getattr(args, "context_parallel_size", 1)
             token_budget = args.max_tokens_per_gpu * cp_size
-            if token_budget < max_ctx_len:
+            if token_budget < max_ctx_len and not getattr(args, "dynamic_context_parallel", False):
                 raise ValueError(
                     f"max_tokens_per_gpu * context_parallel_size ({args.max_tokens_per_gpu} * {cp_size} = "
                     f"{token_budget}) must be >= rollout_max_context_len ({max_ctx_len}); otherwise a single "
