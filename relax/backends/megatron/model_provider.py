@@ -311,6 +311,8 @@ def get_model_provider_func(
             "moe_router_score_function",
             "moe_ffn_hidden_size",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
+            # Dynamic CP related args
+            "dynamic_context_parallel",
         ]
 
         args_dict = vars(args)
@@ -318,6 +320,9 @@ def get_model_provider_func(
             if attr in args_dict and attr in bridge_keys:
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
+                if getattr(args, "dynamic_context_parallel", False):
+                    if attr == "dynamic_context_parallel":
+                        new_val = False
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
