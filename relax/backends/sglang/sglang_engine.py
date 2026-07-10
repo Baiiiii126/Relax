@@ -912,6 +912,12 @@ def _compute_genrm_server_args(
         "dp_size": args.genrm_engine_config.get("dp_size", 1),
         "pp_size": args.genrm_engine_config.get("pp_size", 1),
         "ep_size": args.genrm_engine_config.get("ep_size", 1),
+        # Pin moe_dense_tp_size for the genRM so it does NOT inherit the global
+        # --sglang-moe-dense-tp-size (set to 1 for the MoE actor/rollout). The genRM
+        # is a standalone dense model at tp_size>1; inheriting moe_dense_tp_size=1
+        # shards its dense layers as TP=1 while it runs tp_size=2 → corrupted weights
+        # → garbage judgements (all rewards 0). None = use tp_size (correct default).
+        "moe_dense_tp_size": args.genrm_engine_config.get("moe_dense_tp_size", None),
         # # context and response length
         # "max_total_tokens": args.genrm_engine_config['max_total_tokens'],
         # always skip warmup to prevent warmup timeout.
