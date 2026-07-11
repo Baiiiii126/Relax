@@ -135,6 +135,15 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 | `run_agent_app.sh`               | Per-session wrapper invoked by Relax for each rollout                                    |
 | `sglang_judge_service.sh`        | Stands up the LLM-judge SGLang server                                                    |
 
+## Pitfalls — read before debugging
+
+Adapting DeepEyes V2 on Relax's agentic stack has a set of recurring
+footguns (SGLang mamba IMA, agentic prepare-gate livelock, "step 1 keeps
+looping" caused by `--use-fault-tolerance` silently masking errors,
+reward tool-bonus divergence from upstream, …). Before opening py-spy,
+read [`PITFALLS.md`](./PITFALLS.md) — the top entry (don't enable
+`--use-fault-tolerance` during adaptation) alone will save hours.
+
 ## How it differs from `examples/deepeyes_agentic/` (V1)
 
 Three action branches vs V1's single `image_zoom_in_tool`; stateful Jupyter
