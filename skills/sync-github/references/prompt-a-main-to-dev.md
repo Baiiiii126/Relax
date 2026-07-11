@@ -81,6 +81,8 @@ git cherry-pick -x <external_sha>
 
 - 按脚本报告的正序逐个 cherry-pick，禁止乱序。
 - cherry-pick 后为空：执行 `git cherry-pick --skip`，并记录为空/已吸收。
+- 如果发现该 external commit 已被内部以 exact SHA、patch-id、commit message、人审等方式等价合入或修正版合入，必须执行 `git cherry-pick --skip`，并记录为已吸收；禁止因为冲突解决后仍有残余 tree diff 就部分重放该 commit。
+  - 例：外部 commit 添加 `init_tracking(args)`，但内部已合入并修正为 `serve.start()` 后初始化，应整 commit 跳过，不得把外部较早位置的调用重新带入 CR。
 - 普通冲突：本地解决后继续；解决原则是只吸收该 external PR 的公开改动，同时保留 `gitlab/dev` 的内部开发成果。
 - 语义不确定、疑似重复实现、疑似敏感内容、疑似内部路径/链接：停止并列出 SHA、标题、冲突路径，让用户判断。
 - 每个成功 cherry-pick 都保留 `-x`，方便审计来源。
