@@ -21,7 +21,7 @@
 #
 # Prerequisite (one-time):
 #  Cast the original INT4 release to BF16 HF for the training side:
-#    python -m relax.tools.quant_cast.convert_moe_int4_to_bf16 \
+#    python -m relax.utils.quant_cast.convert_moe_int4_to_bf16 \
 #        --model-dir ${MODEL_DIR}/Kimi-K2.6 \
 #        --output-dir ${MODEL_DIR}/Kimi-K2.6_bf16
 #

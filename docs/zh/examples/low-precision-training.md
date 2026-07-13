@@ -269,7 +269,7 @@ pip install -e . --no-build-isolation
 **一次性**把原始的 W4A16 发布版 cast 成 BF16 HF —— Megatron bridge 需要真实的 BF16 权重来加载，STE 只在 forward 路径上叠加量化噪声：
 
 ```bash
-python -m relax.tools.quant_cast.convert_moe_int4_to_bf16 \
+python -m relax.utils.quant_cast.convert_moe_int4_to_bf16 \
     --model-dir  ${MODEL_DIR}/Kimi-K2.6 \
     --output-dir ${MODEL_DIR}/Kimi-K2.6_bf16
 ```

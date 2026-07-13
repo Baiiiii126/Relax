@@ -3,6 +3,7 @@
 import importlib
 import logging
 import os
+import sys
 from typing import Any
 
 
@@ -10,6 +11,14 @@ def try_import_telemetry_hook(logger: Any = None) -> None:
     """Import the optional telemetry hook without affecting training."""
     hook = os.environ.get("RELAX_TELEMETRY_HOOK")
     if not hook:
+        return
+    # Skip if the hook (or its parent package) has already been imported by an
+    # earlier channel — e.g. a site-packages `.pth` autoload that fires at
+    # Python site init, before this entrypoint. Re-importing here would install
+    # the same monkey-patches twice and can corrupt Ray's captured actor-method
+    # signatures.
+    root = hook.split(".", 1)[0]
+    if hook in sys.modules or root in sys.modules:
         return
     try:
         importlib.import_module(hook)
