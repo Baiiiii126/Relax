@@ -99,6 +99,19 @@ def quant_fp8(
         return block_fp8(weight, block_size)
 
 
+def _store_quantized_fp8(
+    q_weights: dict[str, torch.Tensor],
+    base_name: str,
+    weight: torch.Tensor,
+    strategy: str,
+    block_size: list[int] | None,
+) -> None:
+    qw, s = quant_fp8(weight, strategy, block_size)
+    q_weights[f"{base_name}.weight"] = qw
+    scale_suffix = ".weight_scale_inv" if block_size else ".weight_scale"
+    q_weights[f"{base_name}{scale_suffix}"] = s
+
+
 class ConversionResult:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -139,7 +152,28 @@ def _process_file(
             weights[k] = f.get_tensor(k)
 
     modules_to_not_convert: list[str] = []
-    for key in weights.keys():
+    for key in list(weights.keys()):
+        weight = weights[key]
+
+        is_fused_experts = key.endswith(".experts.gate_up_proj") or key.endswith(".experts.down_proj")
+        if weight.dim() == 3 and is_fused_experts:
+            base = key.rsplit(".", 1)[0]  # ``...mlp.experts``
+            for expert_idx in range(weight.shape[0]):
+                expert = weight[expert_idx]
+                if key.endswith(".gate_up_proj"):
+                    gate_w, up_w = expert.chunk(2, dim=0)
+                    _store_quantized_fp8(
+                        q_weights, f"{base}.{expert_idx}.gate_proj", gate_w.contiguous(), strategy, block_size
+                    )
+                    _store_quantized_fp8(
+                        q_weights, f"{base}.{expert_idx}.up_proj", up_w.contiguous(), strategy, block_size
+                    )
+                else:
+                    _store_quantized_fp8(
+                        q_weights, f"{base}.{expert_idx}.down_proj", expert.contiguous(), strategy, block_size
+                    )
+            continue
+
         if (
             "weight" in key
             and "layernorm" not in key
@@ -155,6 +189,8 @@ def _process_file(
             and "dt_bias" not in key
             and "in_proj_a" not in key
             and "in_proj_b" not in key
+            and "shared_expert_gate" not in key
+            and "visual" not in key
         ):
             qw, s = quant_fp8(weights[key], strategy, block_size)
             q_weights[key] = qw

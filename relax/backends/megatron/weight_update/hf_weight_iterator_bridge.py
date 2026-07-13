@@ -331,6 +331,8 @@ _DTYPE_TO_CODE = {
     torch.int64: 4,
     torch.int8: 5,
     torch.uint8: 6,
+    torch.float8_e4m3fn: 7,
+    torch.float8_e5m2: 8,
 }
 _CODE_TO_DTYPE = {v: k for k, v in _DTYPE_TO_CODE.items()}
 
