@@ -228,6 +228,17 @@ def process_raw_sample(
     prompt = build_messages(data, prompt_key, system_prompt, as_conversation, multimodal_keys, custom_prompt_func)
 
     metadata = data.get(metadata_key) or {}
+
+    # MOPD: surface top-level ``data_source`` column into metadata so the
+    # per-sample teacher router (``_pick_teacher_url``) can look it up via
+    # ``sample.metadata["data_source"]``.  Only injected when the column
+    # exists and the metadata dict does not already carry it.
+    if "data_source" not in metadata and "data_source" in data:
+        if isinstance(metadata, dict):
+            metadata["data_source"] = data["data_source"]
+        else:
+            metadata = {"data_source": data["data_source"]}
+
     tools = None
 
     if tool_key is not None and tool_key in data:
