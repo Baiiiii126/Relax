@@ -448,10 +448,13 @@ class Rollout(Base):
                         partition_list, local_step, self.config.max_staleness
                     )
                     if not should_continue:
-                        if wait_count % 10 == 0:
+                        should_log = (wait_count >= 1200 and wait_count % 30 == 0) or (
+                            600 <= wait_count < 1200 and wait_count % 60 == 0
+                        )
+                        if should_log:
                             self._logger.warning(
-                                f"Rollout {local_step}: waiting for data system to catch up. "
-                                f"Current partitions: {partition_list}, waited {wait_count}s"
+                                f"Rollout {local_step}: still waiting for data system to catch up "
+                                f"after {wait_count}s, possibly hang. Current partitions: {partition_list}"
                             )
                         wait_count += 1
                         await asyncio.sleep(1)
