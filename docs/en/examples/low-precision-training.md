@@ -271,7 +271,7 @@ Two launchers cover both modalities:
 Cast the original W4A16 release to a BF16 HF directory **once** — Megatron's bridge needs real BF16 weights to load, since the STE only adds quant noise in the forward path:
 
 ```bash
-python -m relax.tools.quant_cast.convert_moe_int4_to_bf16 \
+python -m relax.utils.quant_cast.convert_moe_int4_to_bf16 \
     --model-dir  ${MODEL_DIR}/Kimi-K2.6 \
     --output-dir ${MODEL_DIR}/Kimi-K2.6_bf16
 ```

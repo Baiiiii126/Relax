@@ -259,7 +259,7 @@ def quantize_params_compressed_tensors(converted_named_params, quantization_conf
     w_cfg = quantization_config["config_groups"]["group_0"]["weights"]
     group_size = w_cfg["group_size"]
     is_symmetric = w_cfg["symmetric"]
-    # The cast pipeline (`relax/tools/quant_cast/convert_moe_int4_to_bf16.py`)
+    # The cast pipeline (`relax/utils/quant_cast/convert_moe_int4_to_bf16.py`)
     # augments the sidecar's ignore list with non-quantized top-level namespaces
     # so this stays purely config-driven (no K2-specific name knowledge here).
     ignore_rules = list(quantization_config.get("ignore", []))
