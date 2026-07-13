@@ -967,6 +967,17 @@ def log_rollout_data(
                 continue
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
+        if total_lengths:
+            dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            stats = torch.tensor(
+                [max(total_lengths), -min(total_lengths)],
+                dtype=torch.int64,
+                device=loss_masks[0].device,
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=dp_group)
+            log_dict["total_lengths/max"] = int(stats[0].item())
+            log_dict["total_lengths/min"] = -int(stats[1].item())
+
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
         if args.ci_test and reduced_log_dict is not None:
             if (
