@@ -77,6 +77,10 @@ class RewardWorker:
             return compute_score_dapo(response, label)
         elif rm_type == "math":
             return 1 if grade_answer_verl(response, label) else 0
+        elif rm_type == "mopd":
+            from .mopd import get_mopd_reward
+
+            return get_mopd_reward(response, label, metadata)
         elif rm_type == "f1":
             return f1_score(response, label)[0]
         elif rm_type == "gpqa":
@@ -164,6 +168,7 @@ class RewardExecutor:
             "multiple_choice",
             "dapo",
             "math",
+            "mopd",
             "f1",
             "gpqa",
             "ifbench",

@@ -47,6 +47,7 @@ from relax.utils.metrics.metric_utils import (
 )
 from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
+from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
@@ -3928,6 +3929,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= compute_mopd_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     log_dict["num_turn/mean"] = np.mean([s.metadata.get("rollout_turns", 1) for s in samples]).item()

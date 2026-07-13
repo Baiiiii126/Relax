@@ -48,22 +48,47 @@ def _create_teacher_client_session(args) -> aiohttp.ClientSession:
     return aiohttp.ClientSession(connector=connector, timeout=timeout)
 
 
-# --- Teacher URL round-robin (multi-replica TeacherManager) ---
-# When TeacherManager runs N replicas, opd_utils injects ``args.opd_teacher_urls``
-# (list). Spread requests across them with a simple in-process counter — the
-# single-threaded asyncio loop makes the raw ``+= 1`` safe, and pure round-robin
-# keeps the distribution uniform regardless of request ordering. Falls back to
-# ``args.opd_teacher_url`` when only one replica is configured.
-_TEACHER_URL_RR = 0
+# --- Teacher URL selection: MOPD routing (by data_source) x replica round-robin ---
+# Two layers:
+#   1. Routing (MOPD): when ``args.opd_teacher_routes_map`` is set, pick the
+#      teacher for this sample by ``sample.metadata[args.opd_teacher_key]``.
+#      Each route value is a LIST of that teacher's replica URLs.
+#   2. Replica round-robin: spread requests across a teacher's replicas with a
+#      per-teacher in-process counter (single-threaded asyncio makes ``+= 1`` safe).
+# Single-teacher path falls back to ``args.opd_teacher_urls`` / ``opd_teacher_url``.
+_TEACHER_URL_RR: dict[str, int] = {}
 
 
-def _pick_teacher_url(args) -> str:
-    global _TEACHER_URL_RR
+def _round_robin(urls: list[str], key: str) -> str:
+    i = _TEACHER_URL_RR.get(key, 0)
+    _TEACHER_URL_RR[key] = i + 1
+    return urls[i % len(urls)]
+
+
+def _pick_teacher_url(args, sample=None) -> str:
+    routes_map = getattr(args, "opd_teacher_routes_map", None)
+    if routes_map and sample is not None:
+        key_field = getattr(args, "opd_teacher_key", "data_source")
+        metadata = getattr(sample, "metadata", None) or {}
+        routing_value = metadata.get(key_field)
+        if routing_value is None:
+            raise ValueError(
+                f"MOPD routing: sample missing key '{key_field}' in metadata. "
+                f"Available metadata keys: {list(metadata.keys())}. "
+                f"Ensure the dataset has a '{key_field}' column and it is surfaced "
+                "via --metadata-key or the data pipeline."
+            )
+        replicas = routes_map.get(routing_value)
+        if not replicas:
+            raise KeyError(
+                f"MOPD routing: no teacher route for '{key_field}={routing_value}'. "
+                f"Available routes: {list(routes_map.keys())}."
+            )
+        return _round_robin(replicas, routing_value)
+    # Single-teacher path: round-robin over replicas if configured.
     urls = getattr(args, "opd_teacher_urls", None)
     if urls and len(urls) > 1:
-        url = urls[_TEACHER_URL_RR % len(urls)]
-        _TEACHER_URL_RR += 1
-        return url
+        return _round_robin(urls, "__single__")
     return args.opd_teacher_url
 
 
@@ -243,7 +268,7 @@ class OpdManager:
             if mm_fields:
                 payload.update(mm_fields)
 
-        teacher_url = _pick_teacher_url(self.args)
+        teacher_url = _pick_teacher_url(self.args, sample)
         resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill")
         if resp_obj is None:
             return False
