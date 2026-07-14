@@ -895,7 +895,9 @@ def post_process_rollout_data(args, rollout_data):
     padded_total_lengths = maybe_padded_total_lengths(
         rollout_data["total_lengths"],
         args.qkv_format,
-        "multimodal_train_inputs" in rollout_data or getattr(args, "uses_unsplit_forward", False),
+        getattr(args, "is_vl_model", False)
+        or "multimodal_train_inputs" in rollout_data
+        or getattr(args, "uses_unsplit_forward", False),
     )
 
     for key in [

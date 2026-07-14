@@ -496,6 +496,9 @@ class EngineGroup:
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                    "SLIME_ENABLE_PROFILING": "true",
+                    # NOTE(sunhuo): disable custom all-reduce-v2 temporarily, as it may cause custom_all_reduce.cuh:37: CUDA error: invalid argument.
+                    "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
             if getattr(self.args, "fp16", False):

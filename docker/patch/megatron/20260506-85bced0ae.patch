@@ -1033,21 +1033,23 @@ index c87ccd5ff..1111111aa 100644
  from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
  
  
-@@ -136,11 +139,13 @@
+@@ -136,11 +139,15 @@
              if not hasattr(MoonViT3dEncoder, "use_deterministic_attn"):
                  MoonViT3dEncoder.use_deterministic_attn = False
- 
+
 -            # transformers >=5.5 strictly validates `attn_implementation` at
 -            # __init__ and selects `flash_attention_2` by default when flash-attn
 -            # is installed. MoonViT3dPretrainedModel doesn't declare flash-attn-2
 -            # support, so force eager attention before construction.
 -            self.vision_tower_config._attn_implementation = "eager"
-+            # MoonViT3dPretrainedModel does declare `_supports_flash_attn_2 = True`
-+            # and ships `multihead_attention` (flash_attn_varlen_func wrapper) in
-+            # `VL_VISION_ATTENTION_FUNCTIONS`, so flash-attn is the intended path.
-+            # The previous "force eager" workaround was a stale comment from when
-+            # the support flag was missing; eager is O(N²) and OOMs at large image
-+            # patch counts (~1900+ patches/sample), so use flash_attention_2.
++            # MoonViT3dPretrainedModel declares `_supports_flash_attn_2 = True` (old
++            # transformers API).  transformers >= 5.0 unified flash-attn support under
++            # `_supports_flash_attn` (default False); bridge the old flag so the strict
++            # init-time check in _flash_attn_can_dispatch() does not raise ValueError.
++            if not getattr(MoonViT3dPretrainedModel, "_supports_flash_attn", False):
++                MoonViT3dPretrainedModel._supports_flash_attn = getattr(
++                    MoonViT3dPretrainedModel, "_supports_flash_attn_2", False
++                )
 +            self.vision_tower_config._attn_implementation = "flash_attention_2"
              self.vision_tower = MoonViT3dPretrainedModel(self.vision_tower_config)
              self.mm_projector = PatchMergerMLP(self.projector_config)  # TODO: support different types of mm projector

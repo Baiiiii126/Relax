@@ -429,16 +429,40 @@ class MegatronTrainRayActor(TrainRayActor):
             for a, b in zip(rollout_routed_experts, tokens, strict=False):
                 assert a.shape[0] == b.shape[0] - 1, f"{a.shape}, {b.shape}"
 
-            # We need to pad the experts to the last token. We won't calculate loss on this token so this should be fine.
-            # TODO: fuse this padding with the following slice_with_cp to reduce memory copy.
-            rollout_routed_experts = [pad_func(r, 1) for r in rollout_routed_experts]
-            # TODO: maybe extract a common process function for here and get_batch?
+            # Pad each sample so its routed-experts stream lines up with how the forward's MoE
+            # router sees tokens, then CP-slice identically.
+            #
+            # is_vl_model (a VL model such as Kimi-K2.6 — detected from processor/preprocessor
+            # config, True even on a text-only batch) with CP>1 + thd takes the bridge unsplit path:
+            # get_batch/model.py feed the bridge UNSPLIT tokens and it splits along CP internally
+            # after padding each sample to tp*cp*2 (see maybe_padded_total_lengths +
+            # get_logits_and_tokens_offset_with_cp, which commit 2edaade aligned the loss/metric side
+            # to). Routing replay was NOT updated then, so it still used slice_with_cp's 2*cp align +
+            # a global tp*dpm pad -> the recorded routing landed on different per-sample chunk
+            # boundaries than the bridge, misaligning routed_experts vs tokens at CP>1. Pad each
+            # sample to the SAME tp*cp*2 length so slice_with_cp's chunk_size = padded_len // (2*cp)
+            # matches the bridge; the per-CP-rank stream is then tp-divisible, so no global pad (the
+            # bridge adds none either).
+            #
+            # Otherwise (non-VL) the forward uses get_batch's per-sample slice_with_cp (2*cp align)
+            # + global tp*data_pad_size_multiplier pad, so mirror that here.
+            padded_total_lengths = maybe_padded_total_lengths(
+                [t.shape[0] for t in tokens], self.args.qkv_format, getattr(self.args, "is_vl_model", False)
+            )
+            if padded_total_lengths is not None:
+                rollout_routed_experts = [
+                    pad_func(r, padded_total_lengths[i] - r.shape[0]) for i, r in enumerate(rollout_routed_experts)
+                ]
+            else:
+                # Pad each sample by 1 (the last, non-loss token) so it matches the token length.
+                rollout_routed_experts = [pad_func(r, 1) for r in rollout_routed_experts]
             rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
             rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-            pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
-            if pad != 0:
-                rollout_routed_experts = pad_func(rollout_routed_experts, pad)
+            if padded_total_lengths is None:
+                pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+                pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
+                if pad != 0:
+                    rollout_routed_experts = pad_func(rollout_routed_experts, pad)
 
             if self.args.sequence_parallel:
                 seqlen = rollout_routed_experts.size(0)
@@ -2046,7 +2070,9 @@ class MegatronTrainRayActor(TrainRayActor):
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             self.args.qkv_format,
-            "multimodal_train_inputs" in rollout_data or getattr(self.args, "uses_unsplit_forward", False),
+            getattr(self.args, "is_vl_model", False)
+            or "multimodal_train_inputs" in rollout_data
+            or getattr(self.args, "uses_unsplit_forward", False),
         )
         if padded_total_lengths is None:
             padded_total_lengths = [None] * len(total_lengths)

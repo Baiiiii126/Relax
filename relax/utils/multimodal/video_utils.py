@@ -9,16 +9,9 @@ import av
 import librosa
 import numpy as np
 import torch
-import torchvision
+from packaging import version
 from PIL import Image
 from torchvision import transforms
-
-
-try:
-    from torchvision.io.video import _read_from_stream
-except ImportError:
-    # torchvision >= 0.26 remove torchvision.io.video。
-    _read_from_stream = None
 from torchvision.transforms import InterpolationMode
 
 from relax.utils.logging_utils import get_logger
@@ -43,6 +36,13 @@ if not hasattr(av, "AVError"):
         from av.error import AVError  # noqa: F401
     except (ImportError, AttributeError):
         av.AVError = OSError
+
+# torchvision.io.video and its private _read_from_stream were removed in
+# torchvision 0.26 (shipped with torch 2.11). Detect the running torch version to
+# pick the video decoding backend: torchcodec on new stacks, torchvision on old
+# ones. `.release` is used so pre-release/nightly builds (e.g. 2.11.0.dev*) route
+# to the torchcodec path as well.
+_USE_TORCHCODEC = version.parse(torch.__version__).release >= (2, 11)
 
 VideoInput = Union[
     List["Image.Image"],
@@ -161,28 +161,58 @@ def smart_audio_nframes(
     }
 
 
-def load_video_from_path(
-    video: str,
-    use_audio_in_video: bool = True,
-    **kwargs: Any,
+def _decode_video_torchcodec(
+    source: Union[str, bytes],
+    use_audio_in_video: bool,
 ) -> Tuple[torch.Tensor, Dict[str, int], Optional[np.ndarray], Optional[Dict[str, int]]]:
-    """Load video and optionally extract audio from a path or URL.
+    """Decode video (and optional audio) via torchcodec.
 
-    Returns `(video_tensor, video_metadata, audio, audio_metadata)`.
+    `source` may be a path/URL string or raw bytes; ``VideoDecoder`` accepts
+    both. Used on torch >= 2.11 where the torchvision video API has been
+    removed.
     """
-    if "http://" in video or "https://" in video:
-        from packaging import version
+    from torchcodec.decoders import AudioDecoder, VideoDecoder
 
-        if version.parse(torchvision.__version__) < version.parse("0.19.0"):
-            logger.warning_once(
-                "torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0."
-            )
+    vdecoder = VideoDecoder(source)
+    frames = vdecoder.get_all_frames()
+    video_tensor = frames.data  # (T, C, H, W) uint8
+    video_fps = vdecoder.metadata.average_fps
+    video_metadata = {"fps": video_fps, "total_num_frames": len(video_tensor)}
+
+    audio, audio_metadata = None, None
+    if use_audio_in_video:
+        try:
+            adecoder = AudioDecoder(source)
+            samples = adecoder.get_all_samples()
+            audio = samples.data.mean(dim=0).numpy()  # (C, N) → (N,), float32 in [-1, 1]
+            audio_fps = samples.sample_rate
+            audio_metadata = {"fps": audio_fps, "total_num_frames": samples.data.shape[1]}
+        except Exception:
+            pass
+
+    return video_tensor, video_metadata, audio, audio_metadata
+
+
+def _decode_video_path_torchvision(
+    video: str,
+    use_audio_in_video: bool,
+) -> Tuple[torch.Tensor, Dict[str, int], Optional[np.ndarray], Optional[Dict[str, int]]]:
+    """Decode video from a path/URL via the legacy torchvision.io API.
+
+    Used on torch < 2.11 where torchcodec is not part of the stack.
+    """
+    import torchvision
+    from torchvision.io import read_video
+
+    if "http://" in video or "https://" in video:
+        if version.parse(torchvision.__version__).release < (0, 19, 0):
+            logger.warning("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
     else:
         if "file://" in video:
             video = video[7:]
         assert os.path.exists(video), f"Video path {video} does not exist."
 
-    video, _audio, read_info = torchvision.io.read_video(
+    video, _audio, read_info = read_video(
         video,
         start_pts=0.0,
         end_pts=None,
@@ -200,6 +230,28 @@ def load_video_from_path(
         audio_metadata = {"fps": audio_fps, "total_num_frames": _audio.shape[0]}
 
     return video, video_metadata, audio, audio_metadata
+
+
+def load_video_from_path(
+    video: str,
+    use_audio_in_video: bool = True,
+    **kwargs: Any,
+) -> Tuple[torch.Tensor, Dict[str, int], Optional[np.ndarray], Optional[Dict[str, int]]]:
+    """Load video and optionally extract audio from a path or URL.
+
+    Dispatches to torchcodec (torch >= 2.11) or the legacy torchvision API
+    (torch < 2.11). Returns `(video_tensor, video_metadata, audio,
+    audio_metadata)`.
+    """
+    if not _USE_TORCHCODEC:
+        return _decode_video_path_torchvision(video, use_audio_in_video)
+
+    if "file://" in video:
+        video = video[7:]
+    if not ("http://" in video or "https://" in video):
+        assert os.path.exists(video), f"Video path {video} does not exist."
+
+    return _decode_video_torchcodec(video, use_audio_in_video)
 
 
 def load_video_from_bytes_list(
@@ -244,11 +296,16 @@ def load_video_from_bytes_list(
     return video_tensor, video_metadata, None, None
 
 
-def load_video_from_bytes(
+def _decode_video_bytes_torchvision(
     video: bytes,
-    use_audio_in_video: bool = True,
-    **kwargs: Any,
+    use_audio_in_video: bool,
 ) -> Tuple[torch.Tensor, Dict[str, int], Optional[np.ndarray], Optional[Dict[str, int]]]:
+    """Decode video from raw bytes via PyAV + the legacy torchvision helper.
+
+    Used on torch < 2.11 where torchcodec is not part of the stack.
+    """
+    from torchvision.io.video import _read_from_stream
+
     container = av.open(BytesIO(video))
     video_frames = _read_from_stream(
         container,
@@ -283,6 +340,22 @@ def load_video_from_bytes(
             audio = aframes
 
     return video, video_metadata, audio, audio_metadata
+
+
+def load_video_from_bytes(
+    video: bytes,
+    use_audio_in_video: bool = True,
+    **kwargs: Any,
+) -> Tuple[torch.Tensor, Dict[str, int], Optional[np.ndarray], Optional[Dict[str, int]]]:
+    """Load video and optionally extract audio from raw bytes.
+
+    Dispatches to torchcodec (torch >= 2.11) or the legacy PyAV + torchvision
+    path (torch < 2.11).
+    """
+    if not _USE_TORCHCODEC:
+        return _decode_video_bytes_torchvision(video, use_audio_in_video)
+
+    return _decode_video_torchcodec(video, use_audio_in_video)
 
 
 def load_video(

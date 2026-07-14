@@ -897,7 +897,9 @@ def log_rollout_data(
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             args.qkv_format,
-            rollout_data.get("multimodal_train_inputs") is not None or getattr(args, "uses_unsplit_forward", False),
+            getattr(args, "is_vl_model", False)
+            or rollout_data.get("multimodal_train_inputs") is not None
+            or getattr(args, "uses_unsplit_forward", False),
         )
 
         for key, val in rollout_data.items():
@@ -1051,7 +1053,8 @@ def log_rollout_data(
             correct_padded_total_lengths_full = maybe_padded_total_lengths(
                 total_lengths,
                 args.qkv_format,
-                rollout_data.get("multimodal_train_inputs") is not None
+                getattr(args, "is_vl_model", False)
+                or rollout_data.get("multimodal_train_inputs") is not None
                 or getattr(args, "uses_unsplit_forward", False),
             )
             correct_padded_total_lengths: list[int] | None = (

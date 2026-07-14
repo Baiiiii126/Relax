@@ -1,7 +1,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=lmsysorg/sglang:v0.5.9
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.12.post1-cu129
 ARG TRAIN_IMAGE=train
 FROM ${BASE_IMAGE} as base
 
@@ -29,15 +29,11 @@ RUN apt-get update && apt-get install -y locales tzdata && \
     locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-RUN cd /tmp && git clone -b update-transformers-v5 https://github.com/sgl-project/sglang.git && \
-    cd sglang && rsync -avP ./python/sglang/ /sgl-workspace/sglang/python/sglang/ && \
-    rm -rf /tmp/sglang
-
 FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
 
-RUN pip install transformers==5.3.0 nvidia-cudnn-cu12==9.16.0.29
+RUN pip install nvidia-cudnn-cu12==9.16.0.29
 
 FROM base as train
 
@@ -45,20 +41,34 @@ RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no
     pip install --no-cache-dir flash-linear-attention==0.4.1 && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
+# FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
+# window_size_left/right to match TE 2.14.1 (docs/draft/sglang-0.5.12-upgrade-plan.md §8.4).
+# The `cp` exposes flash_attn_3.flash_attn_interface, which is what TE imports. BUT this commit's
+# setup.py (py_modules=["flash_attn_interface"]) ALSO installs a *top-level* flash_attn_interface.py
+# (into the egg root). That top-level module and the copied flash_attn_3/flash_attn_interface.py
+# both register the torch custom op flash_attn_3::_flash_attn_forward; a second import in the same
+# process _destroy()s the Library TE bound to, so a later dispatch reads an empty schema
+# (use-after-free) and every actor forward crashes with `schema_.has_value() INTERNAL ASSERT
+# FAILED` (§8.5). Strip the stray top-level module (site-packages root + egg root). Keep
+# flash_attn_config.py: flash_attn_3/flash_attn_interface.py does `from flash_attn_config import
+# CONFIG` at forward time, so deleting it would break the forward with ModuleNotFoundError.
 RUN MAX_JOBS=64 \
     cd /opt && git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention/ && \
-    git checkout fbf24f67cf7f6442c5cfb2c1057f4bfc57e72d89 && \
+    git checkout 0f82fead0b2d59f6390c62a1d74e927159bc5a7b && \
     git submodule update --init && \
     cd hopper/ && \
     MAX_JOBS=96 python setup.py install && \
     export python_path=`python -c "import site; print(site.getsitepackages()[0])"` && \
     mkdir -p $python_path/flash_attn_3 && \
     cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py && \
+    find $python_path -maxdepth 1 -name flash_attn_interface.py -delete && \
+    find $python_path -maxdepth 2 -path '*.egg/flash_attn_interface.py' -delete && \
+    cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
     rm -rf /opt/flash-attention/
 
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
-    TMS_CUDA_MAJOR=12 pip install git+https://github.com/redai-infra/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
+    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-infra/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
@@ -101,9 +111,20 @@ RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/appt
 
 COPY requirements.txt /tmp/requirements.txt
 
-RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
+RUN pip install --ignore-installed PyJWT && \
+    pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
+
+# sgl-router: override the official wheel (pulled by requirements.txt above) with
+# slime's r3-capable fork. The official sglang-router drops the routed_experts
+# field on the /generate round-trip, breaking R3 (rollout routing replay,
+# --use-rollout-routing-replay) with a step-0 deadlock; this fork carries the
+# `support r3` passthrough patch. Must run AFTER the requirements install so it
+# wins.
+RUN pip install --no-cache-dir --force-reinstall \
+        https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl && \
+    python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
 
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/

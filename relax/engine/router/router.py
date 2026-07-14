@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
@@ -31,8 +32,12 @@ class SlimeRouter:
         self.args = args
         self.verbose = verbose
 
-        self.app = FastAPI()
-        self.app.add_event_handler("startup", self._start_background_health_check)
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            asyncio.create_task(self._health_check_loop())
+            yield
+
+        self.app = FastAPI(lifespan=lifespan)
 
         # URL -> Active Request Count (load state)
         self.worker_request_counts: dict[str, int] = {}
@@ -81,9 +86,6 @@ class SlimeRouter:
         self.app.post("/retrieve_from_text")(self.retrieve_from_text)
         # Catch-all route for proxying to SGLang - must be registered LAST
         self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])(self.proxy)
-
-    async def _start_background_health_check(self):
-        asyncio.create_task(self._health_check_loop())
 
     async def _check_worker_health(self, url):
         """Encapsulated health check logic for better maintainability."""

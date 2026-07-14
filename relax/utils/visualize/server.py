@@ -24,6 +24,7 @@ import re
 import sys
 import threading
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -167,10 +168,18 @@ def create_app(
 
     data_cache = LRUDataCache(max_memory_mb=cache_memory_mb, max_entries=cache_max_entries)
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        logger.info("Shutting down - clearing cache...")
+        data_cache.clear()
+        gc.collect()
+
     app = FastAPI(
         title="Relax Rollout Result Viewer",
         description="Lightweight preview for Relax rollout_result/*.jsonl files",
         version="1.0.0",
+        lifespan=lifespan,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -182,12 +191,6 @@ def create_app(
     app.state.data_dir = data_path
     app.state.data_cache = data_cache
     app.state.base_path = base_path
-
-    @app.on_event("shutdown")
-    async def cleanup():
-        logger.info("Shutting down - clearing cache...")
-        data_cache.clear()
-        gc.collect()
 
     def _resolve_subdir(subdir: str) -> Path:
         buckets = _discover_subdirs(data_path)
