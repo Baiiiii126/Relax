@@ -7,8 +7,8 @@ description: Upgrade the sglang version used by Relax's training Docker image. U
 
 把 Relax 训练镜像依赖的 sglang 升级到新版本。最大的工作量永远是 **rebase `docker/patch/latest/sglang.patch`**;核心方法是 **以 THUDM/slime 已 rebase 好的同版本 patch 为骨架,只 port Relax 真正私有且未被上游吸收的改动**。
 
-本次 v0.5.9 → v0.5.12.post1-cu129 的完整案例与决策日志见
-`docs/draft/sglang-0.5.12-upgrade-plan.md`(可作为模板)。
+升级时建议维护一份 `docs/draft/sglang-<ver>-upgrade-plan.md` 决策日志(见第 8 节),
+记录本次保留/丢弃的私有改动与验证清单,可作为下次升级的模板。
 
 ## 0. 先搞清楚版本是怎么定的(关键前提)
 
