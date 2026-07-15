@@ -236,13 +236,26 @@ This indicates training is running successfully.
 Checkpoints saved by Relax are in Megatron DCP format. To convert them to Hugging Face weight format, use the [`convert_torch_dist_to_hf_bridge.py`](../../../scripts/tools/convert_torch_dist_to_hf_bridge.py) script:
 
 ```bash
-# Ensure PYTHONPATH includes Megatron-LM and Relax
-export PYTHONPATH=${MEGATRON}:${RELAX}:$PYTHONPATH
-
 python scripts/tools/convert_torch_dist_to_hf_bridge.py \
   --input-dir /path/to/dcp_checkpoint \
   --output-dir /path/to/hf_output \
   --origin-hf-dir /path/to/original_hf_model
+```
+
+The script automatically prepends the Relax repository root to `PYTHONPATH`. Megatron-LM and Megatron Bridge must still be available in the current environment.
+
+To export directly to FP8 without first writing an intermediate BF16 HF checkpoint, enable streaming FP8 conversion:
+
+```bash
+python scripts/tools/convert_torch_dist_to_hf_bridge.py \
+  --input-dir /path/to/dcp_checkpoint \
+  --origin-hf-dir /path/to/original_hf_model \
+  --output-dir /path/to/hf_output_fp8 \
+  --fp8 \
+  --fp8-strategy block \
+  --fp8-block-size 128 128 \
+  --fp8-device cuda \
+  --fp8-max-shard-size-mb 4096
 ```
 
 Parameter descriptions:
@@ -251,11 +264,14 @@ Parameter descriptions:
 |---|---|
 | `--input-dir` | Megatron DCP format checkpoint directory |
 | `--output-dir` | Output directory for converted HF weights |
-| `--origin-hf-dir` | Original HF model directory (used to read model config) |
+| `--origin-hf-dir` | Original HF safetensors directory, used for architecture, expected weight keys, and tokenizer files |
 | `--force` | Optional, force overwrite if output directory already exists |
+
+For the FP8 strategy options, memory behavior, output format, and an 8-GPU SGLang launch command, see [Model Checkpoint Conversion](./model-conversion.md).
 
 ## Next Steps
 
 - [Customize Training](./customize-training.md) — Learn how to customize training scripts, parameters, reward functions, and multi-node launch
+- [Model Checkpoint Conversion](./model-conversion.md) — Export and serve trained checkpoints
 - [Configuration](./configuration.md) — Full parameter reference
 - [Architecture](./architecture.md) — Understand the system design

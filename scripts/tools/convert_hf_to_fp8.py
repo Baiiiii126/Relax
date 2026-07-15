@@ -15,121 +15,20 @@ import gc
 import json
 import os
 import shutil
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import safetensors
 import safetensors.torch
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.quant_cast.fp8 import build_quantization_config, quantize_hf_tensor, validate_fp8_options
+from relax.utils.quant_cast.fp8_checkpoint import ConversionResult, write_safetensors_index
 
 
 logger = get_logger(__name__)
-
-FP8_INFO = torch.finfo(torch.float8_e4m3fn)
-FP8_MAX, FP8_MIN = FP8_INFO.max, FP8_INFO.min
-
-
-def ceildiv(a: int, b: int) -> int:
-    return -(-a // b)
-
-
-def block_fp8(weight: torch.Tensor, block_size: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
-    block_n, block_k = block_size[0], block_size[1]
-
-    shape_0, shape_1 = weight.shape
-
-    n_tiles = ceildiv(shape_0, block_n)
-    k_tiles = ceildiv(shape_1, block_k)
-
-    q_weight = F.pad(
-        weight,
-        (0, k_tiles * block_k - shape_1, 0, n_tiles * block_n - shape_0),
-        mode="constant",
-        value=0.0,
-    )
-
-    qweight = q_weight.reshape(n_tiles, block_n, k_tiles, block_k)
-    block_max = torch.max(torch.abs(qweight), dim=1, keepdim=True)[0]
-    block_max = torch.max(block_max, dim=3, keepdim=True)[0]
-
-    scale = block_max.to(torch.float32) / FP8_MAX
-    qweight = (
-        (qweight / scale)
-        .clamp(min=FP8_MIN, max=FP8_MAX)
-        .reshape((n_tiles * block_n, k_tiles * block_k))
-        .to(torch.float8_e4m3fn)
-    )
-    qweight = qweight[:shape_0, :shape_1].clone().detach()
-    scale = scale.reshape(n_tiles, k_tiles)
-
-    return qweight, scale
-
-
-def channel_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    channel_max = torch.max(weight.abs(), dim=-1, keepdim=True)[0]
-    scale = channel_max.clamp(min=1e-12).to(torch.float32) / FP8_MAX
-    qweight = (weight / scale).clamp(min=FP8_MIN, max=FP8_MAX)
-    qweight = qweight.to(torch.float8_e4m3fn)
-    return qweight, scale
-
-
-def tensor_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = weight.abs().max().clamp(min=1e-12).to(torch.float32) / FP8_MAX
-    qweight = (weight / scale).clamp(min=FP8_MIN, max=FP8_MAX)
-    qweight = qweight.to(torch.float8_e4m3fn)
-    scale = scale.view(1)
-    return qweight, scale
-
-
-def quant_fp8(
-    weight: torch.Tensor,
-    strategy: str,
-    block_size: list[int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if strategy == "tensor":
-        return tensor_fp8(weight)
-    elif strategy == "channel":
-        return channel_fp8(weight)
-    else:
-        return block_fp8(weight, block_size)
-
-
-def _store_quantized_fp8(
-    q_weights: dict[str, torch.Tensor],
-    base_name: str,
-    weight: torch.Tensor,
-    strategy: str,
-    block_size: list[int] | None,
-) -> None:
-    qw, s = quant_fp8(weight, strategy, block_size)
-    q_weights[f"{base_name}.weight"] = qw
-    scale_suffix = ".weight_scale_inv" if block_size else ".weight_scale"
-    q_weights[f"{base_name}{scale_suffix}"] = s
-
-
-class ConversionResult:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.weight_map: dict[str, str] = {}
-        self.param_count: int = 0
-        self.modules_to_not_convert: list[str] = []
-
-    def add_result(
-        self,
-        filename: str,
-        q_weights: dict[str, torch.Tensor],
-        module_names: list[str],
-    ) -> None:
-        with self.lock:
-            for k, v in q_weights.items():
-                self.weight_map[k] = filename
-                self.param_count += len(v)
-            self.modules_to_not_convert.extend(module_names)
 
 
 def _process_file(
@@ -144,64 +43,14 @@ def _process_file(
         return
 
     logger.info(f"Processing {filename}, memory usage: {torch.cuda.memory_allocated()}")
-    weights: dict[str, torch.Tensor] = {}
     q_weights: dict[str, torch.Tensor] = {}
+    modules_to_not_convert: list[str] = []
 
     with safetensors.safe_open(os.path.join(input_path, filename), framework="pt", device="cuda") as f:
         for k in f.keys():
-            weights[k] = f.get_tensor(k)
-
-    modules_to_not_convert: list[str] = []
-    for key in list(weights.keys()):
-        weight = weights[key]
-
-        is_fused_experts = key.endswith(".experts.gate_up_proj") or key.endswith(".experts.down_proj")
-        if weight.dim() == 3 and is_fused_experts:
-            base = key.rsplit(".", 1)[0]  # ``...mlp.experts``
-            for expert_idx in range(weight.shape[0]):
-                expert = weight[expert_idx]
-                if key.endswith(".gate_up_proj"):
-                    gate_w, up_w = expert.chunk(2, dim=0)
-                    _store_quantized_fp8(
-                        q_weights, f"{base}.{expert_idx}.gate_proj", gate_w.contiguous(), strategy, block_size
-                    )
-                    _store_quantized_fp8(
-                        q_weights, f"{base}.{expert_idx}.up_proj", up_w.contiguous(), strategy, block_size
-                    )
-                else:
-                    _store_quantized_fp8(
-                        q_weights, f"{base}.{expert_idx}.down_proj", expert.contiguous(), strategy, block_size
-                    )
-            continue
-
-        if (
-            "weight" in key
-            and "layernorm" not in key
-            and "embed" not in key
-            and "router" not in key
-            and "mlp.gate." not in key
-            and "norm" not in key
-            and "lm_head" not in key
-            and "eh_proj" not in key
-            and "weights_proj" not in key
-            and "conv1d" not in key
-            and "A_log" not in key
-            and "dt_bias" not in key
-            and "in_proj_a" not in key
-            and "in_proj_b" not in key
-            and "shared_expert_gate" not in key
-            and "visual" not in key
-        ):
-            qw, s = quant_fp8(weights[key], strategy, block_size)
-            q_weights[key] = qw
-            if block_size:
-                scale_name = key.replace(".weight", ".weight_scale_inv")
-            else:
-                scale_name = key.replace(".weight", ".weight_scale")
-            q_weights[scale_name] = s
-        else:
-            modules_to_not_convert.append(key.replace(".weight", ""))
-            q_weights[key] = weights[key]
+            converted, ignored_modules = quantize_hf_tensor(k, f.get_tensor(k), strategy, block_size)
+            q_weights.update(converted)
+            modules_to_not_convert.extend(ignored_modules)
 
     safetensors.torch.save_file(q_weights, os.path.join(output_path, filename), metadata={"format": "pt"})
 
@@ -216,6 +65,7 @@ def convert_fp8(
     max_workers: int = 4,
     scale_fmt: str | None = None,
 ) -> None:
+    validate_fp8_options(strategy, block_size)
     input_path = os.path.abspath(input_path)
     os.makedirs(output_path, exist_ok=True)
 
@@ -238,56 +88,12 @@ def convert_fp8(
         for future in tqdm(futures, desc="Processing files"):
             future.result()
 
-    if strategy == "block" or strategy == "tensor":
-        quantization_config: dict = {
-            "activation_scheme": "dynamic",
-            "fmt": "e4m3",
-            "quant_method": "fp8",
-        }
-        if block_size:
-            quantization_config["weight_block_size"] = block_size
-            if scale_fmt is not None:
-                quantization_config["scale_fmt"] = scale_fmt
-        if len(result_collector.modules_to_not_convert) > 0:
-            quantization_config["modules_to_not_convert"] = list(set(result_collector.modules_to_not_convert))
-    else:
-        quant_group = {
-            "group_0": {
-                "input_activations": {
-                    "actorder": None,
-                    "block_structure": None,
-                    "dynamic": True,
-                    "group_size": None,
-                    "num_bits": 8,
-                    "observer": None,
-                    "observer_kwargs": {},
-                    "strategy": "token",
-                    "symmetric": True,
-                    "type": "float",
-                },
-                "output_activations": None,
-                "targets": ["Linear"],
-                "weights": {
-                    "actorder": None,
-                    "block_structure": None,
-                    "dynamic": False,
-                    "group_size": None,
-                    "num_bits": 8,
-                    "observer": "minmax",
-                    "observer_kwargs": {},
-                    "strategy": strategy,
-                    "symmetric": True,
-                    "type": "float",
-                },
-            },
-        }
-        quantization_config = {
-            "config_groups": quant_group,
-            "format": "float-quantized",
-            "ignore": list(set(result_collector.modules_to_not_convert)),
-            "quant_method": "compressed-tensors",
-            "quantization_status": "compressed",
-        }
+    quantization_config = build_quantization_config(
+        strategy,
+        block_size,
+        result_collector.modules_to_not_convert,
+        scale_fmt,
+    )
 
     config_path = Path(input_path) / "config.json"
     if config_path.exists():
@@ -297,9 +103,7 @@ def convert_fp8(
         with open(Path(output_path) / "config.json", "w") as f:
             json.dump(cfg, f, indent=2)
 
-    index_dict = {"weight_map": result_collector.weight_map, "metadata": {"total_size": result_collector.param_count}}
-    with open(Path(output_path) / "model.safetensors.index.json", "w") as f:
-        json.dump(index_dict, f, indent=2)
+    write_safetensors_index(output_path, result_collector)
 
     gc.collect()
     torch.cuda.empty_cache()

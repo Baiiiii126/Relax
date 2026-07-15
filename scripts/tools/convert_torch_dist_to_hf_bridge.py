@@ -2,10 +2,24 @@
 
 import argparse
 import os
+import sys
+from pathlib import Path
 
 import megatron.bridge.training.model_load_save as _model_load_save_module
 import safetensors.torch as _safetensors_torch
+import torch
 from megatron.bridge import AutoBridge
+
+
+_RELAX_ROOT = str(Path(__file__).resolve().parents[2])
+if _RELAX_ROOT in sys.path:
+    sys.path.remove(_RELAX_ROOT)
+sys.path.insert(0, _RELAX_ROOT)
+
+_pythonpath_entries = [
+    entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry and entry != _RELAX_ROOT
+]
+os.environ["PYTHONPATH"] = os.pathsep.join([_RELAX_ROOT, *_pythonpath_entries])
 
 
 # Some megatron_to_hf mappings in Megatron Bridge yield non-contiguous tensors (e.g. after
@@ -92,10 +106,62 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f", "--force", action="store_true", help="Force overwrite the output directory if it exists."
     )
+    parser.add_argument(
+        "--fp8",
+        action="store_true",
+        help="Quantize each exported HF tensor to FP8 before it is buffered for safetensors output.",
+    )
+    parser.add_argument(
+        "--fp8-strategy",
+        choices=["block", "channel", "tensor"],
+        default="block",
+        help="FP8 quantization strategy (default: block).",
+    )
+    parser.add_argument(
+        "--fp8-block-size",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("ROWS", "COLS"),
+        help="Block shape for block FP8 (default: 128 128).",
+    )
+    parser.add_argument(
+        "--fp8-device",
+        type=str,
+        default="cuda",
+        help="Device used for one-tensor-at-a-time FP8 quantization (default: cuda).",
+    )
+    parser.add_argument(
+        "--fp8-max-shard-size-mb",
+        type=int,
+        default=4096,
+        help="Target FP8 safetensors shard size in MiB; one converted tensor group may exceed it (default: 4096).",
+    )
     args = parser.parse_args()
 
+    if args.fp8:
+        try:
+            output_is_origin = os.path.samefile(args.output_dir, args.origin_hf_dir)
+        except FileNotFoundError:
+            output_is_origin = os.path.realpath(args.output_dir) == os.path.realpath(args.origin_hf_dir)
+        if output_is_origin:
+            raise ValueError("--output-dir must differ from --origin-hf-dir for online FP8 conversion")
     if os.path.exists(args.output_dir) and not args.force:
         raise ValueError(f"Output directory {args.output_dir} already exists. Use --force to overwrite it.")
+
+    fp8_block_size = args.fp8_block_size
+    if args.fp8 and args.fp8_strategy == "block" and fp8_block_size is None:
+        fp8_block_size = [128, 128]
+    if args.fp8:
+        from relax.utils.quant_cast.fp8 import build_quantization_config, validate_fp8_options
+        from relax.utils.quant_cast.fp8_checkpoint import StreamingFP8Writer
+
+        validate_fp8_options(args.fp8_strategy, fp8_block_size)
+        if args.fp8_max_shard_size_mb <= 0:
+            raise ValueError("--fp8-max-shard-size-mb must be positive")
+        fp8_device = torch.device(args.fp8_device)
+        if fp8_device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("--fp8-device points to CUDA, but torch.cuda.is_available() is false")
 
     print(f"Loading config from {args.origin_hf_dir}")
     bridge = AutoBridge.from_hf_pretrained(args.origin_hf_dir, trust_remote_code=True)
@@ -105,15 +171,44 @@ if __name__ == "__main__":
     provider = bridge.to_megatron_provider(load_weights=False)
 
     # Some HF configurations enable MTP layers, but RL-trained Megatron checkpoints lack MTP weights, which causes a loading error.
+    allow_missing_mtp_keys = False
     if getattr(provider, "mtp_num_layers", 0) and not _checkpoint_has_mtp(args.input_dir):
         print(f"[convert] Checkpoint has no MTP weights; disabling MTP (was mtp_num_layers={provider.mtp_num_layers})")
         provider.mtp_num_layers = 0
+        allow_missing_mtp_keys = True
 
     _provider_override["provider"] = provider
     print(f"[convert] Using Bridge provider: {type(provider).__name__}")
 
+    fp8_writer = None
+    source = None
+    original_save_generator = None
+    if args.fp8:
+        state = getattr(bridge.hf_pretrained, "state", None)
+        source = getattr(state, "source", None)
+        if source is None or not hasattr(source, "key_to_filename_map"):
+            raise ValueError("Online FP8 conversion requires --origin-hf-dir to contain safetensors weights")
+        fp8_writer = StreamingFP8Writer(
+            source.key_to_filename_map,
+            args.fp8_strategy,
+            fp8_block_size,
+            args.fp8_device,
+            args.fp8_max_shard_size_mb * 1024**2,
+        )
+        original_save_generator = source.save_generator
+        source.save_generator = fp8_writer.save_generator
+        print(
+            f"[convert] Enabled streaming FP8: strategy={args.fp8_strategy}, "
+            f"block_size={fp8_block_size}, device={args.fp8_device}, "
+            f"max_shard_size_mb={args.fp8_max_shard_size_mb}"
+        )
+
     print(f"Exporting checkpoint from {args.input_dir} to {args.output_dir}")
-    bridge.export_ckpt(args.input_dir, args.output_dir)
+    try:
+        bridge.export_ckpt(args.input_dir, args.output_dir, strict=args.fp8 and not allow_missing_mtp_keys)
+    finally:
+        if source is not None and original_save_generator is not None:
+            source.save_generator = original_save_generator
 
     # Make the output dir consumable by older transformers 4.x releases.
     import json
@@ -130,6 +225,12 @@ if __name__ == "__main__":
         if "dtype" in cfg and "torch_dtype" not in cfg:
             cfg["torch_dtype"] = cfg["dtype"]
         cfg["transformers_version"] = "4.51.0"
+        if fp8_writer is not None:
+            cfg["quantization_config"] = build_quantization_config(
+                args.fp8_strategy,
+                fp8_block_size,
+                fp8_writer.result.modules_to_not_convert,
+            )
         with open(cfg_path, "w") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
         print(f"[convert] post-processed {cfg_path} for transformers 4.x compatibility")
@@ -140,5 +241,11 @@ if __name__ == "__main__":
         if os.path.isfile(src):
             shutil.copyfile(src, dst)
             print(f"[convert] copied {fname} from origin (tokenizer-compatibility)")
+
+    if fp8_writer is not None:
+        print(
+            f"[convert] wrote {len(fp8_writer.result.weight_map)} FP8 checkpoint tensors "
+            f"({fp8_writer.result.total_size} bytes)"
+        )
 
     print("Done!")

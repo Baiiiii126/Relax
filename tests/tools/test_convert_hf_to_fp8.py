@@ -7,14 +7,15 @@ Qwen3.6 stores routed experts as a single fused 3-D tensor
 into per-expert 2-D projections, split ``gate_up`` into ``gate`` + ``up``, and
 quantize each. It must also skip the vision tower and the shared-expert gate.
 
-The real quantizer needs a GPU (triton FP8), so we stub ``quant_fp8`` with a
-shape-recording no-op and fake the safetensors I/O. That isolates the pure
-naming / slicing logic introduced by the commit.
+The production path normally quantizes on CUDA, so these tests stub ``quant_fp8``
+with a shape-recording no-op and fake the safetensors I/O. That isolates the
+naming, slicing, streaming, and indexing logic.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 
 import pytest
@@ -24,6 +25,9 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("safetensors")
 import safetensors  # noqa: E402
 import safetensors.torch  # noqa: E402
+
+from relax.utils.quant_cast import fp8 as fp8_mod  # noqa: E402
+from relax.utils.quant_cast import fp8_checkpoint as checkpoint_mod  # noqa: E402
 
 
 _SOURCE = pathlib.Path(__file__).resolve().parents[2] / "scripts/tools/convert_hf_to_fp8.py"
@@ -72,18 +76,18 @@ def harness(monkeypatch):
     def _fake_save_file(tensors, path, metadata=None):
         saved["tensors"] = dict(tensors)
 
-    monkeypatch.setattr(mod, "quant_fp8", _fake_quant_fp8)
+    monkeypatch.setattr(fp8_mod, "quant_fp8", _fake_quant_fp8)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a, **k: 0)
     monkeypatch.setattr(safetensors.torch, "save_file", _fake_save_file)
 
     def _run(inputs, block_size=None):
         monkeypatch.setattr(safetensors, "safe_open", lambda *a, **k: _FakeReader(inputs))
-        collector = mod.ConversionResult()
+        collector = checkpoint_mod.ConversionResult()
         mod._process_file(
             input_path="/in",
             output_path="/out",
             filename="model-00001-of-00001.safetensors",
-            strategy="tensor",
+            strategy="block" if block_size else "tensor",
             block_size=block_size,
             result_collector=collector,
         )
@@ -93,19 +97,153 @@ def harness(monkeypatch):
 
 
 class TestStoreQuantizedFp8:
-    """Unit-level: scale-suffix selection depends on block_size."""
+    """Unit-level: scale-suffix selection follows the quantization strategy."""
 
     def test_per_tensor_scale_suffix(self, monkeypatch):
-        monkeypatch.setattr(mod, "quant_fp8", lambda w, s, b=None: (w, torch.ones(1)))
+        monkeypatch.setattr(fp8_mod, "quant_fp8", lambda w, s, b=None: (w, torch.ones(1)))
         out = {}
-        mod._store_quantized_fp8(out, "a.b", torch.zeros(2, 2), strategy="tensor", block_size=None)
+        fp8_mod._store_quantized_fp8(out, "a.b", torch.zeros(2, 2), strategy="tensor", block_size=None)
         assert set(out) == {"a.b.weight", "a.b.weight_scale"}
 
     def test_block_scale_suffix(self, monkeypatch):
-        monkeypatch.setattr(mod, "quant_fp8", lambda w, s, b=None: (w, torch.ones(1)))
+        monkeypatch.setattr(fp8_mod, "quant_fp8", lambda w, s, b=None: (w, torch.ones(1)))
         out = {}
-        mod._store_quantized_fp8(out, "a.b", torch.zeros(2, 2), strategy="block", block_size=[128, 128])
+        fp8_mod._store_quantized_fp8(out, "a.b", torch.zeros(2, 2), strategy="block", block_size=[128, 128])
         assert set(out) == {"a.b.weight", "a.b.weight_scale_inv"}
+
+    def test_quantization_outputs_are_detached(self, monkeypatch):
+        monkeypatch.setattr(
+            fp8_mod,
+            "quant_fp8",
+            lambda weight, strategy, block_size=None: (weight * 2, weight.sum().view(1)),
+        )
+        weight = torch.ones(2, 2, requires_grad=True)
+        qweight, scale = fp8_mod._quantize_on_device(weight, "tensor", None, "cpu")
+        assert not qweight.requires_grad
+        assert not scale.requires_grad
+
+
+class TestFp8Options:
+    def test_block_requires_two_positive_dimensions(self):
+        with pytest.raises(ValueError, match="exactly two positive"):
+            fp8_mod.validate_fp8_options("block", None)
+        with pytest.raises(ValueError, match="exactly two positive"):
+            fp8_mod.validate_fp8_options("block", [128, 0])
+
+    def test_non_block_rejects_block_size(self):
+        with pytest.raises(ValueError, match="only valid"):
+            fp8_mod.validate_fp8_options("tensor", [128, 128])
+
+
+class TestStreamingFp8Writer:
+    def test_quantizes_per_tensor_flushes_bounded_shards_and_rebuilds_index(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            fp8_mod,
+            "quant_fp8",
+            lambda weight, strategy, block_size=None: (weight.clone(), torch.ones(1, dtype=torch.float32)),
+        )
+
+        saved = []
+
+        def _fake_save_file(tensors, path, metadata=None):
+            saved.append((path.name, set(tensors), metadata))
+            path.touch()
+
+        monkeypatch.setattr(safetensors.torch, "save_file", _fake_save_file)
+
+        writer = checkpoint_mod.StreamingFP8Writer(
+            {
+                "a.weight": "model-00001-of-00002.safetensors",
+                "norm.weight": "model-00001-of-00002.safetensors",
+                "b.weight": "model-00002-of-00002.safetensors",
+            },
+            strategy="block",
+            block_size=[2, 2],
+            device="cpu",
+            max_shard_size=20,
+        )
+        writer.save_generator(
+            iter(
+                [
+                    ("a.weight", torch.ones(2, 2)),
+                    ("b.weight", torch.ones(2, 2)),
+                    ("norm.weight", torch.ones(2, 2)),
+                ]
+            ),
+            tmp_path,
+        )
+
+        assert len(saved) == 3
+        assert saved[0][1] == {"a.weight", "a.weight_scale_inv"}
+        assert saved[1][1] == {"b.weight", "b.weight_scale_inv"}
+        assert saved[2][1] == {"norm.weight"}
+        assert writer.result.modules_to_not_convert == ["norm"]
+
+        with open(tmp_path / "model.safetensors.index.json") as f:
+            index = json.load(f)
+        assert index["weight_map"]["a.weight_scale_inv"] == "model-00001-of-00003.safetensors"
+        assert index["weight_map"]["norm.weight"] == "model-00003-of-00003.safetensors"
+        assert "norm.weight_scale_inv" not in index["weight_map"]
+        assert index["metadata"]["total_size"] == 56
+        assert len(list(tmp_path.glob("model-*-of-*.safetensors"))) == 3
+
+    def test_strict_mode_rejects_incomplete_source_shard(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            fp8_mod,
+            "quant_fp8",
+            lambda weight, strategy, block_size=None: (weight.clone(), torch.ones(1, dtype=torch.float32)),
+        )
+        writer = checkpoint_mod.StreamingFP8Writer(
+            {"a.weight": "model.safetensors", "b.weight": "model.safetensors"},
+            strategy="tensor",
+            block_size=None,
+            device="cpu",
+            max_shard_size=1,
+        )
+        existing_checkpoint = tmp_path / "model.safetensors"
+        existing_checkpoint.write_bytes(b"existing checkpoint")
+        with pytest.raises(KeyError, match="did not yield 1 tensors"):
+            writer.save_generator(iter([("a.weight", torch.ones(2, 2))]), tmp_path, strict=True)
+        assert existing_checkpoint.read_bytes() == b"existing checkpoint"
+        assert not (tmp_path / "model.safetensors.index.json").exists()
+        assert not list(tmp_path.glob(".fp8-export-*"))
+
+    def test_keyboard_interrupt_during_commit_restores_existing_checkpoint(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            fp8_mod,
+            "quant_fp8",
+            lambda weight, strategy, block_size=None: (weight.clone(), torch.ones(1, dtype=torch.float32)),
+        )
+        monkeypatch.setattr(safetensors.torch, "save_file", lambda tensors, path, metadata=None: path.touch())
+
+        existing_checkpoint = tmp_path / "model.safetensors"
+        existing_checkpoint.write_bytes(b"existing checkpoint")
+        original_replace = checkpoint_mod.os.replace
+
+        def _interrupt_when_installing_shard(source, destination):
+            if pathlib.Path(source).name.startswith(".fp8-shard-") and pathlib.Path(destination).parent == tmp_path:
+                original_replace(source, destination)
+                raise KeyboardInterrupt
+            original_replace(source, destination)
+
+        monkeypatch.setattr(checkpoint_mod.os, "replace", _interrupt_when_installing_shard)
+        writer = checkpoint_mod.StreamingFP8Writer(
+            {"a.weight": "model.safetensors"},
+            strategy="tensor",
+            block_size=None,
+            device="cpu",
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            writer.save_generator(iter([("a.weight", torch.ones(2, 2))]), tmp_path)
+
+        assert existing_checkpoint.read_bytes() == b"existing checkpoint"
+        assert not (tmp_path / "model.safetensors.index.json").exists()
+        assert not list(tmp_path.glob(".fp8-export-*"))
+
+    def test_config_uses_sorted_unique_ignored_modules(self):
+        config = fp8_mod.build_quantization_config("block", [128, 128], ["z", "a", "z"])
+        assert config["modules_to_not_convert"] == ["a", "z"]
 
 
 class TestProcessFileFusedExperts:
