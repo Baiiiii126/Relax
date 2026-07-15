@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from packaging.version import parse
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
@@ -73,8 +74,11 @@ def init_process_group(
 
     # NOTE: The pg_options parameter was renamed into backend_options in PyTorch 2.6.0
     # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
-    # We need to determine the appropriate parameter name based on PyTorch version
-    pg_options_param_name = "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+    # We need to determine the appropriate parameter name based on PyTorch version.
+    # Use packaging.version for a numeric comparison: a plain string compare is wrong
+    # for torch >= 2.10 (e.g. "2.11.0" < "2.6" lexicographically), which would pick the
+    # pre-2.6 name "pg_options" and raise TypeError on newer PyTorch.
+    pg_options_param_name = "backend_options" if parse(torch.__version__) >= parse("2.6") else "pg_options"
     pg, _ = _new_process_group_helper(
         world_size,
         rank,
