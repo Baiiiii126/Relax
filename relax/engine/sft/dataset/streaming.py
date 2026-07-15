@@ -666,13 +666,13 @@ def _expand_loss_mask_via_alignment(
     return torch.tensor(out, dtype=torch.long)
 
 
-def pack_samples_for_tq(samples: list[ProcessedSample]) -> Optional[dict]:
+def pack_samples_for_tq(samples: list[ProcessedSample], force_multimodal_field: bool = False) -> Optional[dict]:
     if not samples:
         return None
     tokens = [s.tokens.tolist() for s in samples]
     loss_masks = [s.loss_mask.tolist() for s in samples]
     total_lengths = [s.total_length for s in samples]
-    has_mm = any(s.multimodal_train_inputs is not None for s in samples)
+    has_mm = force_multimodal_field or any(s.multimodal_train_inputs is not None for s in samples)
     batch = {
         "tokens": tokens,
         "loss_masks": loss_masks,

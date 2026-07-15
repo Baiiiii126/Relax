@@ -325,7 +325,7 @@ class SFT(Base):
             self.step += 1
             return
         self._maybe_print_first_sample(samples)
-        backend_batch = pack_samples_for_tq(samples)
+        backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
         assert backend_batch is not None
         await self.data_system_client.async_put(
             data=dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
@@ -392,7 +392,7 @@ class SFT(Base):
                 f"interpret with caution."
             )
 
-        backend_batch = pack_samples_for_tq(samples)
+        backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
         assert backend_batch is not None
         n_samples = len(backend_batch["tokens"])
 
