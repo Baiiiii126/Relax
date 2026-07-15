@@ -236,13 +236,26 @@ training step 0/200
 Relax 保存的 checkpoint 为 Megatron DCP 格式，如需转换为 Hugging Face 权重格式，可使用 [`convert_torch_dist_to_hf_bridge.py`](../../../scripts/tools/convert_torch_dist_to_hf_bridge.py) 脚本：
 
 ```bash
-# 确保 PYTHONPATH 包含 Megatron-LM 和 Relax
-export PYTHONPATH=${MEGATRON}:${RELAX}:$PYTHONPATH
-
 python scripts/tools/convert_torch_dist_to_hf_bridge.py \
   --input-dir /path/to/dcp_checkpoint \
   --output-dir /path/to/hf_output \
   --origin-hf-dir /path/to/original_hf_model
+```
+
+脚本会自动把 Relax 仓库根目录添加到 `PYTHONPATH`；当前环境仍需能够导入 Megatron-LM 和 Megatron Bridge。
+
+如果希望在导出过程中直接转成 FP8，而不先写一份中间 BF16 HF checkpoint，可开启流式 FP8 转换：
+
+```bash
+python scripts/tools/convert_torch_dist_to_hf_bridge.py \
+  --input-dir /path/to/dcp_checkpoint \
+  --origin-hf-dir /path/to/original_hf_model \
+  --output-dir /path/to/hf_output_fp8 \
+  --fp8 \
+  --fp8-strategy block \
+  --fp8-block-size 128 128 \
+  --fp8-device cuda \
+  --fp8-max-shard-size-mb 4096
 ```
 
 参数说明：
@@ -251,11 +264,14 @@ python scripts/tools/convert_torch_dist_to_hf_bridge.py \
 |---|---|
 | `--input-dir` | Megatron DCP 格式的 checkpoint 目录 |
 | `--output-dir` | 转换后 HF 权重的输出目录 |
-| `--origin-hf-dir` | 原始 HF 模型目录（用于读取模型配置） |
+| `--origin-hf-dir` | 原始 HF safetensors 目录，用于读取模型结构、预期权重 key 和 tokenizer 文件 |
 | `--force` | 可选，若输出目录已存在则强制覆盖 |
+
+FP8 策略参数、显存行为、输出格式和 SGLang 8 卡 TP8 启动命令见[模型 Checkpoint 转换](./model-conversion.md)。
 
 ## 下一步
 
 - [自定义训练](./customize-training.md) — 了解如何自定义训练脚本、参数、Reward 函数以及多机启动
+- [模型 Checkpoint 转换](./model-conversion.md) — 导出并启动训练后的 checkpoint
 - [配置说明](./configuration.md) — 完整参数参考
 - [架构设计](./architecture.md) — 理解系统设计

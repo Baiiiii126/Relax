@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Augment ``quantization_config.ignore`` at runtime for INT4 checkpoints."""
+"""Utilities for quantized checkpoint casting and metadata handling."""
 
 import os
 
