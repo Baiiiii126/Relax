@@ -147,11 +147,14 @@ def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
             response.raise_for_status()
             with BytesIO(response.content) as bio:
                 image_obj = Image.open(bio)
+                image_obj.load()
     else:
         if image.startswith("file://"):
             image = image[7:]
         assert os.path.exists(image), f"Image path {image} does not exist."
-        image_obj = Image.open(image)
+        with open(image, "rb") as f:
+            image_obj = Image.open(f)
+            image_obj.load()
 
     return image_obj
 
