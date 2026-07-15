@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from relax.engine.sft.dataset.streaming import (
+    ProcessedSample,
     SFTStreamingDataset,
     _canonicalize_messages,
     _expand_loss_mask_via_alignment,
@@ -128,6 +129,35 @@ def test_pack_samples_for_tq_marks_samples_as_sft(tmp_path: Path):
     assert batch["response_lengths"][0] == len(batch["tokens"][0])
     assert sum(batch["loss_masks"][0]) == len("A")
     ds.stop()
+
+
+def _make_text_only_sample() -> ProcessedSample:
+    """A ProcessedSample with no multimodal inputs (text-only)."""
+    return ProcessedSample(
+        tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+        loss_mask=torch.tensor([0, 1, 1], dtype=torch.long),
+        total_length=3,
+        multimodal_train_inputs=None,
+        source_idx=0,
+    )
+
+
+def test_pack_samples_for_tq_omits_multimodal_field_for_text_only_batch():
+    # Default behaviour: an all-text batch carries no multimodal key.
+    batch = pack_samples_for_tq([_make_text_only_sample()])
+
+    assert batch is not None
+    assert "multimodal_train_inputs" not in batch
+
+
+def test_pack_samples_for_tq_forces_multimodal_field_for_text_only_batch():
+    # A VL run (multimodal_keys configured) must always emit the field so the
+    # consumer's fixed TQ field list stays satisfied even for text-only batches.
+    batch = pack_samples_for_tq([_make_text_only_sample()], force_multimodal_field=True)
+
+    assert batch is not None
+    assert "multimodal_train_inputs" in batch
+    assert batch["multimodal_train_inputs"] == [None]
 
 
 def test_streaming_dataset_builds_messages_from_prompt_and_label_keys(tmp_path: Path):
