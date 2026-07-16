@@ -286,7 +286,7 @@ class SFT(Base):
                     f"partitions={partitions}); consumer likely dead. Raise "
                     f"--sft-tq-timeout-minutes if this is a slow consumer."
                 )
-            if wait_count % 10 == 0:
+            if wait_count % 60 == 0:
                 self._logger.info(
                     f"SFT producer step {self.step}: TQ buffer full "
                     f"(in_flight={in_flight}/{max_in_flight}, partitions={partitions}); waited {wait_count}s"

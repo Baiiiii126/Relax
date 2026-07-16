@@ -346,7 +346,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",
-                help="Whether to disable recompute loss function to save memory during training.",
+                help="Whether to recompute the loss function to save memory during training.",
+            )
+            parser.add_argument(
+                "--recompute-loss-function-use-reentrant",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Whether loss-function recomputation uses PyTorch's reentrant checkpoint implementation. "
+                "Defaults to True to preserve existing behavior; pass "
+                "--no-recompute-loss-function-use-reentrant to use the recommended non-reentrant implementation.",
             )
             parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import argparse
 import importlib
 import sys
 from types import ModuleType, SimpleNamespace
@@ -35,6 +36,24 @@ def arguments_module(monkeypatch):
     module = importlib.import_module("relax.utils.arguments")
     yield module
     sys.modules.pop("relax.utils.arguments", None)
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], True),
+        (["--recompute-loss-function-use-reentrant"], True),
+        (["--no-recompute-loss-function-use-reentrant"], False),
+    ],
+)
+def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    args = parser.parse_args(argv)
+
+    assert args.recompute_loss_function_use_reentrant is expected
 
 
 def _opd_args() -> SimpleNamespace:

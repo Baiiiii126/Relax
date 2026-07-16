@@ -10,12 +10,15 @@ Two paths (spec §7.5):
    to build the mask. Used when the template lacks `{% generation %}`.
 """
 
+import hashlib
 import re
 from collections.abc import Mapping
 from typing import Any
 
 import torch
 
+from relax.engine.sft.dataset.chat_template_patch import TemplatePatchResult, apply_chat_template_patchers
+from relax.engine.sft.dataset.qwen_chat_template_patch import try_patch_qwen_chat_template
 from relax.engine.sft.dataset.sample import CanonicalSample
 from relax.utils.logging_utils import get_logger
 
@@ -27,8 +30,9 @@ logger = get_logger(__name__)
 # form for the purpose of marking assistant-token spans, so they should be
 # recognised as the same marker.
 _GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
+_CHAT_TEMPLATE_PATCHERS = (try_patch_qwen_chat_template,)
 _FALLBACK_WARNED: set[int] = set()  # tokenizer id → warned once
-_TEMPLATE_LOGGED: set[int] = set()  # tokenizer id → effective-template logged once
+_TEMPLATE_LOGGED: set[tuple[int, int, str]] = set()  # tokenizer id + template hash + preserve mode
 
 
 def HAS_GENERATION_MARKER(template_str: str | None) -> bool:  # noqa: N802
@@ -212,6 +216,23 @@ def _merge_per_sample_kwargs(sample: CanonicalSample, apply_chat_template_kwargs
     return {**(apply_chat_template_kwargs or {}), **(per_sample or {})}
 
 
+def _resolve_sft_template_kwargs(
+    sample: CanonicalSample,
+    *,
+    tokenizer,
+    apply_chat_template_kwargs: dict | None,
+) -> TemplatePatchResult:
+    """Merge template kwargs and apply the unique matching model adapter."""
+    merged = _merge_per_sample_kwargs(sample, apply_chat_template_kwargs)
+    effective_template = merged.get("chat_template") or getattr(tokenizer, "chat_template", None)
+    return apply_chat_template_patchers(
+        sample,
+        effective_template,
+        merged,
+        patchers=_CHAT_TEMPLATE_PATCHERS,
+    )
+
+
 def render_with_loss_mask(
     sample: CanonicalSample,
     *,
@@ -229,34 +250,45 @@ def render_with_loss_mask(
     for inference and silently drops content needed for training
     (e.g. DeepSeek-R1 distill templates strip ``<think>...</think>``).
     """
-    merged = _merge_per_sample_kwargs(sample, apply_chat_template_kwargs)
+    patch_result = _resolve_sft_template_kwargs(
+        sample,
+        tokenizer=tokenizer,
+        apply_chat_template_kwargs=apply_chat_template_kwargs,
+    )
+    merged = patch_result.kwargs
+    effective_template = patch_result.template
     # Effective template is the override if provided, else the tokenizer's
     # bound template. We must consult the EFFECTIVE template (not the
     # tokenizer's) to pick path 1 vs path 2 — passing a chat_template kwarg
     # that has {% generation %} markers should still take the fast path
     # even if the tokenizer's own bound template lacks them.
-    effective_template = merged.get("chat_template") or getattr(tokenizer, "chat_template", None)
-
     # Log the effective template once per tokenizer instance so users can
     # confirm an apply_chat_template_kwargs override is actually taking
     # effect (sha256 + short prefix; the full template can be 1000s of chars).
     tok_id = id(tokenizer)
-    if tok_id not in _TEMPLATE_LOGGED:
-        import hashlib
-
+    eff = effective_template or ""
+    log_key = (tok_id, hash(eff), repr(merged.get("preserve_thinking")))
+    if log_key not in _TEMPLATE_LOGGED:
+        template_hash = hashlib.sha256(eff.encode()).hexdigest()[:16]
         bound = getattr(tokenizer, "chat_template", None) or ""
-        eff = effective_template or ""
-        source = "override (apply_chat_template_kwargs)" if merged.get("chat_template") else "tokenizer.chat_template"
+        if patch_result.patch_name:
+            status = "patched" if patch_result.changed else "native"
+            source = f"{patch_result.patch_name} ({status})"
+        elif merged.get("chat_template"):
+            source = "override (apply_chat_template_kwargs)"
+        else:
+            source = "tokenizer.chat_template"
         eff_preview = eff[:120].replace("\n", "\\n")
         logger.info(
             f"SFT chat_template source={source} "
-            f"sha256={hashlib.sha256(eff.encode()).hexdigest()[:16]} "
+            f"sha256={template_hash} "
             f"len={len(eff)} "
             f"matches_bound={eff == bound} "
             f"has_generation_marker={HAS_GENERATION_MARKER(eff)} "
+            f"preserve_thinking={merged.get('preserve_thinking')!r} "
             f"preview={eff_preview!r}"
         )
-        _TEMPLATE_LOGGED.add(tok_id)
+        _TEMPLATE_LOGGED.add(log_key)
 
     if HAS_GENERATION_MARKER(effective_template):
         return _render_with_assistant_mask(sample, tokenizer=tokenizer, apply_chat_template_kwargs=merged)
@@ -285,10 +317,14 @@ def render_to_text(
     expands those placeholders to per-image-grid token runs and produces the
     ``input_ids`` the model actually consumes.
     """
-    merged = _merge_per_sample_kwargs(sample, apply_chat_template_kwargs)
+    patch_result = _resolve_sft_template_kwargs(
+        sample,
+        tokenizer=tokenizer,
+        apply_chat_template_kwargs=apply_chat_template_kwargs,
+    )
     return tokenizer.apply_chat_template(
         _to_chat_messages(sample),
         tools=sample.tools,
         tokenize=False,
-        **merged,
+        **patch_result.kwargs,
     )

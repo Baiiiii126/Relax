@@ -1299,7 +1299,14 @@ def loss_function(
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
     if args.recompute_loss_function:
-        loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean)
+        loss, log = checkpoint(
+            func,
+            args,
+            batch,
+            logits,
+            sum_of_sample_mean,
+            use_reentrant=getattr(args, "recompute_loss_function_use_reentrant", True),
+        )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
 

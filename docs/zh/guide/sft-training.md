@@ -218,6 +218,57 @@ SFT 必须使用动态 batching。缺少 `--use-dynamic-batch-size` 时，参数
 
 SFT 不需要额外添加 `--apply-chat-template`。SFT 数据集会在内部使用 tokenizer chat template 渲染样本，并从渲染结果构造 assistant loss mask。
 
+### Chat Template 兼容补丁
+
+#### 分发与作用域
+
+渲染 SFT 样本前，Relax 会从显式 `chat_template` override 或 `tokenizer.chat_template` 中确定 effective template，再执行静态的模型专用 patch 注册表。全局 `--apply-chat-template-kwargs` 会与 `sample.metadata["apply_chat_template_kwargs"]` 合并，样本级配置优先。tokenize 的 `render_with_loss_mask` 路径和多模态使用的 `render_to_text` 路径共用同一份结果。
+
+patch 按样本、按调用生效，绝不会修改 `tokenizer.chat_template`。如果没有 patcher 识别 effective template，dispatcher 会严格 no-op：原模板和用户显式提供的 kwargs 均原样透传。模型识别依据是模板内容，而不是 checkpoint 名称。
+
+通用 dispatcher 实现在 [`chat_template_patch.py`](../../../relax/engine/sft/dataset/chat_template_patch.py)，模型专用行为则放在独立模块中，例如 [`qwen_chat_template_patch.py`](../../../relax/engine/sft/dataset/qwen_chat_template_patch.py)。
+
+::: tip 作用域
+这些 patch 只影响 SFT 样本渲染，不会修改 Rollout、Agentic Session、SGLang 或其他推理侧的 chat template 行为。
+:::
+
+#### Qwen 历史 Thinking
+
+部分 Qwen 模板只保留最后一个普通 user query 之后的 assistant reasoning。在多轮工具数据中，这可能删除更早的监督 assistant 中的 `<think>...</think>`，但仍留下它的 tool call。Relax 会识别 Qwen3.5 的精确旧 history gate，并在当前渲染调用中回填兼容的 `preserve_thinking` gate；已经包含原生 gate 的模板保持不变。
+
+`preserve_thinking` 支持三种状态：
+
+| 配置 | 行为 |
+| --- | --- |
+| 未配置或 `null` | 默认的按样本自动模式。最后一个普通 user 之前存在 `learn=true` 且文本含 `</think>` 的 assistant 时，Relax 将其设为 `true`；否则保持 Qwen 原生行为。 |
+| `true` | 在整个样本渲染中强制保留历史 thinking。哪些渲染 token 计算 loss 仍由 `learn` 控制。 |
+| `false` | 关闭自动保留，使用 Qwen 原生的历史 reasoning 压缩。answer、tool call 等非 reasoning 内容仍会正常渲染。 |
+
+完整 messages 格式的 SFT 数据如果没有显式提供 `learn`，assistant message 默认 `learn=true`。如果一个 user message 的完整字符串内容被 `<tool_response>...</tool_response>` 包裹，它不会被视为新的普通 user 边界。自动模式只要被一个可学习的历史 assistant 触发，保留策略就会作用于整个渲染；`learn=false` 的 message 可以保留为上下文，但仍不计算 loss。
+
+由于样本级 kwargs 优先，样本中的 `preserve_thinking: null` 会覆盖全局 `false`，使该样本重新进入自动模式。
+
+请使用 JSON 布尔值，不要使用字符串：
+
+```bash
+# 强制保留
+--apply-chat-template-kwargs '{"preserve_thinking": true}'
+
+# 关闭自动保留
+--apply-chat-template-kwargs '{"preserve_thinking": false}'
+
+# 显式恢复按样本自动模式
+--apply-chat-template-kwargs '{"preserve_thinking": null}'
+```
+
+::: warning `false` 不会关闭所有 Thinking
+`preserve_thinking=false` 只会恢复 Qwen 对最后一个普通 user 之前 assistant 轮次的原生压缩。当前 tool episode 中的 assistant 仍遵循 Qwen 原生模板，可能包含空的 `<think>\n\n</think>` 外壳。这个配置与推理侧的 `enable_thinking` 无关。
+
+历史 reasoning 被压缩后，这些 reasoning token 不会出现在渲染后的训练序列中，因此无法计算 loss；关联的 answer 或 tool call 仍可正常训练。
+:::
+
+除了 JSON 布尔值和 `null` 之外的值（例如 `"false"`）会触发 `ValueError`。如果疑似 Qwen 的模板包含重复、冲突或无法识别的 history gate，Relax 会触发 `RuntimeError`，而不是猜测如何 patch。可以通过 SFT 日志中的 `source=qwen_history_thinking (patched|native)` 和最终 `preserve_thinking` 值确认实际分支。
+
 ### 评估与 predict
 
 PPL 评估由以下参数控制：
@@ -417,6 +468,81 @@ SFT 会拒绝静态 micro-batch。添加 `--use-dynamic-batch-size`，并设置 
 ### Predict 没有写文件
 
 检查是否设置了 `--sft-predict-interval`、`--save`，并且至少存在一个 eval 来源。预测文件会写到 `<save>/predict/`。
+
+## 扩展 Chat Template 补丁
+
+如需兼容其他模型族，请新增独立的纯函数 patcher。不要把模型专用知识堆回 [`chat_template.py`](../../../relax/engine/sft/dataset/chat_template.py)；新模块应与现有的 [`qwen_chat_template_patch.py`](../../../relax/engine/sft/dataset/qwen_chat_template_patch.py) 放在同一目录。
+
+### Patcher 约定
+
+使用 [`chat_template_patch.py`](../../../relax/engine/sft/dataset/chat_template_patch.py) 中的 `TemplatePatcher` 签名：
+
+下面的私有函数名 `_matches_exact_foo_template` 和 `_patch_exact_foo_template` 只是占位示例。请在新模块中自行实现对应模型的识别逻辑和精确替换逻辑。
+
+```python
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+from collections.abc import Mapping
+from typing import Any
+
+from relax.engine.sft.dataset.chat_template_patch import TemplatePatchResult
+from relax.engine.sft.dataset.sample import CanonicalSample
+
+
+def try_patch_foo_chat_template(
+    sample: CanonicalSample,
+    template: str | None,
+    kwargs: Mapping[str, Any],
+) -> TemplatePatchResult | None:
+    if not isinstance(template, str):
+        return None
+
+    # 匹配精确且属于该模型的 legacy 或 native 模板片段。
+    if not _matches_exact_foo_template(template):
+        return None
+
+    resolved_kwargs = dict(kwargs)
+    patched_template = _patch_exact_foo_template(template)
+    return TemplatePatchResult(
+        template=patched_template,
+        kwargs=resolved_kwargs,
+        patch_name="foo_history_compatibility",
+        changed=patched_template != template,
+    )
+```
+
+请遵循以下规则：
+
+1. 所有无关模板必须返回 `None`。使用足够窄且稳定的模板特征，不要依赖模型路径或 tokenizer 类名。
+2. 同时识别需要 patch 的 legacy 模板和已经修复的 native 模板，保证重复渲染幂等。
+3. 如果模板疑似属于受支持的模型族，但关键片段已经漂移，应给出清晰错误并 fail-fast，不要猜测替换方式。
+4. 修改前复制 `kwargs`。不要修改 sample、tokenizer、输入 mapping 或任何全局状态。
+5. 返回 effective template 和 kwargs。模板变化时，dispatcher 会把它作为当前调用的 `chat_template` kwarg 注入，并维持 template/kwargs 一致。
+
+### 注册
+
+在 [`chat_template.py`](../../../relax/engine/sft/dataset/chat_template.py) 中导入 patcher，并追加到静态注册表：
+
+```python
+_CHAT_TEMPLATE_PATCHERS = (
+    try_patch_qwen_chat_template,
+    try_patch_foo_chat_template,
+)
+```
+
+不同 patch 的识别条件必须互斥。dispatcher 会执行所有已注册 patcher；如果同一模板匹配多个 patcher，会触发 `RuntimeError`，注册顺序不是优先级机制。
+
+### 测试
+
+参考 [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/test_qwen_chat_template_patch.py)，至少覆盖：
+
+1. 无关模板严格 no-op。
+2. legacy 模板正确 patch，native 模板保持幂等。
+3. 模板漂移、重复或冲突时 fail-fast。
+4. 显式 kwargs 与默认策略正确，且不修改输入 mapping。
+5. `render_with_loss_mask` 与 `render_to_text` 两条路径行为一致。
+6. 不修改绑定的 `tokenizer.chat_template`。
+7. 不与已有 patcher 发生重叠匹配。
 
 ## 下一步
 
