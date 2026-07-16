@@ -1,0 +1,56 @@
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 1ade4ed9e4..0161bd398a 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -314,12 +314,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+                 layer.num_local_experts, *new_shape_w2
+             )
+ 
+-        if _is_npu:
+-            for weight_name in ["w13_weight", "w2_weight"]:
+-                weight = getattr(layer, weight_name)
+-                weight.data = weight.data.transpose(1, 2)
+-                weight.data = npu_format_cast(weight.data)
+-
+         return
+ 
+     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+@@ -646,7 +640,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+         # gmm1: gate_up_proj
+         hidden_states = torch.ops.npu.npu_grouped_matmul(
+             x=[hidden_states],
+-            weight=[layer.w13_weight],
++            weight=[layer.w13_weight.transpose(1, 2)],
+             bias=w13_bias,
+             split_item=2,
+             group_list_type=1,
+@@ -670,7 +664,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+         # gmm2: down_proj
+         hidden_states = torch.ops.npu.npu_grouped_matmul(
+             x=[hidden_states],
+-            weight=[layer.w2_weight],
++            weight=[layer.w2_weight.transpose(1, 2)],
+             bias=w2_bias,
+             split_item=2,
+             group_list_type=1,
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index f68721f3d0..3e85ee7c10 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -46,6 +46,7 @@ import types
+ import uuid
+ import warnings
+ from collections import OrderedDict, defaultdict
++from relax.utils.device import is_npu_available
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from decimal import Decimal
+@@ -150,7 +151,7 @@ def is_npu() -> bool:
+     if not hasattr(torch, "npu"):
+         return False
+ 
+-    if not torch.npu.is_available():
++    if not is_npu_available:
+         raise RuntimeError(
+             "torch_npu detected, but NPU device is not available or visible."
+         )

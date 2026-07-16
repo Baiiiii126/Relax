@@ -40,6 +40,7 @@ CKPT_ARGS=(
    --load ${EXP_DIR}/Qwen3.5-9B_mcore_4xnpu/
    --save ${EXP_DIR}/Qwen3.5-9B_mcore_4xnpu/
    --save-interval 50
+   --max-actor-ckpt-to-keep 1
 )
 
 PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl

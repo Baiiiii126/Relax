@@ -6,10 +6,11 @@
 
 ## 模型支持
 
-| 模型       | 训练场景 | Sync | Async | 训练所需最小卡数 | 参考脚本                                                |
-| ---------- | -------- | ---- | ----- | ---------------- | ------------------------------------------------------- |
-| Qwen3-4B   | DAPO     | √    | √     | 910C 2卡         | `scripts/training/text/run-qwen3-4B-4xnpu-colocate.sh`  |
-| Qwen3.5-9B | DAPO     | √    | √     | 910C 2卡         | `scripts/training/text/run-qwen35-9B-4xnpu-colocate.sh` |
+| 模型            | 训练场景 | Sync | Async | 训练所需最小卡数 | 参考脚本                                                      |
+| --------------- | -------- | ---- | ----- | ---------------- | ------------------------------------------------------------- |
+| Qwen3-4B        | DAPO     | √    | √     | 910C 2卡         | `scripts/training/text/run-qwen3-4B-4xnpu-colocate.sh`        |
+| Qwen3.5-9B      | DAPO     | √    | √     | 910C 2卡         | `scripts/training/text/run-qwen35-9B-4xnpu-colocate.sh`       |
+| Qwen3.5-35B-A3B | DAPO     | √    | √     | 910C 8卡         | `scripts/training/text/run-qwen35-35B-A3B-16xnpu-colocate.sh` |
 
 ## 环境准备
 
@@ -54,6 +55,14 @@ docker run \
 --device=/dev/davinci5   \
 --device=/dev/davinci6   \
 --device=/dev/davinci7   \
+--device=/dev/davinci8   \
+--device=/dev/davinci9   \
+--device=/dev/davinci10   \
+--device=/dev/davinci11   \
+--device=/dev/davinci12   \
+--device=/dev/davinci13   \
+--device=/dev/davinci14   \
+--device=/dev/davinci15   \
 --device=/dev/davinci_manager   \
 --device=/dev/devmm_svm   \
 --device=/dev/hisi_hdc   \
@@ -111,4 +120,4 @@ bash scripts/training/text/run-qwen3-4B-8xgpu-async-npu.sh
 
 ## 下一步
 
-- [ ] 模型支持：Qwen3.5-35B
+- [ ] 特性支持：多模态、CP长序列、MTP 等
