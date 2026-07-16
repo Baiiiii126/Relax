@@ -401,6 +401,47 @@ def test_chunked_loss_delegates_to_get_log_probs_and_entropy(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("configured_value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        (None, True),
+    ],
+)
+def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configured_value, expected):
+    captured_kwargs: dict = {}
+
+    def spy_checkpoint(_function, *args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return torch.tensor(1.0), {"loss": torch.tensor(1.0)}
+
+    monkeypatch.setattr(_loss_mod, "checkpoint", spy_checkpoint)
+    monkeypatch.setattr(_loss_mod, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(1))
+    monkeypatch.setattr(_loss_mod, "get_sum_of_sample_mean", lambda *args, **kwargs: object())
+
+    args = Namespace(
+        loss_type="sft",
+        recompute_loss_function=True,
+        sft_chunked_logits=False,
+        qkv_format="thd",
+        calculate_per_token_loss=True,
+        allgather_cp=False,
+        global_batch_size=1,
+    )
+    if configured_value is not None:
+        args.recompute_loss_function_use_reentrant = configured_value
+    batch = {
+        "total_lengths": [1],
+        "response_lengths": [1],
+        "loss_masks": [torch.ones(1)],
+    }
+
+    _loss_mod.loss_function(args, batch, num_microbatches=1, logits=torch.ones(1))
+
+    assert captured_kwargs["use_reentrant"] is expected
+
+
+@pytest.mark.parametrize(
     ("loss_type", "chunked_flag", "expected"),
     [
         ("sft", True, True),  # SFT + opt-in → chunked

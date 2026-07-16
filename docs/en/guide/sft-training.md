@@ -218,6 +218,57 @@ Use one of two row formats:
 
 Do not add `--apply-chat-template` for SFT. The SFT dataset renders samples with the tokenizer chat template internally and builds the assistant loss mask from that render.
 
+### Chat Template Compatibility Patches
+
+#### Dispatch and Scope
+
+Before rendering an SFT sample, Relax resolves the effective template from an explicit `chat_template` override or `tokenizer.chat_template`, then runs the static model-specific patch registry. Global `--apply-chat-template-kwargs` are merged with `sample.metadata["apply_chat_template_kwargs"]`; the per-sample values win. Both the tokenized `render_with_loss_mask` path and the multimodal `render_to_text` path use the same result.
+
+Patches are applied per sample and per call. They never mutate `tokenizer.chat_template`. If no patcher recognizes the effective template, the dispatcher is a strict no-op: the original template and explicitly supplied kwargs are forwarded unchanged. Model detection is based on template content rather than checkpoint names.
+
+The generic dispatcher is implemented in [`chat_template_patch.py`](../../../relax/engine/sft/dataset/chat_template_patch.py), while model-specific behavior lives in separate modules such as [`qwen_chat_template_patch.py`](../../../relax/engine/sft/dataset/qwen_chat_template_patch.py).
+
+::: tip Scope
+These patches only affect SFT sample rendering. They do not change Rollout, Agentic Session, SGLang, or other inference-side chat-template behavior.
+:::
+
+#### Qwen Historical Thinking
+
+Some Qwen templates keep reasoning only for assistant messages after the last ordinary user query. In multi-turn tool data, this can remove `<think>...</think>` from an earlier supervised assistant while leaving its tool call in place. Relax recognizes the exact legacy Qwen3.5 history gate and backports the compatible `preserve_thinking` gate for the current render. Templates that already contain the native gate remain unchanged.
+
+`preserve_thinking` has three states:
+
+| Setting | Behavior |
+| --- | --- |
+| Omitted or `null` | Default, sample-aware auto mode. Relax sets it to `true` when an assistant before the last ordinary user has `learn=true` and its text contains `</think>`; otherwise Qwen's native behavior is preserved. |
+| `true` | Force preservation of historical thinking for the whole sample render. `learn` still controls which rendered tokens receive loss. |
+| `false` | Disable auto-preservation and use Qwen's native historical-reasoning compression. Non-reasoning content, including answers and tool calls, is still rendered. |
+
+Assistant messages default to `learn=true` when a full-message SFT row does not provide `learn`. A user message whose complete string content is wrapped in `<tool_response>...</tool_response>` is not treated as a new ordinary user boundary. If auto mode is triggered by one learnable historical assistant, preservation applies to the whole render; messages with `learn=false` may remain as context but still receive no loss.
+
+Because per-sample kwargs take precedence, a sample-level `preserve_thinking: null` overrides a global `false` and re-enters auto mode for that sample.
+
+Use JSON booleans, not strings:
+
+```bash
+# Force preservation
+--apply-chat-template-kwargs '{"preserve_thinking": true}'
+
+# Disable automatic preservation
+--apply-chat-template-kwargs '{"preserve_thinking": false}'
+
+# Re-enable sample-aware auto mode explicitly
+--apply-chat-template-kwargs '{"preserve_thinking": null}'
+```
+
+::: warning `false` Does Not Disable All Thinking
+`preserve_thinking=false` only restores Qwen's native compression for assistant turns before the last ordinary user. Assistant turns in the current tool episode still follow the native Qwen template and may contain an empty `<think>\n\n</think>` wrapper. This setting is unrelated to inference-side `enable_thinking`.
+
+When historical reasoning is compressed, those reasoning tokens are absent from the rendered training sequence and cannot receive loss; the associated answer or tool call remains trainable.
+:::
+
+Values other than a JSON boolean or `null`, such as `"false"`, raise `ValueError`. A Qwen-like template with a duplicated, conflicting, or unrecognized history gate raises `RuntimeError` instead of being patched heuristically. The SFT log reports `source=qwen_history_thinking (patched|native)` and the resolved `preserve_thinking` value for verification.
+
 ### Evaluation and Predict
 
 PPL evaluation is controlled by:
@@ -417,6 +468,81 @@ For image SFT, each image referenced by `--multimodal-keys '{"image":"images"}'`
 ### Predict Does Not Write Files
 
 Check that `--sft-predict-interval` is set, `--save` is set, and an eval source exists. Prediction files are written under `<save>/predict/`.
+
+## Extending Chat Template Patches
+
+Add compatibility for another model family through a dedicated pure-function patcher. Keep model knowledge out of [`chat_template.py`](../../../relax/engine/sft/dataset/chat_template.py); create the new module beside the existing [`qwen_chat_template_patch.py`](../../../relax/engine/sft/dataset/qwen_chat_template_patch.py).
+
+### Patcher Contract
+
+Use the `TemplatePatcher` signature from [`chat_template_patch.py`](../../../relax/engine/sft/dataset/chat_template_patch.py):
+
+The private `_matches_exact_foo_template` and `_patch_exact_foo_template` names below are placeholders. Implement the corresponding model-specific recognition and exact replacement helpers in the new module.
+
+```python
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+from collections.abc import Mapping
+from typing import Any
+
+from relax.engine.sft.dataset.chat_template_patch import TemplatePatchResult
+from relax.engine.sft.dataset.sample import CanonicalSample
+
+
+def try_patch_foo_chat_template(
+    sample: CanonicalSample,
+    template: str | None,
+    kwargs: Mapping[str, Any],
+) -> TemplatePatchResult | None:
+    if not isinstance(template, str):
+        return None
+
+    # Match exact, model-specific legacy or native template fragments.
+    if not _matches_exact_foo_template(template):
+        return None
+
+    resolved_kwargs = dict(kwargs)
+    patched_template = _patch_exact_foo_template(template)
+    return TemplatePatchResult(
+        template=patched_template,
+        kwargs=resolved_kwargs,
+        patch_name="foo_history_compatibility",
+        changed=patched_template != template,
+    )
+```
+
+Follow these rules:
+
+1. Return `None` for every unrelated template. Use narrow, stable template signatures rather than model paths or tokenizer class names.
+2. Recognize both the legacy template that needs a patch and the already-fixed native template so repeated rendering is idempotent.
+3. If a template resembles the supported family but its critical fragment has drifted, fail with a clear error instead of guessing a replacement.
+4. Copy `kwargs` before changing them. Do not mutate the sample, tokenizer, input mapping, or global state.
+5. Return the effective template and kwargs. When the template changes, the dispatcher injects it as a per-call `chat_template` kwarg and keeps the template/kwargs pair consistent.
+
+### Registration
+
+Import the patcher in [`chat_template.py`](../../../relax/engine/sft/dataset/chat_template.py) and append it to the static registry:
+
+```python
+_CHAT_TEMPLATE_PATCHERS = (
+    try_patch_qwen_chat_template,
+    try_patch_foo_chat_template,
+)
+```
+
+Patch signatures must be mutually exclusive. The dispatcher evaluates all registered patchers and raises `RuntimeError` if more than one matches; registration order is not a priority mechanism.
+
+### Tests
+
+Follow [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/test_qwen_chat_template_patch.py) and cover at least:
+
+1. Unrelated-template strict no-op behavior.
+2. Correct legacy-template patching and native-template idempotence.
+3. Fail-fast behavior for drifted, duplicated, or conflicting signatures.
+4. Explicit kwargs and default policy behavior without mutating the input mapping.
+5. Consistent behavior through both `render_with_loss_mask` and `render_to_text`.
+6. Preservation of the bound `tokenizer.chat_template`.
+7. No overlapping match with existing patchers.
 
 ## Next Steps
 
