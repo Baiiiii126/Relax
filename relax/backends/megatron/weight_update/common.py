@@ -11,6 +11,7 @@ from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.utils.device import is_npu_available
 from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
@@ -110,6 +111,9 @@ def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor
     if "linear_fc1.weight" in name and "vision_model" not in name:
         param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
         param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
+        # TODO:Temporary workaround for NPU to set partition_dim to 0
+        if is_npu_available:
+            partition_dim = 0
     # this is bug in megatron's grouped moe.
     if "linear_fc2.weight" in name and "vision_model" not in name:
         if partition_dim == 0:

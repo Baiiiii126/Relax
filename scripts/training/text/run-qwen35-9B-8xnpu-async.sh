@@ -113,9 +113,9 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.7
-   --sglang-cuda-graph-bs 4 8 16 32 64 128 192 $(seq 256 32 512)
+   --rollout-num-gpus-per-engine 2
+   --sglang-mem-fraction-static 0.8
+   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    --sglang-device npu
    --sglang-disable-radix-cache
    --sglang-chunked-prefill-size 8192
@@ -123,6 +123,7 @@ SGLANG_ARGS=(
    --sglang-enable-dp-attention
    --sglang-enable-dp-lm-head
    --sglang-attention-backend ascend
+   --sglang-max-running-requests 256
 )
 
 WANDB_ARGS=(
