@@ -20,7 +20,7 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 # Support setting env from outside
-EXP_DIR="${EXP_DIR:-/root/exps}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
