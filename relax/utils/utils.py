@@ -518,6 +518,8 @@ def process_args(args: Namespace, role: str) -> None:
     args.only_load_weight = True
     if role == "reference":
         args.load = args.ref_load
+    if role == "actor_fwd":
+        args.load = args.ref_load
 
 
 def get_serve_url(route_prefix: str = "") -> str:
