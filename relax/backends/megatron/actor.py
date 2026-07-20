@@ -1805,7 +1805,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return status[0]
 
-    def all_consumed_streaming(self, task_name, rollout_id):
+    def all_consumed_streaming(self, task_name, rollout_id, window_id=None, window_quota=None):
         """End-of-stream check for the streaming PP schedule — NO pipeline-
         group collective.
 
@@ -1825,13 +1825,28 @@ class MegatronTrainRayActor(TrainRayActor):
         them aligned on the "data is None" branch), so we broadcast the flag over
         the TP group ONLY to give tp_rank>0 the same answer.  CP ranks within a
         stage are likewise in lockstep, so a CP-group broadcast is safe too.
+
+        When ``window_id`` is given (multi-mini train path) the check is PER
+        WINDOW: the sampler reports drained once it has globally dispatched
+        ``window_quota`` (``mini_global_samples``) for this rollout-mini window,
+        or the whole partition is drained (under-produced final window).
+        Otherwise it falls back to the partition-level stream-drained check.
         """
         if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0:
             # Streaming end-of-stream predicate (no preset global batch): the producer
             # marks production_completed and we require every actually-inserted sample
             # to be consumed, rather than a tensor-wide .all() over (possibly dynamic)
-            # rows. See TransferQueue check_stream_drained.
-            status = [run(self.data_system_client.async_check_stream_drained(task_name, f"train_{rollout_id}"))]
+            # rows. See TransferQueue check_stream_drained / check_window_drained.
+            if window_id is not None:
+                status = [
+                    run(
+                        self.data_system_client.async_check_window_drained(
+                            task_name, f"train_{rollout_id}", window_id, window_quota
+                        )
+                    )
+                ]
+            else:
+                status = [run(self.data_system_client.async_check_stream_drained(task_name, f"train_{rollout_id}"))]
         else:
             status = [True]
         status = torch.tensor(status, device=device_utils.make_current_torch_device())
@@ -1878,7 +1893,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if use_streaming:
             batch_index_stride = 1_000_000
-            overflow_buffer = []
             data_iterator = [
                 StreamingTQIterator(
                     args=self.args,
@@ -1887,18 +1901,36 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_id=rollout_id,
                     token_budget=token_budget,
                     loss_scale=loss_scale,
-                    # PP-collective-free end-of-stream check: the streaming PP
-                    # schedule pulls per-stage at different schedule points, so a
-                    # PP-group broadcast inside __next__ would deadlock.  See
+                    # PP-collective-free PER-WINDOW end-of-stream check: the
+                    # streaming PP schedule pulls per-stage at different schedule
+                    # points, so a PP-group broadcast inside __next__ would
+                    # deadlock.  window_id + window_quota make it query per-window
+                    # drained (sampler dispatched mini_global_samples for this
+                    # window, or partition drained).  Default-arg binds mini_idx
+                    # to avoid the late-binding closure bug.  See
                     # all_consumed_streaming for the full rationale.
-                    all_consumed_fn=lambda: self.all_consumed_streaming(task_name, rollout_id),
+                    all_consumed_fn=(
+                        lambda mi=mini_idx: self.all_consumed_streaming(
+                            task_name, rollout_id, window_id=mi, window_quota=plan.mini_global_samples
+                        )
+                    ),
+                    # Train path: sampler-driven per-round dummy alignment. On an
+                    # empty fetch the iterator reads the DUMMY-round flag from the
+                    # fetched meta and emits a zero-grad dummy so all DPs run equal
+                    # micro-batch counts (MoE EP all-to-all matches by call order).
+                    per_round_dummy=True,
                     dp_rank=dp_rank,
                     dp_size=dp_size,
                     task_name=task_name,
-                    max_samples=plan.mini_local_sample_request,
+                    # Global per-window quota (mini_global_samples): the sampler
+                    # stops dispatching this window once the quota is met across
+                    # all DPs.  Per-DP counts stay uneven (token-budget driven);
+                    # the dummy-pad aligns cross-DP mb counts.  No per-DP hard
+                    # count target on the consumer — termination is the per-window
+                    # drained signal above.
+                    window_quota=plan.mini_global_samples,
                     rollout_mini_index=mini_idx,
                     start_batch_index=mini_idx * batch_index_stride,
-                    overflow_buffer=overflow_buffer,
                 )
                 for mini_idx in range(plan.num_rollout_minis)
             ]
