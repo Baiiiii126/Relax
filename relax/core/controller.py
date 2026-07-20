@@ -19,7 +19,7 @@ except ImportError as e:
     raise ImportError(
         "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
         '    pip install "transferqueue @ git+https://github.com/redai-infra/'
-        'TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps\n'
+        'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps\n'
         "or use the latest image."
     ) from e
 
@@ -133,7 +133,7 @@ class Controller:
             # Fully-async + dynamic-batch path streams data per DP via token
             # budget; the controller-side sampler maintains per-DP buckets and
             # balances tokens at small-unit granularity.  See
-            # docs/draft/dynamic_batch_size_fully_async.md.
+            # docs/zh/guide/fully-async-training.md.
             sampler = StreamingTokenBudgetSampler(
                 n_samples_per_prompt=self.config.n_samples_per_prompt,
             )
