@@ -297,6 +297,13 @@ async def generate(
 
     if state.opd_manager and not evaluation:
         state.opd_manager.before_rollout(payload)
+    # LoRA adapter mode: route generation through the trained adapter registered on the engine
+    # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
+    # base model only and rollouts would not reflect the trained policy.
+    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+        from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
+
+        payload["lora_path"] = LORA_ADAPTER_NAME
 
     _t_mm_encode: float | None = None
     if _has_media:
@@ -1228,7 +1235,11 @@ def generate_rollout(
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
     if aborted_samples:
         ray.get(data_buffer.add_samples.remote(aborted_samples))
-    if not args.fully_async:
+    # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
+    # prefetched generation is almost always aborted by the next step's pause_generation and its
+    # truncated samples would pollute the next rollout. Other modes keep the optimization.
+    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
+    if not args.fully_async and not _lora_adapter_mode:
         state = GenerateState(args)
         state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")

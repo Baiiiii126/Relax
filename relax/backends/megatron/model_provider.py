@@ -25,6 +25,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from relax.utils.device import is_npu_available
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import build_lora_peft, count_adapter_parameters, is_lora_enabled
 from relax.utils.misc import load_function
 
 from .conditional_branch_sync import install_conditional_branch_sync
@@ -364,6 +365,9 @@ def get_model_provider_func(
             _install_cp_probe(model)
             return model
 
+        if is_lora_enabled(args):
+            provide_with_cp_probe = wrap_model_provider_with_lora(provide_with_cp_probe, args)
+
         return provide_with_cp_probe
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
@@ -476,7 +480,48 @@ def get_model_provider_func(
         _install_cp_probe(model)
         return model
 
+    if is_lora_enabled(args):
+        model_provider = wrap_model_provider_with_lora(model_provider, args)
+
     return model_provider
+
+
+def wrap_model_provider_with_lora(original_provider, args):
+    """Wrap model provider to add LoRA support.
+
+    Only wraps if args.lora_rank > 0. Uses Megatron-Bridge's PEFT integration
+    to freeze base model and enable only LoRA parameters.
+    """
+    if not is_lora_enabled(args):
+        return original_provider
+
+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
+        sig = inspect.signature(original_provider)
+        accepts_vp_stage = "vp_stage" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        if accepts_vp_stage:
+            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        else:
+            model = original_provider(pre_process=pre_process, post_process=post_process)
+
+        try:
+            peft = build_lora_peft(args)
+            model = peft(model, training=True)
+            if dist.is_initialized() and dist.get_rank() == 0:
+                adapter_params, total_params, percentage = count_adapter_parameters(model)
+                logger.info(
+                    f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+                    f"adapter_params={adapter_params:,} ({percentage:.2f}% of {total_params:,} total)"
+                )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to create LoRA (PEFT) wrapper. Ensure Megatron-Bridge PEFT utilities are available: {e}"
+            ) from e
+
+        return model
+
+    return wrapped_provider
 
 
 def wrap_model_provider_with_freeze(original_provider, args):

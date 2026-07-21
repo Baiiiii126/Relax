@@ -25,10 +25,12 @@ from megatron.core.utils import get_model_config, unwrap_model
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
+from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.timer import timer
@@ -1193,6 +1195,9 @@ def save(
         train_data_iterator=None,
         preprocess_common_state_dict_fn=None,
     )
+    if is_lora_enabled(args):
+        checkpoint_dir = Path(args.save) / f"iter_{iteration:07d}"
+        _save_lora_to_checkpoint(model, str(checkpoint_dir), args)
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
 
@@ -1227,7 +1232,8 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
                 model,
                 path=path,
             )
-
+        if is_lora_enabled(args):
+            _save_lora_to_checkpoint(model, str(path), args, bridge=bridge)
         if should_log:
             logger.info(f"Successfully saved HuggingFace model to {path}")
     except Exception as e:
