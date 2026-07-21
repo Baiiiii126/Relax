@@ -1406,6 +1406,56 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--ref-ckpt-step", type=int, default=None, help="The checkpoint step for reference model. "
             )
+            parser.add_argument(
+                "--lora-rank",
+                type=int,
+                default=0,
+                help="LoRA rank for parameter-efficient fine-tuning (0=disabled).",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=int,
+                default=32,
+                help="LoRA alpha scaling factor for learning rate adjustment.",
+            )
+            parser.add_argument(
+                "--lora-target-modules",
+                type=str,
+                nargs="+",
+                default=["linear_qkv", "linear_proj"],
+                help=(
+                    "Target modules for LoRA (Megatron-style names, e.g. linear_qkv, "
+                    "linear_proj, linear_fc1, linear_fc2). Expanded to HF-style names "
+                    "automatically when exporting the adapter."
+                ),
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="Dropout probability for LoRA layers.",
+            )
+            parser.add_argument(
+                "--lora-merge-mode",
+                action="store_true",
+                default=False,
+                help=(
+                    "Merge LoRA adapters into base weights before weight synchronization. "
+                    "Simplifies rollout but slower rollout inference."
+                ),
+            )
+            parser.add_argument(
+                "--lora-adapter-mode",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable LoRA adapter mode: sync the base model once, then each step push only "
+                    "the trained LoRA adapter to the rollout engine via SGLang's runtime LoRA API "
+                    "(rollouts select it via lora_path). Saves per-step full-weight-sync bandwidth. "
+                    "Requires --enable-lora (auto-set by the engine) and sglang_dp_size == 1. "
+                    "Supported in colocate and fully-async modes. Mutually exclusive with --lora-merge-mode."
+                ),
+            )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
             reset_arg(parser, "--save-interval", type=int, default=None)
@@ -2519,6 +2569,23 @@ def slime_validate_args(args):
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
+
+    if getattr(args, "lora_rank", 0) > 0:
+        if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
+            raise ValueError(
+                "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
+            )
+        if getattr(args, "lora_adapter_mode", False) and getattr(args, "sglang_dp_size", 1) != 1:
+            raise ValueError(
+                "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
+                "support dp_size > 1)."
+            )
+        if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
+            logger.info(
+                "LoRA enabled (lora_rank=%d): forcing --lora-merge-mode (default supported LoRA rollout path).",
+                args.lora_rank,
+            )
+            args.lora_merge_mode = True
 
     # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
     # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
