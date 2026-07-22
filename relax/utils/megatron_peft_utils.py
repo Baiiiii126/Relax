@@ -279,7 +279,13 @@ def build_lora_peft(args):
     Returns:
         The Megatron-Bridge PEFT object (not yet applied to a model).
     """
-    from megatron.bridge.peft.utils import create_peft
+    try:
+        from megatron.bridge.peft.utils import create_peft
+    except ImportError as e:
+        raise RuntimeError(
+            "LoRA training requires a newer training image with LoRA-enabled Megatron-Bridge. "
+            "Please upgrade the training image."
+        ) from e
 
     peft_config = {
         "rank": args.lora_rank,

@@ -514,6 +514,10 @@ def wrap_model_provider_with_lora(original_provider, args):
                     f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
                     f"adapter_params={adapter_params:,} ({percentage:.2f}% of {total_params:,} total)"
                 )
+        except RuntimeError:
+            # build_lora_peft already raises a clear upgrade-hint message when the
+            # Megatron-Bridge image lacks PEFT support; don't shadow it.
+            raise
         except Exception as e:
             raise RuntimeError(
                 f"Failed to create LoRA (PEFT) wrapper. Ensure Megatron-Bridge PEFT utilities are available: {e}"
