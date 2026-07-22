@@ -1313,6 +1313,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="SGLang reasoning parser for agentic rollout.",
             )
             parser.add_argument(
+                "--agentic-custom-advantage-path",
+                type=str,
+                default=None,
+                help="Custom group-level advantage function for explicit agentic exports.",
+            )
+            parser.add_argument(
                 "--agentic-prepare-pool-size",
                 type=int,
                 default=None,
