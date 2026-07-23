@@ -2538,6 +2538,21 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _normalize_sync_ppo_kl_args(args) -> bool:
+    """Disable KL options that have no ref-logprob producer in sync PPO."""
+    is_sync_ppo = (
+        getattr(args, "use_critic", False)
+        and not getattr(args, "fully_async", False)
+        and not getattr(args, "hybrid", False)
+    )
+    if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
+        return False
+
+    args.use_kl_loss = False
+    args.kl_coef = 0.0
+    return True
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -2849,6 +2864,23 @@ def slime_validate_args(args):
             args.balance_data = True
 
     args.use_critic = args.advantage_estimator == "ppo"
+    # Synchronous PPO has no producer for
+    # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
+    # gated on `advantage_estimator != "ppo"`, and the sync role set does not
+    # deploy a separate reference service. Either KL option would make
+    # advantages / actor request a field that never arrives and hang in
+    # TQ.get_meta, so disable both for the currently supported sync topology.
+    if _normalize_sync_ppo_kl_args(args):
+        logger.warning(
+            "Synchronous PPO (--advantage-estimator ppo) does not support --use-kl-loss or "
+            "--kl-coef != 0 because its service graph has no producer for ref_log_probs. "
+            "Auto-disabling --use-kl-loss and resetting --kl-coef to 0.0. "
+            "Drop these KL options from the launch script to silence this warning."
+        )
+    elif args.use_critic and args.use_kl_loss:
+        # Preserve the existing behavior outside the synchronous topology.
+        logger.warning("PPO does not support --use-kl-loss. Auto-disabling --use-kl-loss.")
+        args.use_kl_loss = False
     if args.critic_num_gpus_per_node is None:
         args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     if args.critic_num_nodes is None:
@@ -3108,13 +3140,6 @@ def slime_validate_args(args):
         )
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
-
-    if args.advantage_estimator == "ppo":
-        raise ValueError(
-            "PPO (Proximal Policy Optimization) is no longer supported in Relax. "
-            "Please use one of the following advantage estimators instead: "
-            "'grpo', 'gspo', 'sapo', 'cispo', 'reinforce_plus_plus', or 'reinforce_plus_plus_baseline'."
-        )
 
     if args.rotate_ckpt:
         assert args.save is not None, "--save must be set when --rotate-ckpt is set."

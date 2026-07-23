@@ -128,8 +128,8 @@ def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeyp
 
 
 def test_streaming_tq_iterator_polls_until_window_drained(monkeypatch):
-    """Empty fetch while the window is NOT yet drained → keep polling; once the
-    per-window drained signal flips, finish (no per-DP count involved)."""
+    """Empty fetch while the window is NOT yet drained -> keep polling; once
+    the per-window drained signal flips, finish (no per-DP count involved)."""
     stream_module = _load_stream_module(monkeypatch)
     monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(stream_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)

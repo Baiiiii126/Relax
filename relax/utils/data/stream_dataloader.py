@@ -909,6 +909,7 @@ def post_process_rollout_data(args, rollout_data):
         "rollout_log_probs",
         "advantages",
         "returns",
+        "values",
         *iter_opd_cp_float_fields(),
     ]:
         if key not in rollout_data:
