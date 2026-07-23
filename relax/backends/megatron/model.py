@@ -34,6 +34,12 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.timer import timer
+from relax.utils.training.ppo_utils import (
+    install_critic_value_head_runtime_check,
+    maybe_verify_critic_value_head_movement,
+    release_critic_lm_heads,
+    validate_critic_value_head_registration,
+)
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
@@ -49,9 +55,8 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
     stages.
 
     ``unwrap_model`` strips Megatron's known wrapper classes (DDP, FP16, ...)
-    in one shot — same pattern as ``_iter_critic_output_layers``. The bounded
-    ``.module``/``.language_model`` walk that follows handles VL bridges and
-    non-Megatron DDP shapes used by tests.
+    in one shot. The bounded ``.module``/``.language_model`` walk that follows
+    handles VL bridges and non-Megatron DDP shapes used by tests.
     """
     module = unwrap_model(model)
     for _ in range(4):  # bounded; bridge depth is at most 2
@@ -864,6 +869,12 @@ def train_one_step(
 
         check_mtp_only_grad(model, step_id, require_non_mtp_zero=not main_loss_has_tokens)
 
+    critic_value_head_snapshot = None
+    if args.ci_test and rollout_id == 0 and step_id == 0 and getattr(model[0], "role", "actor") == "critic":
+        from relax.backends.megatron.ci_utils import capture_critic_value_head_update
+
+        critic_value_head_snapshot = capture_critic_value_head_update(model)
+
     # Update parameters. Single optimizer.step() call handles prepare_grads, unscale,
     # clip, and inner step in one shot — avoids the double prepare_grads/unscale and
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
@@ -896,6 +907,17 @@ def train_one_step(
         opt_param_scheduler.step(increment=args.global_batch_size)
     else:
         grad_norm = float("nan")
+
+    if critic_value_head_snapshot is not None:
+        from relax.backends.megatron.ci_utils import assert_critic_value_head_updated
+
+        assert_critic_value_head_updated(
+            critic_value_head_snapshot,
+            update_successful=bool(update_successful),
+            learning_rates=[param_group.get("lr", 0.0) for param_group in optimizer.param_groups],
+        )
+
+    maybe_verify_critic_value_head_movement(model, optimizer, bool(update_successful))
 
     # release grad
     for model_chunk in model:
@@ -1241,68 +1263,6 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
             logger.error(f"Failed to save HuggingFace format: {e}")
 
 
-def _iter_critic_output_layers(model: Sequence[DDP]):
-    for chunk_id, module in enumerate(unwrap_model(model)):
-        output_layer = getattr(module, "output_layer", None)
-        if output_layer is not None:
-            yield chunk_id, output_layer
-
-
-def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], role: str) -> bool:
-    if role != "critic" or args.load is None:
-        return False
-
-    from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
-    from megatron.training.checkpointing import get_load_checkpoint_path_by_args
-
-    checkpoint_path = Path(get_load_checkpoint_path_by_args(args))
-    if not (checkpoint_path / ".metadata").is_file():
-        return False
-
-    checkpoint_metadata = load_tensors_metadata(str(checkpoint_path))
-    for _chunk_id, output_layer in _iter_critic_output_layers(model):
-        for name in ("weight", "bias"):
-            param = getattr(output_layer, name, None)
-            if param is None:
-                continue
-
-            param_name = f"output_layer.{name}"
-            ckpt_tensor_metadata = next(
-                (
-                    tensor_metadata
-                    for key, tensor_metadata in checkpoint_metadata.items()
-                    if key == param_name or key.endswith(f".{param_name}")
-                ),
-                None,
-            )
-            expected_shape = tuple(param.shape)
-            checkpoint_shape = tuple(ckpt_tensor_metadata.global_shape) if ckpt_tensor_metadata is not None else None
-            if checkpoint_shape == expected_shape:
-                continue
-
-            reason = (
-                "missing from checkpoint metadata"
-                if checkpoint_shape is None
-                else f"shape mismatch checkpoint={checkpoint_shape} runtime={expected_shape}"
-            )
-            logger.warning(
-                "Will reinitialize critic %s after checkpoint load because it is %s",
-                param_name,
-                reason,
-            )
-            return True
-
-    return False
-
-
-@torch.no_grad()
-def _reinitialize_critic_output_layer(model: Sequence[DDP]) -> None:
-    for _chunk_id, output_layer in _iter_critic_output_layers(model):
-        output_layer.weight.data.normal_(mean=0.0, std=0.02)
-        if output_layer.bias is not None:
-            output_layer.bias.data.zero_()
-
-
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"
 ) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
@@ -1327,7 +1287,9 @@ def initialize_model_and_optimizer(
 
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
-    reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
+    value_head_param_ids = ()
+    if role == "critic":
+        value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
     clear_memory()
     iteration, _ = load_checkpoint(
         model,
@@ -1336,10 +1298,13 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
-    if reinit_critic_output_layer:
-        _reinitialize_critic_output_layer(model)
-        if (args.fp16 or args.bf16) and optimizer is not None:
-            optimizer.reload_model_params()
+    if role == "critic":
+        release_critic_lm_heads(model)
+        loaded_value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
+        assert loaded_value_head_param_ids == value_head_param_ids, (
+            "critic value head parameter identities changed during checkpoint loading"
+        )
+        install_critic_value_head_runtime_check(model)
     clear_memory()
     if opt_param_scheduler is not None:
         opt_param_scheduler.step(increment=iteration * args.global_batch_size)
