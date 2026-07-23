@@ -1249,10 +1249,23 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
 
         path.mkdir(parents=True, exist_ok=True)
 
+        # RL-trained Megatron models drop the base model's MTP module, so the
+        # weight iterator never yields the base checkpoint's `mtp.*` tensors.
+        # Those tensors share safetensors shards with real LM tensors; with
+        # strict=True the bridge refuses to write those shards and silently
+        # truncates the export. Mirror the offline converter
+        # (scripts/tools/convert_torch_dist_to_hf_bridge.py): tolerate the
+        # missing MTP keys so the shard's LM tensors are still written.
+        allow_missing_mtp_keys = bool(getattr(args, "mtp_num_layers", 0)) and not getattr(
+            args, "enable_mtp_training", False
+        )
+        strict = not allow_missing_mtp_keys
+
         with patch_megatron_model(model):
             bridge.save_hf_pretrained(
                 model,
                 path=path,
+                strict=strict,
             )
         if is_lora_enabled(args):
             _save_lora_to_checkpoint(model, str(path), args, bridge=bridge)
