@@ -2559,6 +2559,13 @@ def slime_validate_args(args):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
+    if is_sft and getattr(args, "dynamic_context_parallel", False) and args.eval_interval is not None:
+        raise ValueError(
+            "--dynamic-context-parallel cannot be used with SFT eval (--eval-interval) yet: "
+            "this combination can hang and has not been fixed. "
+            "Disable --eval-interval or --dynamic-context-parallel."
+        )
+
     if is_sft:
         # Force-disable RL-only state so SFT users don't have to pass
         # `--disable-compute-advantages-and-returns` and friends.
