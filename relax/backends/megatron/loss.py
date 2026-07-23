@@ -1158,6 +1158,8 @@ def sft_loss_function(
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1206,6 +1208,8 @@ def sft_loss_function_chunked(
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         lm_head_forward=lm_head_forward,
     )
 
