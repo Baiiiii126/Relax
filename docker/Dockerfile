@@ -12,9 +12,9 @@ ENV NVIDIA_PYTORCH_VERSION=25.06 \
     PYSFX=3 \
     L4T=0 \
     PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
-    TZ=Asia/Shanghai\
+    TZ=Asia/Shanghai \
     LANG=en_US.UTF-8 \
-    LC_ALL=en_US.UTF-8\
+    LC_ALL=en_US.UTF-8 \
     OPENCV_VERSION=4.7.0 \
     DEBIAN_FRONTEND=noninteractive
 
@@ -122,7 +122,7 @@ RUN pip install --ignore-installed PyJWT && \
 # --use-rollout-routing-replay) with a step-0 deadlock; this fork carries the
 # `support r3` passthrough patch. Must run AFTER the requirements install so it
 # wins.
-RUN pip install --no-cache-dir --force-reinstall \
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
         https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl && \
     python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
 
