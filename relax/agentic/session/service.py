@@ -2518,6 +2518,15 @@ def create_agentic_session_shards(config: Namespace):
     return shard_handles
 
 
+def _resolve_fastapi_request_endpoint(func: Callable[..., Any]) -> Callable[..., Any]:
+    # Ray Serve registers this class-bound route while FastAPI inspects its signature.
+    # Resolve postponed annotations first so FastAPI 0.139 injects Request instead of
+    # treating `request` as a required query parameter.
+    func.__annotations__["request"] = Request
+    func.__annotations__["return"] = JSONResponse
+    return func
+
+
 @serve.deployment
 @serve.ingress(app)
 class AgenticChatAPIService:
