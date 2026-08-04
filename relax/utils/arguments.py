@@ -66,6 +66,14 @@ def check_transfer_queue_version() -> None:
         )
 
 
+def _positive_int(value: str) -> int:
+    """argparse type that rejects non-positive integers at parse time."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
 def reset_arg(parser, name, **kwargs):
     """Reset the default value of a Megatron argument.
 
@@ -80,6 +88,55 @@ def reset_arg(parser, name, **kwargs):
             break
     else:
         parser.add_argument(name, **kwargs)
+
+
+def _add_fp16_optimizer_arguments(parser):
+    """Expose FP16 optimizer settings while preserving an unset sentinel."""
+    reset_arg(
+        parser,
+        "--initial-loss-scale",
+        type=float,
+        default=None,
+        help="Initial loss scale for dynamic FP16 loss scaling.",
+    )
+    reset_arg(
+        parser,
+        "--min-loss-scale",
+        type=float,
+        default=None,
+        help="Minimum loss scale for dynamic FP16 loss scaling.",
+    )
+    reset_arg(
+        parser,
+        "--use-precision-aware-optimizer",
+        action="store_true",
+        default=None,
+        help="Use TransformerEngine's precision-aware optimizer.",
+    )
+    if "--no-use-precision-aware-optimizer" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-use-precision-aware-optimizer",
+            action="store_false",
+            dest="use_precision_aware_optimizer",
+            default=None,
+            help="Disable TransformerEngine's precision-aware optimizer.",
+        )
+    reset_arg(
+        parser,
+        "--store-param-remainders",
+        action="store_true",
+        default=None,
+        help="Store parameter remainders in the distributed optimizer.",
+    )
+    if "--no-store-param-remainders" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-store-param-remainders",
+            action="store_false",
+            dest="store_param_remainders",
+            default=None,
+            help="Do not store parameter remainders in the distributed optimizer.",
+        )
+    return parser
 
 
 def get_slime_extra_args_provider(add_custom_arguments=None):
@@ -300,6 +357,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1024**3,
                 help="Add margin for train memory allocation. By default we will reserve 1GB as margin.",
+            )
+            parser.add_argument(
+                "--selective-offload",
+                action="store_true",
+                default=False,
+                help=(
+                    "Offload the training actor to CPU during colocate sleep/wake by copying only the "
+                    "live train state (weights + optimizer state) instead of torch_memory_saver's "
+                    "whole-pool pause. Default is torch_memory_saver; use this on backends where "
+                    "its VMM pause() is unavailable/unsafe (e.g. Kunlunxin P800)."
+                ),
             )
             parser.add_argument(
                 "--disable-weights-backuper",
@@ -579,6 +647,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
+            parser = _add_fp16_optimizer_arguments(parser)
             return parser
 
         # rollout
@@ -1156,6 +1225,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "0 (default) disables the processor pool and uses ThreadPoolExecutor instead. "
                     "When set to a positive integer, creates a ProcessPoolExecutor with the specified number of workers "
                     "for true parallelism without GIL contention."
+                ),
+            )
+            parser.add_argument(
+                "--encode-max-workers",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Worker threads for the shared media-encoding thread pool (image/video/audio "
+                    "encoding offloaded from the asyncio event loop). Positive integer. If unset, "
+                    "falls back to $RELAX_ENCODE_MAX_WORKERS, then to min(32, usable CPU count)."
                 ),
             )
             parser.add_argument(
@@ -2040,6 +2119,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Type of the reward model",
             )
             parser.add_argument(
+                "--rm-type-fallback",
+                type=str,
+                default=None,
+                help=(
+                    "Fallback for samples whose reward type is unknown or missing. "
+                    "None (default) keeps the current behavior of raising. 'zero' scores "
+                    "the sample 0.0 (reward-key aware) with a warning. Any registered "
+                    "reward type name routes degraded samples to that reward instead."
+                ),
+            )
+            parser.add_argument(
+                "--rm-type-infer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Infer the reward type from the sample label via registered label "
+                    "matchers when neither sample metadata nor --rm-type provides one. "
+                    "Also enables conflict detection (warn; the explicit type wins)."
+                ),
+            )
+            parser.add_argument(
                 "--reward-key",
                 type=str,
                 default=None,
@@ -2850,6 +2950,17 @@ def slime_validate_args(args):
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
 
+    rm_type_fallback = getattr(args, "rm_type_fallback", None)
+    if rm_type_fallback is not None and rm_type_fallback != "zero":
+        # Lazy import: only pay for the rewards package when the flag is set.
+        from relax.engine.rewards.registry import list_reward_types
+
+        if rm_type_fallback not in list_reward_types():
+            raise ValueError(
+                f"--rm-type-fallback {rm_type_fallback!r} is not a registered reward type. "
+                f"Use 'zero' or one of: {list_reward_types()}"
+            )
+
     if hasattr(args, "rollout_result_dir"):
         if args.rollout_result_dir is None and getattr(args, "save", None):
             args.rollout_result_dir = f"{args.save}/rollout_result"
@@ -3046,6 +3157,27 @@ def slime_validate_args(args):
 
     if args.use_critic:
         args.offload_train = True
+
+    # expandable_segments cannot coexist with torch_memory_saver, the default mechanism
+    # behind --offload-train. TMS's hook is armed from TMS_INIT_ENABLE inside the
+    # LD_PRELOAD'ed .so before any Python runs, so neither its own sanity check nor any
+    # in-process guard can intervene — the actor just dies with a bare
+    # "CUresult error: 1 (invalid argument)" from cu_mem_create. Fail here instead, while
+    # the message can still be read. Only the CUDA variable names are checked on purpose:
+    # NPU uses a different torch_memory_saver build and its scripts already combine
+    # PYTORCH_NPU_ALLOC_CONF=expandable_segments:True with offload successfully.
+    if args.offload_train and not getattr(args, "selective_offload", False):
+        alloc_conf_sources = {
+            **{name: os.environ.get(name, "") for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")},
+            **{key: str(value) for key, value in getattr(args, "train_env_vars", {}).items()},
+        }
+        for name, value in alloc_conf_sources.items():
+            if "expandable_segments:True" in value:
+                raise ValueError(
+                    f"{name} enables expandable_segments, which torch_memory_saver cannot track. "
+                    "Add --selective-offload to use the application-level offload instead, "
+                    "or drop expandable_segments."
+                )
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
