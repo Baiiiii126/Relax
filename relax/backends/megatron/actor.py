@@ -40,6 +40,13 @@ from relax.engine.sft.runtime import (
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
+from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.micro_batch_ring import (
+    PrefetchedSFTWindow,
+    SFTWindowPrefetcher,
+    is_sft_async_prepack_enabled,
+)
+from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.data.stream_dataloader import (
     MicroBatchListIterator,
     StreamingTQIterator,
@@ -81,12 +88,16 @@ from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with
 from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
+    PrepackedBatch,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
     get_data_iterator,
     log_perf_data,
     log_perf_data_fwd,
     log_rollout_data,
+    move_tensors_to_device,
+    prepack_sft_micro_batch_cpu,
+    record_tensors_on_stream,
 )
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
@@ -140,6 +151,76 @@ def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
         return value
 
     return {k: _slice(v) for k, v in rollout_data.items()}
+
+
+def _select_rollout_samples(rollout_data: RolloutBatch, indices: list[int]) -> RolloutBatch:
+    """Slice a rollout batch to the given per-sample indices."""
+    num_samples = len(rollout_data["total_lengths"])
+
+    def _select(value):
+        if isinstance(value, list) and len(value) == num_samples:
+            return [value[index] for index in indices]
+        if isinstance(value, tuple) and len(value) == num_samples:
+            return tuple(value[index] for index in indices)
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.size(0) == num_samples:
+            return value[indices]
+        return value
+
+    return {key: _select(value) for key, value in rollout_data.items()}
+
+
+class _SFTPrepackedDeviceIterator:
+    """Two-slot H2D pipeline over fully packed pinned-CPU micro-batches.
+
+    All H2D copies run on ``copy_stream``; the training thread waits on a per-
+    batch ready event before consuming a batch, and calls ``record_stream`` so
+    the caching allocator does not reclaim the pinned source before the
+    consumer stream finishes.
+    """
+
+    def __init__(
+        self,
+        packed_cpu: list[tuple[PrepackedBatch, Any]],
+        first_device_micro_batch: tuple[PrepackedBatch, Any],
+        first_ready_event: Any,
+        copy_stream: Any,
+        device: torch.device,
+    ) -> None:
+        self._packed_cpu = packed_cpu
+        self._next_device_micro_batch = first_device_micro_batch
+        self._next_ready_event = first_ready_event
+        self._copy_stream = copy_stream
+        self._device = device
+        self._offset = 0
+
+    def __iter__(self) -> "_SFTPrepackedDeviceIterator":
+        return self
+
+    def __next__(self) -> tuple[PrepackedBatch, Any]:
+        if self._offset >= len(self._packed_cpu):
+            raise StopIteration
+
+        current_batch, current_meta = self._next_device_micro_batch
+        train_stream = device_utils.current_stream(self._device)
+        train_stream.wait_event(self._next_ready_event)
+        record_tensors_on_stream(current_batch, train_stream)
+
+        self._offset += 1
+        if self._offset < len(self._packed_cpu):
+            next_cpu_batch, next_meta = self._packed_cpu[self._offset]
+            with device_utils.stream_context(self._copy_stream):
+                next_device_batch = move_tensors_to_device(next_cpu_batch, self._device, non_blocking=True)
+                next_ready_event = device_utils.Event()
+                next_ready_event.record(self._copy_stream)
+            # move_tensors_to_device returns a plain dict; re-wrap so
+            # get_batch() short-circuits on the PrepackedBatch marker.
+            self._next_device_micro_batch = (PrepackedBatch(next_device_batch), next_meta)
+            self._next_ready_event = next_ready_event
+
+        return current_batch, current_meta
+
+    def close(self) -> None:
+        self._packed_cpu = []
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -359,6 +440,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.prof.on_init_end()
         self.data_iterator = None
+        self._sft_window_prefetcher = SFTWindowPrefetcher() if is_sft_async_prepack_enabled(self.args) else None
+        self._sft_prefetch_stream = None
+        self._sft_copy_stream = None
+        self._sft_device = None
+        if self._sft_window_prefetcher is not None:
+            self._validate_sft_prepack_pipeline()
+            self._sft_device = device_utils.make_current_torch_device()
+            # Two streams, one owner each: _sft_prefetch_stream is written to
+            # by the background prefetch worker for the first H2D of the next
+            # window; _sft_copy_stream is written to by the training thread
+            # for the overlapped H2D of the current window's later batches.
+            # Sharing one stream would let both host threads race on the
+            # enqueue order and let the next window's copy jump ahead of the
+            # current step's remaining copies.
+            self._sft_prefetch_stream = device_utils.Stream(device=self._sft_device)
+            self._sft_copy_stream = device_utils.Stream(device=self._sft_device)
 
         if dist.get_rank() == 0:
             logger.info(
@@ -367,6 +464,28 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
         return start_rollout_id
+
+    def _validate_sft_prepack_pipeline(self) -> None:
+        unsupported = []
+        if mpu.get_pipeline_model_parallel_world_size() != 1:
+            unsupported.append("pipeline parallelism")
+        if mpu.get_context_parallel_world_size() != 1:
+            unsupported.append("context parallelism")
+        if (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) != 1:
+            unsupported.append("virtual pipeline parallelism")
+        if getattr(self.args, "dynamic_context_parallel", False):
+            unsupported.append("dynamic context parallelism")
+        if getattr(self.args, "calculate_per_token_loss", False):
+            unsupported.append("per-token loss")
+        if device_utils.get_device_name() != "cuda":
+            unsupported.append(f"device={device_utils.get_device_name()}")
+        if self.args.qkv_format != "thd":
+            unsupported.append(f"qkv_format={self.args.qkv_format}")
+        if unsupported:
+            raise ValueError(
+                "--sft-async-prepack currently supports THD with PP=1, CP=1 and VPP disabled; "
+                f"unsupported: {', '.join(unsupported)}."
+            )
 
     @timer
     def sleep(self) -> None:
@@ -676,6 +795,19 @@ class MegatronTrainRayActor(TrainRayActor):
                 task_name = f"{base_task_name}_critic"
             else:
                 task_name = base_task_name
+            if is_sft_mode(self.args) and self._sft_window_prefetcher is not None:
+                data_fields = build_data_fields(self.args, consumer="actor")
+                rollout_data, prepared_iterator, num_microbatches = self._get_prefetched_sft_window(
+                    task_name,
+                    rollout_id,
+                    data_fields,
+                )
+                return self.train_actor(
+                    rollout_id,
+                    rollout_data,
+                    prepared_data_iterator=[prepared_iterator],
+                    prepared_num_microbatches=[num_microbatches],
+                )
             empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
             rollout_mini_batch_metas: list = []
@@ -729,6 +861,247 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     return self.train_actor(rollout_id, rollout_data)
 
+    def _get_prefetched_sft_window(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> tuple[RolloutBatch, _SFTPrepackedDeviceIterator, int]:
+        assert self._sft_window_prefetcher is not None
+        identity = (task_name, tuple(data_fields))
+        self._sft_window_prefetcher.prefetch(
+            rollout_id,
+            partial(self._fetch_and_prepack_sft_window, task_name, rollout_id, data_fields),
+            identity=identity,
+        )
+        # Capture prefetch failure locally so all ranks can synchronize on
+        # error status before touching any collective. A background TQ /
+        # packing / pin failure on one rank must not leave peer ranks stuck
+        # in the first all_reduce below.
+        device = device_utils.make_current_torch_device()
+        tp_group = mpu.get_tensor_model_parallel_group()
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+        local_error: BaseException | None = None
+        window = None
+        with timer("sft_prefetch_wait"):
+            try:
+                window = self._sft_window_prefetcher.get(rollout_id)
+            except BaseException as exc:  # noqa: BLE001
+                local_error = exc
+
+        error_flag = torch.tensor([1 if local_error is not None else 0], dtype=torch.int, device=device)
+        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=tp_group)
+        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=dp_group)
+        if int(error_flag.item()) != 0:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(
+                f"SFT prefetch failed on a peer rank for rollout_id={rollout_id}; "
+                "aborting to avoid a distributed hang."
+            )
+        assert window is not None
+
+        local_k = len(window.packed_micro_batches)
+        local_samples = len(window.rollout_data["total_lengths"])
+
+        # Run every collective unconditionally, aggregate failure into a
+        # single global bit, then raise together. Raising between collectives
+        # would leave peers stuck in the next all_reduce.
+        # tp_bounds: [max_k, -min_k, max_samples, -min_samples] MAX-reduced
+        # across TP replicas. Only tp_max_k / TP sample-count agreement are
+        # used downstream; tp_min_k folds into DP-wide MAX below.
+        tp_bounds = torch.tensor([local_k, -local_k, local_samples, -local_samples], dtype=torch.int, device=device)
+        dist.all_reduce(tp_bounds, op=dist.ReduceOp.MAX, group=tp_group)
+        tp_max_k = int(tp_bounds[0].item())
+        tp_max_samples, tp_min_samples = int(tp_bounds[2].item()), -int(tp_bounds[3].item())
+
+        dp_k_bounds = torch.tensor([tp_max_k], dtype=torch.int, device=device)
+        dist.all_reduce(dp_k_bounds, op=dist.ReduceOp.MAX, group=dp_group)
+        max_k = int(dp_k_bounds[0].item())
+
+        global_samples = torch.tensor([local_samples], dtype=torch.int, device=device)
+        dist.all_reduce(global_samples, op=dist.ReduceOp.SUM, group=dp_group)
+        total_samples = int(global_samples.item())
+
+        errors: list[str] = []
+        if tp_max_samples != tp_min_samples:
+            errors.append(f"real sample count differs across TP ranks (min={tp_min_samples}, max={tp_max_samples})")
+        if total_samples != self.args.global_batch_size:
+            errors.append(
+                f"sample count mismatch (expected global_batch_size={self.args.global_batch_size}, got {total_samples})"
+            )
+        if errors:
+            raise RuntimeError(
+                f"SFT prefetch validation failed for rollout_id={rollout_id}: " + "; ".join(errors) + "."
+            )
+
+        packed_micro_batches = window.packed_micro_batches
+        first_device_micro_batch = window.first_device_micro_batch
+        first_ready_event = window.first_ready_event
+
+        # Match get_data_iterator: first agree on DP-wide K, then repartition
+        # every rank's real samples into that K. Repeating a complete local
+        # micro-batch as a zero-loss dummy still runs its full forward/backward
+        # and made long-sequence SFT substantially slower.
+        if local_k < max_k:
+            first_ready_event.synchronize()
+            micro_batch_indices = get_seqlen_balanced_partitions(
+                window.rollout_data["total_lengths"], max_k, equal_size=False
+            )
+            packed_micro_batches = [
+                (
+                    prepack_sft_micro_batch_cpu(
+                        self.args,
+                        _select_rollout_samples(window.rollout_data, indices),
+                    ),
+                    None,
+                )
+                for indices in micro_batch_indices
+            ]
+
+            assert self._sft_copy_stream is not None
+            assert self._sft_device is not None
+            with device_utils.stream_context(self._sft_copy_stream):
+                first_cpu_batch, first_meta = packed_micro_batches[0]
+                first_device_batch = PrepackedBatch(
+                    move_tensors_to_device(first_cpu_batch, self._sft_device, non_blocking=True)
+                )
+                first_ready_event = device_utils.Event()
+                first_ready_event.record(self._sft_copy_stream)
+            first_device_micro_batch = (first_device_batch, first_meta)
+        local_k = max_k
+
+        should_pause_for_eval = should_run_sft_eval(self.args, rollout_id) or should_run_sft_predict(
+            self.args, rollout_id
+        )
+        next_rollout_id = rollout_id + 1
+        if next_rollout_id < self.args.num_rollout and self.args.max_staleness >= 1 and not should_pause_for_eval:
+            self._sft_window_prefetcher.prefetch(
+                next_rollout_id,
+                partial(self._fetch_and_prepack_sft_window, task_name, next_rollout_id, data_fields),
+                identity=(task_name, tuple(data_fields)),
+            )
+
+        assert self._sft_copy_stream is not None
+        assert self._sft_device is not None
+        iterator = _SFTPrepackedDeviceIterator(
+            packed_micro_batches,
+            first_device_micro_batch,
+            first_ready_event,
+            self._sft_copy_stream,
+            self._sft_device,
+        )
+        return window.rollout_data, iterator, local_k
+
+    def _fetch_and_prepack_sft_window(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> PrefetchedSFTWindow:
+        """Fetch, fully pack, pin, and enqueue H2D for one SFT window."""
+        prefetch_started = time.monotonic()
+        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+        dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+        if self.args.global_batch_size % dp_size != 0:
+            raise ValueError(
+                "--sft-async-prepack requires global_batch_size divisible by data parallel size, "
+                f"got global_batch_size={self.args.global_batch_size}, dp_size={dp_size}."
+            )
+
+        # The producer writes exactly one global SFT batch per partition. Use
+        # the regular seqlen-balanced sampler to fetch the complete local shard
+        # in one request, just like the stable non-prepack path. Streaming
+        # token-budget rounds wait on straggling tail samples and their polling
+        # backoff can turn a small producer skew into multi-second stalls.
+        batch_size = self.args.global_batch_size // dp_size
+        partition_id = sft_partition_id(self.args, rollout_id)
+        sampling_config = {"dp_rank": dp_rank, "task_name": task_name}
+        rollout_data = None
+        fetch_attempt = 0
+        while rollout_data is None:
+            rollout_data, _batch_meta = get_data_from_transfer_queue(
+                args=self.args,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                batch_index=0,
+                broadcast_pp=False,
+                per_rank_fetch=True,
+                post_process=False,
+            )
+            if rollout_data is None:
+                fetch_attempt += 1
+                if fetch_attempt % 100 == 0:
+                    logger.info(
+                        "[sft-prepack] rollout=%d dp=%d waiting for complete balanced shard; attempts=%d",
+                        rollout_id,
+                        dp_rank,
+                        fetch_attempt,
+                    )
+                time.sleep(Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0)
+        drain_finished = time.monotonic()
+
+        assert rollout_data is not None
+        if len(rollout_data["total_lengths"]) != batch_size:
+            raise RuntimeError(
+                f"SFT prefetch local shard size mismatch for rollout_id={rollout_id}: "
+                f"expected {batch_size}, got {len(rollout_data['total_lengths'])}."
+            )
+
+        # K_local is speculative so CPU packing can stay in the background.
+        # The training thread performs the DP-wide MAX and only short ranks
+        # repack their real samples to K_global.
+        samples = rollout_data["total_lengths"]
+        # CP=1 by _validate_sft_prepack_pipeline; cp_size factor is a no-op
+        # but kept explicit to mirror get_data_iterator's formula.
+        cp_size = mpu.get_context_parallel_world_size()
+        max_tokens = self.args.max_tokens_per_gpu * cp_size
+        k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
+        micro_batch_indices = get_seqlen_balanced_partitions(samples, k_local, equal_size=False)
+        packed_cpu = [
+            (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
+            for indices in micro_batch_indices
+        ]
+        packing_finished = time.monotonic()
+
+        assert self._sft_prefetch_stream is not None
+        assert self._sft_device is not None
+        device_utils.set_device(self._sft_device)
+        # First H2D goes on the prefetch-owned stream so the training thread's
+        # _sft_copy_stream (used by _SFTPrepackedDeviceIterator) never has
+        # background enqueues racing in front of the current step's copies.
+        with device_utils.stream_context(self._sft_prefetch_stream):
+            first_cpu_batch, first_meta = packed_cpu[0]
+            first_device_batch = PrepackedBatch(
+                move_tensors_to_device(first_cpu_batch, self._sft_device, non_blocking=True)
+            )
+            first_ready_event = device_utils.Event()
+            first_ready_event.record(self._sft_prefetch_stream)
+
+        logger.info(
+            "[sft-prepack] rollout=%d dp=%d real_samples=%d micro_batches=%d "
+            "tq_drain=%.3fs cpu_pack_pin=%.3fs first_h2d_enqueue=%.3fs",
+            rollout_id,
+            dp_rank,
+            len(rollout_data["total_lengths"]),
+            len(packed_cpu),
+            drain_finished - prefetch_started,
+            packing_finished - drain_finished,
+            time.monotonic() - packing_finished,
+        )
+
+        return PrefetchedSFTWindow(
+            rollout_id=rollout_id,
+            rollout_data=rollout_data,
+            packed_micro_batches=packed_cpu,
+            first_device_micro_batch=(first_device_batch, first_meta),
+            first_ready_event=first_ready_event,
+        )
+
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
@@ -775,7 +1148,13 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._per_step_rollout and self.args.offload_train:
             self.sleep()
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+    def train_actor(
+        self,
+        rollout_id: int,
+        rollout_data: RolloutBatch,
+        prepared_data_iterator: list[_SFTPrepackedDeviceIterator] | None = None,
+        prepared_num_microbatches: list[int] | None = None,
+    ) -> None:
         # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
         # GAE + normalize_advantages need GPU tensors — dispatch here so the
@@ -791,9 +1170,17 @@ class MegatronTrainRayActor(TrainRayActor):
                 ]
 
         # Create data iterator for actor forward + routing replay + train.
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        uses_prepared_sft_window = prepared_data_iterator is not None and prepared_num_microbatches is not None
+        if not uses_prepared_sft_window:
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        else:
+            data_iterator, num_microbatches = prepared_data_iterator, prepared_num_microbatches
         # Create a separate iterator with a larger token budget for ref/teacher log-probs
-        if self.args.use_dynamic_batch_size and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu:
+        if (
+            not is_sft_mode(self.args)
+            and self.args.use_dynamic_batch_size
+            and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu
+        ):
             data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
                 self.args,
                 self.model,
@@ -881,14 +1268,20 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                )
+                try:
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                    )
+                finally:
+                    for iterator in data_iterator:
+                        close = getattr(iterator, "close", None)
+                        if close is not None:
+                            close()
 
             self.prof.step(rollout_id=rollout_id)
 

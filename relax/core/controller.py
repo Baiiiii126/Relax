@@ -13,17 +13,6 @@ from omegaconf import OmegaConf
 from ray import serve
 from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
 
-
-try:
-    from transfer_queue import StreamingTokenBudgetSampler
-except ImportError as e:
-    raise ImportError(
-        "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
-        '    pip install "transferqueue @ git+https://github.com/redai-infra/'
-        'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps\n'
-        "or use the latest image."
-    ) from e
-
 from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
 from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
@@ -47,6 +36,27 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
+
+
+def _load_streaming_token_budget_sampler() -> type[Any]:
+    """Import the optional fully-async sampler only when that path is
+    selected."""
+    try:
+        from relax.utils.data.streaming_token_budget_sampler import StreamingTokenBudgetSampler
+    except ImportError as e:
+        missing = getattr(e, "name", None)
+        if missing == "relax.utils.data.streaming_token_budget_sampler":
+            raise ImportError(
+                "relax.utils.data.streaming_token_budget_sampler is missing from the checkout; "
+                "the fully-async streaming path requires this local wrapper."
+            ) from e
+        raise ImportError(
+            "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
+            '    pip install "transferqueue @ git+https://github.com/redai-infra/'
+            'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps\n'
+            "or use the latest image."
+        ) from e
+    return StreamingTokenBudgetSampler
 
 
 def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
@@ -152,15 +162,21 @@ class Controller:
         total_storage_size = (
             batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
         )
-        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
-            # Fully-async + dynamic-batch path streams data per DP via token
-            # budget; the controller-side sampler maintains per-DP buckets and
-            # balances tokens at small-unit granularity.  See
-            # docs/zh/guide/fully-async-training.md.
-            sampler = StreamingTokenBudgetSampler(
+        use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
+        use_streaming_sampler = (
+            getattr(self.config, "use_dynamic_batch_size", False)
+            and getattr(self.config, "fully_async", False)
+            and not use_sft_prepack
+        )
+        if use_streaming_sampler:
+            # Fully-async training consumes token-budget micro-batches directly
+            # from TQ. SFT async prepack fetches one complete balanced shard in
+            # the background and therefore uses SeqlenBalancedSampler below.
+            streaming_sampler_cls = _load_streaming_token_budget_sampler()
+            sampler = streaming_sampler_cls(
                 n_samples_per_prompt=self.config.n_samples_per_prompt,
             )
-            logger.info("Using StreamingTokenBudgetSampler (fully_async + dynamic batch)")
+            logger.info("Using StreamingTokenBudgetSampler (streaming dynamic batch)")
         elif algo_key == "sft" or getattr(self.config, "balance_data", False):
             # SFT walks the SeqlenBalancedSampler branch (sequential / balanced sampling),
             # since the GRPO grouped sampler assumes n_samples_per_prompt > 1 rollouts.

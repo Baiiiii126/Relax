@@ -566,6 +566,7 @@ def get_data_from_transfer_queue(
     per_rank_fetch: bool = False,
     token_budget: int | None = None,
     allow_underfill: bool = True,
+    post_process: bool = True,
 ):
     """Fetch a batch from the transfer queue and broadcast it across tensor-
     parallel and optionally pipeline-parallel ranks.
@@ -603,6 +604,9 @@ def get_data_from_transfer_queue(
             dominates ``tgd_bcast_tp_time``.  Caller must ensure
             ``rollout_routed_experts`` is not in ``data_fields`` (its bcast
             path is incompatible) — actor.py guards this.
+        post_process: Move and reshape rollout fields for Megatron. Set to
+            False only for CPU-only background prefetch; the training thread
+            must materialize each micro-batch before use.
 
     Returns:
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
@@ -687,7 +691,7 @@ def get_data_from_transfer_queue(
 
     # Use an explicit device so the communication backend (e.g. NCCL)
     # can bind to a known device context.
-    cuda_dev = device_utils.make_current_torch_device()
+    cuda_dev = None if per_rank_fetch else device_utils.make_current_torch_device()
 
     # --- Extract rollout_routed_experts BEFORE broadcast_object_list ---
     # broadcast_object_list uses pickle for the entire payload. When
@@ -868,7 +872,8 @@ def get_data_from_transfer_queue(
     if has_multimodal and mm_inputs is not None:
         rollout_data["multimodal_train_inputs"] = mm_inputs
 
-    post_process_rollout_data(args, rollout_data)
+    if post_process:
+        post_process_rollout_data(args, rollout_data)
 
     return rollout_data, batch_meta
 
@@ -1328,10 +1333,9 @@ class StreamingTQIterator:
             )
             return self._make_dummy_batch()
 
-        partition_id = f"train_{self.rollout_id}"
-
         t0 = time.monotonic()
         empty_streak = 0
+        partition_id = f"train_{self.rollout_id}"
 
         while True:
             sampling_config = self._sampling_config(self._batch_index)

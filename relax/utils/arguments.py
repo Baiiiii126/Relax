@@ -590,6 +590,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Worker threads inside the SFT PrefetchBuffer for I/O-bound media decoding.",
             )
             parser.add_argument(
+                "--sft-async-prepack",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable the SFT prepack pipeline: TQ fetch + seqlen-balanced "
+                    "micro-batch partitioning + THD packing + pinned-memory H2D "
+                    "are all offloaded to a background worker, keeping only "
+                    "fwd/bwd on the training thread. Data / batch / loss-scaling "
+                    "semantics match the standard SFT path exactly (same K, same "
+                    "get_seqlen_balanced_partitions, same __loss_scale__). Requires "
+                    "--per-rank-fetch; PP=1, CP=1, VPP=1 and THD qkv format only."
+                ),
+            )
+            parser.add_argument(
                 "--sft-oversize-strategy",
                 type=str,
                 default="keep",
@@ -1307,7 +1321,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Balance the number of tokens between data parallel ranks with `karmarkar_karp` for verl. "
                     "Note that this may allocate the different response of the same prompt into different training steps. "
-                    "In fully-async + --use-dynamic-batch-size mode this is effectively always on: the "
+                    "In streaming dynamic-batch mode this is effectively always on: the "
                     "StreamingTokenBudgetSampler already balances tokens across DP ranks per sample, so the "
                     "flag is accepted but has no additional effect there."
                 ),
@@ -2569,8 +2583,7 @@ def parse_args(add_custom_arguments=None):
     if not args.debug_train_only:
         sglang_validate_args(args)
 
-    # Only fully-async mode relies on the newer TransferQueue (e.g.
-    # StreamingTokenBudgetSampler), so gate the version requirement on it.
+    # Only fully-async mode relies on the newer TransferQueue streaming sampler.
     if getattr(args, "fully_async", False):
         check_transfer_queue_version()
 
@@ -2990,6 +3003,32 @@ def slime_validate_args(args):
     if args.loss_type == "sft":
         if not args.custom_dataset_class_path and not args.prompt_data:
             raise ValueError("--loss-type sft requires --prompt-data.")
+        if getattr(args, "sft_async_prepack", False):
+            if not args.per_rank_fetch:
+                raise ValueError(
+                    "--sft-async-prepack enables background prepacking and requires --per-rank-fetch; "
+                    "background prefetch workers must not execute CP/TP/PP collectives."
+                )
+            if args.use_routing_replay or args.use_rollout_routing_replay:
+                raise ValueError(
+                    "--sft-async-prepack does not support routing replay because its iterator is single-pass."
+                )
+            # Lookahead prefetch (next rollout) only starts when max_staleness >= 1.
+            # With max_staleness = 0 the pipeline degrades to synchronous prefetch —
+            # training thread waits for the current window before it can start
+            # fetching + packing + H2D + fwd/bwd, losing all overlap and paying
+            # the pipeline's fixed overhead (extra threads, pinned memory and
+            # cross-stream events). Auto-bump so the flag actually
+            # buys overlap; user can still raise it explicitly via
+            # --max-staleness or --sft-max-in-flight-steps.
+            if args.max_staleness < 1:
+                logger.info(
+                    "--sft-async-prepack requires max_staleness >= 1 to overlap prefetch with "
+                    "training; auto-bumping max_staleness from %d to 1. Set --sft-max-in-flight-steps "
+                    "or --max-staleness explicitly to raise it further (recommended: 4).",
+                    args.max_staleness,
+                )
+                args.max_staleness = 1
         if args.sft_oversize_strategy == "custom" and not args.sft_oversize_custom_function_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
         # SFT does not use advantages / reference; force-disable to avoid wasted compute.
@@ -3004,14 +3043,13 @@ def slime_validate_args(args):
                 "SFT relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
                 "samples that cannot fit on a single GPU."
             )
-        # The controller always installs SeqlenBalancedSampler for SFT (see
-        # `core/controller.py:_initialize_data_system`). That sampler can hand
-        # different sample counts to each DP rank, which the Megatron data
-        # path only handles correctly when args.balance_data is True. Force it
-        # on so the two layers stay consistent.
+        # The controller installs SeqlenBalancedSampler for SFT, so keep the
+        # Megatron data path in DP-balanced mode as well.
         if not args.balance_data:
             logger.info("--loss-type sft: auto-enabling --balance-data for DP-balanced batching.")
             args.balance_data = True
+    elif getattr(args, "sft_async_prepack", False):
+        raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
     args.use_critic = args.advantage_estimator == "ppo"
     # Synchronous PPO has no producer for
