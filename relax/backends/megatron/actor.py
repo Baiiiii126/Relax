@@ -170,6 +170,10 @@ def _select_rollout_samples(rollout_data: RolloutBatch, indices: list[int]) -> R
     return {key: _select(value) for key, value in rollout_data.items()}
 
 
+class _SFTPrefetchMiss(RuntimeError):
+    """Background prefetch did not find data within its local retry budget."""
+
+
 class _SFTPrepackedDeviceIterator:
     """Two-slot H2D pipeline over fully packed pinned-CPU micro-batches.
 
@@ -887,20 +891,12 @@ class MegatronTrainRayActor(TrainRayActor):
         with timer("sft_prefetch_wait"):
             try:
                 window = self._sft_window_prefetcher.get(rollout_id)
+            except _SFTPrefetchMiss:
+                window = None
             except BaseException as exc:  # noqa: BLE001
                 local_error = exc
 
-        error_flag = torch.tensor([1 if local_error is not None else 0], dtype=torch.int, device=device)
-        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=tp_group)
-        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=dp_group)
-        if int(error_flag.item()) != 0:
-            if local_error is not None:
-                raise local_error
-            raise RuntimeError(
-                f"SFT prefetch failed on a peer rank for rollout_id={rollout_id}; "
-                "aborting to avoid a distributed hang."
-            )
-        assert window is not None
+        window = self._agree_sft_prefetch_window(task_name, rollout_id, data_fields, window, local_error)
 
         local_k = len(window.packed_micro_batches)
         local_samples = len(window.rollout_data["total_lengths"])
@@ -994,59 +990,55 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         return window.rollout_data, iterator, local_k
 
-    def _fetch_and_prepack_sft_window(
-        self,
-        task_name: str,
-        rollout_id: int,
-        data_fields: list[str],
-    ) -> PrefetchedSFTWindow:
-        """Fetch, fully pack, pin, and enqueue H2D for one SFT window."""
-        prefetch_started = time.monotonic()
-        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+    def _sft_prepack_local_batch_size(self) -> int:
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
         if self.args.global_batch_size % dp_size != 0:
             raise ValueError(
                 "--sft-async-prepack requires global_batch_size divisible by data parallel size, "
                 f"got global_batch_size={self.args.global_batch_size}, dp_size={dp_size}."
             )
+        return self.args.global_batch_size // dp_size
 
+    def _fetch_sft_prepack_rollout_once(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> RolloutBatch | None:
         # The producer writes exactly one global SFT batch per partition. Use
         # the regular seqlen-balanced sampler to fetch the complete local shard
         # in one request, just like the stable non-prepack path. Streaming
         # token-budget rounds wait on straggling tail samples and their polling
         # backoff can turn a small producer skew into multi-second stalls.
-        batch_size = self.args.global_batch_size // dp_size
+        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+        batch_size = self._sft_prepack_local_batch_size()
         partition_id = sft_partition_id(self.args, rollout_id)
         sampling_config = {"dp_rank": dp_rank, "task_name": task_name}
-        rollout_data = None
-        fetch_attempt = 0
-        while rollout_data is None:
-            rollout_data, _batch_meta = get_data_from_transfer_queue(
-                args=self.args,
-                tq_client=self.data_system_client,
-                data_fields=data_fields,
-                batch_size=batch_size,
-                partition_id=partition_id,
-                task_name=task_name,
-                sampling_config=sampling_config,
-                batch_index=0,
-                broadcast_pp=False,
-                per_rank_fetch=True,
-                post_process=False,
-            )
-            if rollout_data is None:
-                fetch_attempt += 1
-                if fetch_attempt % 100 == 0:
-                    logger.info(
-                        "[sft-prepack] rollout=%d dp=%d waiting for complete balanced shard; attempts=%d",
-                        rollout_id,
-                        dp_rank,
-                        fetch_attempt,
-                    )
-                time.sleep(Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0)
-        drain_finished = time.monotonic()
+        rollout_data, _batch_meta = get_data_from_transfer_queue(
+            args=self.args,
+            tq_client=self.data_system_client,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=0,
+            broadcast_pp=False,
+            per_rank_fetch=True,
+            post_process=False,
+            synchronize_per_rank_fetch=False,
+        )
+        return rollout_data
 
-        assert rollout_data is not None
+    def _pack_sft_prepack_window(
+        self,
+        rollout_id: int,
+        rollout_data: RolloutBatch,
+        prefetch_started: float,
+        drain_finished: float,
+    ) -> PrefetchedSFTWindow:
+        batch_size = self._sft_prepack_local_batch_size()
+        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
         if len(rollout_data["total_lengths"]) != batch_size:
             raise RuntimeError(
                 f"SFT prefetch local shard size mismatch for rollout_id={rollout_id}: "
@@ -1102,6 +1094,136 @@ class MegatronTrainRayActor(TrainRayActor):
             first_device_micro_batch=(first_device_batch, first_meta),
             first_ready_event=first_ready_event,
         )
+
+    def _fetch_sft_prepack_window_once(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> PrefetchedSFTWindow | None:
+        fetch_started = time.monotonic()
+        rollout_data = self._fetch_sft_prepack_rollout_once(task_name, rollout_id, data_fields)
+        if rollout_data is None:
+            return None
+        return self._pack_sft_prepack_window(rollout_id, rollout_data, fetch_started, time.monotonic())
+
+    def _agree_sft_prefetch_window(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+        window: PrefetchedSFTWindow | None,
+        local_error: BaseException | None,
+    ) -> PrefetchedSFTWindow:
+        device = device_utils.make_current_torch_device()
+        tp_group = mpu.get_tensor_model_parallel_group()
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+
+        error_flag = torch.tensor([1 if local_error is not None else 0], dtype=torch.int, device=device)
+        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=tp_group)
+        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=dp_group)
+        if int(error_flag.item()) != 0:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(
+                f"SFT prefetch failed on a peer rank for rollout_id={rollout_id}; "
+                "aborting to avoid a distributed hang."
+            )
+
+        # Any recovery collectives run in the training thread. The background
+        # worker is deliberately limited to rank-local TQ RPC, CPU packing, and
+        # H2D enqueue so it cannot interleave NCCL with model fwd/bwd collectives.
+        max_retries = Envs.RELAX_FETCH_SPLIT_MAX_RETRIES
+        split_attempt = 0
+        empty_attempt = 0
+        recovery_error: BaseException | None = None
+        while True:
+            has_window = window is not None
+            status = torch.tensor(
+                [1 if has_window else 0, 0 if has_window else 1, 1 if recovery_error is not None else 0],
+                dtype=torch.int,
+                device=device,
+            )
+            dist.all_reduce(status, op=dist.ReduceOp.SUM, group=tp_group)
+            got, missing, failed = status.tolist()
+
+            if failed:
+                if recovery_error is None:
+                    recovery_error = RuntimeError(
+                        f"SFT prefetch recovery failed on a peer TP rank for rollout_id={rollout_id}."
+                    )
+                break
+            if missing == 0:
+                break
+
+            if got:
+                split_attempt += 1
+                if split_attempt > max_retries:
+                    recovery_error = RuntimeError(
+                        f"[sft-prepack] rollout={rollout_id}: TP ranks still split after {max_retries} "
+                        f"foreground retries ({got}/{got + missing} ranks have data)."
+                    )
+                    continue
+                if not has_window:
+                    logger.warning(
+                        "[sft-prepack] rollout=%d: %d/%d TP ranks have data, foreground re-fetch attempt %d",
+                        rollout_id,
+                        got,
+                        got + missing,
+                        split_attempt,
+                    )
+                retry_sleep_s = 0.25
+            else:
+                empty_attempt += 1
+                if empty_attempt % 100 == 0 and not has_window:
+                    logger.info(
+                        "[sft-prepack] rollout=%d waiting for complete balanced shard; attempts=%d",
+                        rollout_id,
+                        empty_attempt,
+                    )
+                retry_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
+
+            if not has_window:
+                time.sleep(retry_sleep_s)
+                try:
+                    window = self._fetch_sft_prepack_window_once(task_name, rollout_id, data_fields)
+                except BaseException as exc:  # noqa: BLE001
+                    recovery_error = exc
+
+        recovery_error_flag = torch.tensor([1 if recovery_error is not None else 0], dtype=torch.int, device=device)
+        dist.all_reduce(recovery_error_flag, op=dist.ReduceOp.MAX, group=dp_group)
+        if int(recovery_error_flag.item()) != 0:
+            if recovery_error is not None:
+                raise recovery_error
+            raise RuntimeError(
+                f"SFT prefetch recovery failed on a peer DP rank for rollout_id={rollout_id}; "
+                "aborting to avoid a distributed hang."
+            )
+
+        assert window is not None
+        return window
+
+    def _fetch_and_prepack_sft_window(
+        self,
+        task_name: str,
+        rollout_id: int,
+        data_fields: list[str],
+    ) -> PrefetchedSFTWindow:
+        """Fetch, fully pack, pin, and enqueue H2D for one SFT window."""
+        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+        window = None
+        fetch_attempt = 0
+        while window is None and fetch_attempt <= Envs.RELAX_FETCH_SPLIT_MAX_RETRIES:
+            window = self._fetch_sft_prepack_window_once(task_name, rollout_id, data_fields)
+            if window is None:
+                fetch_attempt += 1
+                time.sleep(Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0)
+        if window is None:
+            raise _SFTPrefetchMiss(
+                f"SFT prefetch rollout={rollout_id} dp={dp_rank} found no data after "
+                f"{fetch_attempt} rank-local attempts."
+            )
+        return window
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
