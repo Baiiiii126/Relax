@@ -625,6 +625,7 @@ def get_data_from_transfer_queue(
     token_budget: int | None = None,
     allow_underfill: bool = True,
     post_process: bool = True,
+    synchronize_per_rank_fetch: bool = True,
 ):
     """Fetch a batch from the transfer queue and broadcast it across tensor-
     parallel and optionally pipeline-parallel ranks.
@@ -665,11 +666,18 @@ def get_data_from_transfer_queue(
         post_process: Move and reshape rollout fields for Megatron. Set to
             False only for CPU-only background prefetch; the training thread
             must materialize each micro-batch before use.
+        synchronize_per_rank_fetch: When True, per-rank fetches agree on
+            empty-vs-data state across the model-parallel replica before
+            returning. Set to False only when the caller has its own foreground
+            synchronization point and must keep this call collective-free.
 
     Returns:
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
         If no data is available, both elements are None.
     """
+    if not synchronize_per_rank_fetch and not per_rank_fetch:
+        raise ValueError("synchronize_per_rank_fetch=False requires per_rank_fetch=True")
+
     # Compose request configuration and ask the queue for metadata.
     config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
     if token_budget is not None:
@@ -749,7 +757,7 @@ def get_data_from_transfer_queue(
             # will receive the real data via broadcast.
             rollout_data = [None, None]
 
-    if per_rank_fetch:
+    if per_rank_fetch and synchronize_per_rank_fetch:
         # No broadcast follows, so a producer race can split this logical DP
         # rank into "got data" and "empty meta" model-parallel subsets.
         rollout_data = _agree_on_fetch(
