@@ -3859,6 +3859,10 @@ class SGLangBackendAdapter:
         self._use_rollout_routing_replay = args.use_rollout_routing_replay
         self._router_policy = args.sglang_router_policy
         self._slime_router_sticky = getattr(args, "slime_router_sticky", False)
+        # Session KV lifecycle: when enabled, send the engine session id as a
+        # top-level `session_id` so SGLang's session-radix cache tags the leaf and
+        # the session can be released via /close_session on finalize.
+        self._session_lifecycle = getattr(args, "agentic_session_lifecycle", False)
         resources = compiler_resources or get_agentic_runtime_resources(args).compiler
         self.tokenizer = resources.tokenizer
         self.compiler = SGLangMessageCompiler(
@@ -3901,6 +3905,12 @@ class SGLangBackendAdapter:
             payload["audio_data"] = list(audio_data)
         if video_data:
             payload["video_data"] = list(video_data)
+        if session_id and self._session_lifecycle:
+            # Tag this engine session on the server's session-radix cache so
+            # its unique KV can be released on finalize via /close_session. The full
+            # `input_ids` are always sent, so a cold cache still serves correctly and
+            # servers without --enable-session-radix-cache simply ignore this field.
+            payload["session_id"] = session_id
         headers = None
         if session_id and (self._router_policy == "consistent_hashing" or self._slime_router_sticky):
             # Pin every turn of a session to the same engine so the growing

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from types import SimpleNamespace
 from typing import Any
@@ -9,21 +10,35 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
+from relax.agentic.pipeline import runtime as runtime_mod
 from relax.agentic.pipeline.reward import RewardDomain
 from relax.agentic.pipeline.runtime import (
     BackendGenerateResult,
     RuntimeGroup,
+    SGLangBackendAdapter,
     _request_envelope_from_sample,
 )
 from relax.agentic.pipeline.transfer import TransferDomain
 from relax.agentic.rollout import AgenticResidentPipeline, _AgenticStepHandle
+from relax.agentic.session import service as service_mod
+from relax.agentic.session.admission import (
+    AdmissionAction,
+    AdmissionFeatures,
+    AdmissionReason,
+    BudgetState,
+    WorkerSnapshot,
+    compute_reservation_tokens,
+    decide_admission_prelude,
+    interpret_budget_response,
+)
 from relax.agentic.session.service import (
     AgenticSessionShard,
     _decide_ir_release,
     _normalized_chat_request,
     _openai_token_logprobs_payload,
+    _SessionRecord,
 )
-from relax.agentic.session.state import RequestKind, SessionForest, check_messages
+from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.utils.types import Sample
 
 
@@ -176,6 +191,10 @@ def _make_chat_test_shard(
     shard._terminal_ir_gate_closed = False
     shard._sglang_request_semaphore = None
     shard._sglang_request_limiter = None
+    shard._admission_client = None
+    shard._admission_enabled = False
+    shard._admission_pump_task = None
+    shard._admission_stats = {}
     forest, initial_obs = _forest_with_initial_obs(
         session_id="sess-chat",
         messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
@@ -200,6 +219,10 @@ def _make_chat_test_shard(
         pending_chat_waiters={},
         gate_reason=None,
         protected_until_finalize=False,
+        admission_deferred=False,
+        admission_deferred_since=0.0,
+        admission_marked=False,
+        admission_aged_resume=False,
     )
     shard._session_records["sess-chat"] = record
     shard._session_locks["sess-chat"] = asyncio.Lock()
@@ -675,3 +698,539 @@ def test_deficit_quota_keeps_admission_ledger_consistent() -> None:
     assert remaining_previous_debt == 1  # only the genuine deficit is debt
     assert resident_current_window_groups == 2  # the 2 surplus folded into current window
     assert current_window_slack >= 0
+
+
+# ── Admission + session lifecycle ──────────────────────────────────────────────────────
+
+
+def _admission_features(**overrides) -> AdmissionFeatures:
+    base = dict(
+        enabled=True,
+        session_id="sess",
+        scope_allowed=True,
+        is_protected=False,
+        marked=False,
+        prompt_tokens=100,
+        expected_decode_tokens=8,
+        reservation_tokens=108,
+        dispatch_id="req:0",
+        admission_decision_id="d0",
+        serving_weight_version=None,
+        aged=False,
+    )
+    base.update(overrides)
+    return AdmissionFeatures(**base)
+
+
+class _FakeBudgetClient:
+    def __init__(self, *, grants=None, hint=None) -> None:
+        self.reserve_reqs: list[dict] = []
+        self.released: list[str] = []
+        self._grants = list(grants or [])
+        self._hint = (
+            hint
+            if hint is not None
+            else {
+                "degraded": False,
+                "available": 10**9,
+                "ceiling": 10**9,
+                "reserved": 0,
+                "epoch": 1,
+            }
+        )
+
+    async def reserve(self, req):
+        self.reserve_reqs.append(req)
+        if self._grants:
+            return self._grants.pop(0)
+        return {
+            "granted": True,
+            "reason": "capacity_available",
+            "lease_id": f"L{len(self.reserve_reqs)}",
+            "owner_epoch": 1,
+            "reservation_tokens": req["tokens"],
+        }
+
+    async def release(self, lease_id, actual_tokens=None):
+        self.released.append(lease_id)
+
+    async def capacity_hint(self):
+        return dict(self._hint)
+
+
+class _RaisingBudgetClient:
+    async def reserve(self, req):
+        raise RuntimeError("coordinator down")
+
+    async def release(self, lease_id, actual_tokens=None):
+        return None
+
+    async def capacity_hint(self):
+        raise RuntimeError("coordinator down")
+
+
+def _make_admission_shard(*, client=None, enabled=True, scope="train", max_wait_s=30.0, forced_cap=8):
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard.args = SimpleNamespace(
+        agentic_program_admission=enabled,
+        agentic_admission_scope=scope,
+        agentic_admission_expected_decode_cap=8,
+        rollout_max_response_len=8,
+        agentic_session_lifecycle=False,
+    )
+    shard._admission_client = client
+    shard._admission_enabled = bool(enabled) and client is not None
+    shard._admission_scope = scope
+    shard._admission_expected_decode_cap = 8
+    shard._rollout_max_response_len = 8
+    shard._admission_reconcile_interval_s = 0.01
+    shard._admission_max_wait_s = max_wait_s
+    shard._admission_forced_resume_cap = forced_cap
+    shard._admission_pump_task = None
+    shard._admission_stats = {}
+    shard._session_records = {}
+    shard._session_locks = {}
+    return shard_cls, shard
+
+
+def test_generate_sends_session_id_only_when_lifecycle_enabled(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Stop(Exception):
+        pass
+
+    async def _fake_post(url, payload, headers=None):
+        captured["payload"] = dict(payload)
+        captured["headers"] = headers
+        raise _Stop()
+
+    monkeypatch.setattr(runtime_mod, "post", _fake_post)
+    adapter = object.__new__(SGLangBackendAdapter)
+    adapter._resolved_router_ip = "10.0.0.1"
+    adapter._resolved_router_port = 8000
+    adapter._use_rollout_routing_replay = False
+    adapter._router_policy = "cache_aware"
+    adapter._slime_router_sticky = False
+    adapter.tokenizer = _FakeTokenizer()
+    adapter.compiler = SimpleNamespace(processor=None)
+
+    adapter._session_lifecycle = True
+    with pytest.raises(_Stop):
+        asyncio.run(adapter.generate(input_ids=[1, 2, 3], sampling_params={"max_new_tokens": 4}, session_id="sess-9"))
+    assert captured["payload"]["session_id"] == "sess-9"
+    assert captured["headers"] is None  # cache_aware policy -> no sticky routing header
+
+    captured.clear()
+    adapter._session_lifecycle = False
+    with pytest.raises(_Stop):
+        asyncio.run(adapter.generate(input_ids=[1, 2, 3], sampling_params={"max_new_tokens": 4}, session_id="sess-9"))
+    assert "session_id" not in captured["payload"]
+
+
+def test_close_engine_sessions_fans_out_to_all_engines(monkeypatch) -> None:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard.args = SimpleNamespace(
+        agentic_session_lifecycle=True,
+        agentic_session_close_timeout_ms=500,
+        agentic_session_close_max_retries=2,
+    )
+    posts: list[tuple] = []
+
+    async def _fake_urls(args):
+        return ["http://e0:1", "http://e1:1"]
+
+    async def _fake_post(url, payload, max_retries=6):
+        posts.append((url, payload))
+
+    monkeypatch.setattr(service_mod, "_sglang_worker_urls", _fake_urls)
+    monkeypatch.setattr(service_mod, "post", _fake_post)
+    asyncio.run(shard_cls._close_engine_sessions(shard, ["sess-1"]))
+    assert sorted(posts) == [
+        ("http://e0:1/close_session", {"session_id": "sess-1"}),
+        ("http://e1:1/close_session", {"session_id": "sess-1"}),
+    ]
+
+
+def test_close_is_noop_when_disabled(monkeypatch) -> None:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard.args = SimpleNamespace(
+        agentic_session_lifecycle=False,
+        agentic_session_close_timeout_ms=500,
+        agentic_session_close_max_retries=2,
+    )
+    posts: list[tuple] = []
+
+    async def _fake_urls(args):
+        return ["http://e0:1"]
+
+    async def _fake_post(url, payload, max_retries=6):
+        posts.append((url, payload))
+
+    monkeypatch.setattr(service_mod, "_sglang_worker_urls", _fake_urls)
+    monkeypatch.setattr(service_mod, "post", _fake_post)
+    asyncio.run(shard_cls._close_engine_sessions(shard, ["sess-1"]))
+    assert posts == []
+
+
+def test_close_is_fail_open_on_post_error(monkeypatch) -> None:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard.args = SimpleNamespace(
+        agentic_session_lifecycle=True,
+        agentic_session_close_timeout_ms=500,
+        agentic_session_close_max_retries=2,
+    )
+
+    async def _fake_urls(args):
+        return ["http://e0:1"]
+
+    async def _fake_post(url, payload, max_retries=6):
+        raise RuntimeError("engine unreachable")
+
+    monkeypatch.setattr(service_mod, "_sglang_worker_urls", _fake_urls)
+    monkeypatch.setattr(service_mod, "post", _fake_post)
+    # Must not raise: close is best-effort and never blocks the terminal path.
+    asyncio.run(shard_cls._close_engine_sessions(shard, ["sess-1"]))
+
+
+def test_finalize_closes_once_only_when_record_removed() -> None:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard.args = SimpleNamespace()
+    close_calls: list[list[str]] = []
+
+    async def _fake_close(ids):
+        close_calls.append(list(ids))
+
+    async def _fake_abort(ids):
+        return None
+
+    shard._close_engine_sessions = _fake_close
+    shard._abort_backend_request_ids = _fake_abort
+
+    lock = asyncio.Lock()
+    shard._session_records = {}
+    shard._session_locks = {"sess-x": lock}
+    result = asyncio.run(
+        shard_cls._finish_discarded_session(
+            shard,
+            session_id="sess-x",
+            lock=lock,
+            removed=_SessionRecord(),
+            active_tasks=[],
+            backend_request_ids=[],
+            waiters=[],
+            stats={"node_count": 0, "request_count": 0},
+        )
+    )
+    assert result is True
+    assert close_calls == [["sess-x"]]
+
+    close_calls.clear()
+    lock2 = asyncio.Lock()
+    shard._session_locks = {"sess-y": lock2}
+    result2 = asyncio.run(
+        shard_cls._finish_discarded_session(
+            shard,
+            session_id="sess-y",
+            lock=lock2,
+            removed=None,
+            active_tasks=[],
+            backend_request_ids=[],
+            waiters=[],
+            stats=None,
+        )
+    )
+    assert result2 is False
+    assert close_calls == []  # nothing removed -> no close
+
+
+def test_compute_reservation_tokens() -> None:
+    assert (
+        compute_reservation_tokens(
+            prompt_tokens=100, sampling_max_new_tokens=50, expected_decode_cap=200, rollout_max_response_len=8192
+        )
+        == 150
+    )
+    assert (
+        compute_reservation_tokens(
+            prompt_tokens=100, sampling_max_new_tokens=None, expected_decode_cap=None, rollout_max_response_len=8192
+        )
+        == 100 + 8192
+    )
+    assert (
+        compute_reservation_tokens(
+            prompt_tokens=0, sampling_max_new_tokens=0, expected_decode_cap=0, rollout_max_response_len=0
+        )
+        == 0
+    )
+
+
+def test_decide_admission_prelude_branches() -> None:
+    assert decide_admission_prelude(_admission_features(enabled=False)).reason_code is AdmissionReason.FEATURE_DISABLED
+    assert decide_admission_prelude(_admission_features(session_id="")).reason_code is AdmissionReason.MISSING_IDENTITY
+    assert (
+        decide_admission_prelude(_admission_features(scope_allowed=False)).reason_code
+        is AdmissionReason.CAPABILITY_UNAVAILABLE
+    )
+    protected = decide_admission_prelude(_admission_features(is_protected=True))
+    assert protected.action is AdmissionAction.BYPASS and protected.reason_code is AdmissionReason.FAIRNESS_RESERVE
+    marked = decide_admission_prelude(_admission_features(marked=True))
+    assert marked.action is AdmissionAction.DEFER and marked.reason_code is AdmissionReason.PRESSURE_GUARD
+    assert decide_admission_prelude(_admission_features()) is None
+
+
+def test_budget_state_reserve_release_and_exhaust() -> None:
+    budget = BudgetState(
+        headroom=1.0, pressure_threshold=1.0, emergency_reserve_frac=0.0, lease_ttl_s=10.0, staleness_s=30.0
+    )
+    budget.reconcile([WorkerSnapshot("e0", 1000, 0.1)], now=100.0)
+    assert budget.ceiling == 1000 and budget.epoch == 1
+    grant = budget.reserve(tokens=600, dispatch_id="r1:0", admission_decision_id="d1", aged=False, now=100.0)
+    assert grant.granted and grant.lease_id == "1:r1:0:d1"
+    # idempotent: same dispatch does not double-count
+    again = budget.reserve(tokens=600, dispatch_id="r1:0", admission_decision_id="d1", aged=False, now=100.0)
+    assert again.lease_id == grant.lease_id and budget.reserved == 600
+    exhausted = budget.reserve(tokens=600, dispatch_id="r2:0", admission_decision_id="d2", aged=False, now=100.0)
+    assert not exhausted.granted and exhausted.reason is AdmissionReason.CAPACITY_EXHAUSTED
+    budget.release(grant.lease_id)
+    assert budget.reserved == 0
+    budget.release(grant.lease_id)  # idempotent no-op
+    assert budget.reserved == 0
+
+
+def test_budget_state_pressure_and_emergency_reserve() -> None:
+    pressured = BudgetState(
+        headroom=1.0, pressure_threshold=0.90, emergency_reserve_frac=0.10, lease_ttl_s=10.0, staleness_s=30.0
+    )
+    pressured.reconcile([WorkerSnapshot("e0", 1000, 0.0, num_used_tokens=950)], now=1.0)
+    # usage derived elsewhere; force max_usage via a high-usage snapshot
+    pressured.reconcile([WorkerSnapshot("e0", 1000, 0.95)], now=1.0)
+    blocked = pressured.reserve(tokens=10, dispatch_id="a:0", admission_decision_id="d", aged=False, now=1.0)
+    assert not blocked.granted and blocked.reason is AdmissionReason.PRESSURE_GUARD
+    aged_ok = pressured.reserve(tokens=10, dispatch_id="a:0", admission_decision_id="d", aged=True, now=1.0)
+    assert aged_ok.granted  # aged bypasses the pressure guard
+
+    emergency = BudgetState(
+        headroom=1.0, pressure_threshold=1.0, emergency_reserve_frac=0.10, lease_ttl_s=10.0, staleness_s=30.0
+    )
+    emergency.reconcile([WorkerSnapshot("e0", 1000, 0.0)], now=1.0)
+    assert not emergency.reserve(tokens=950, dispatch_id="b:0", admission_decision_id="d", aged=False, now=1.0).granted
+    assert emergency.reserve(tokens=950, dispatch_id="b:0", admission_decision_id="d", aged=True, now=1.0).granted
+
+
+def test_budget_state_ttl_reconcile_and_staleness() -> None:
+    ttl = BudgetState(
+        headroom=1.0, pressure_threshold=1.0, emergency_reserve_frac=0.0, lease_ttl_s=5.0, staleness_s=30.0
+    )
+    ttl.reconcile([WorkerSnapshot("e0", 1000, 0.0)], now=0.0)
+    ttl.reserve(tokens=100, dispatch_id="x:0", admission_decision_id="d", aged=False, now=0.0)
+    assert ttl.reserved == 100
+    assert ttl.expire_ttl(now=10.0) == 1 and ttl.reserved == 0
+
+    churn = BudgetState(
+        headroom=1.0, pressure_threshold=1.0, emergency_reserve_frac=0.0, lease_ttl_s=100.0, staleness_s=30.0
+    )
+    churn.reconcile([WorkerSnapshot("e0", 1000, 0.0)], now=0.0)
+    epoch0 = churn.epoch
+    churn.reserve(tokens=100, dispatch_id="y:0", admission_decision_id="d", aged=False, now=0.0)
+    churn.reconcile([WorkerSnapshot("e0", 1000, 0.0), WorkerSnapshot("e1", 1000, 0.0)], now=1.0)
+    assert churn.epoch == epoch0 + 1 and churn.reserved == 0  # worker-set change drops stale-epoch leases
+
+    stale = BudgetState(
+        headroom=1.0, pressure_threshold=1.0, emergency_reserve_frac=0.0, lease_ttl_s=100.0, staleness_s=5.0
+    )
+    stale.reconcile([WorkerSnapshot("e0", 1000, 0.0)], now=0.0)
+    degraded = stale.reserve(tokens=10, dispatch_id="z:0", admission_decision_id="d", aged=False, now=100.0)
+    assert not degraded.granted and degraded.reason is AdmissionReason.DEGRADED
+
+
+def test_parse_engine_kv_gauges_unsums_tp_replicated_max_total() -> None:
+    """Regression: SGLang replicates max_total_num_tokens once per tp_rank; the generic
+    summing parser inflated capacity by the TP degree and deflated the derived usage by the
+    same factor, so a saturated engine (0.92) read as ~idle (0.23) and the pressure guard
+    never fired. Aggregation must be MAX per gauge."""
+    from relax.agentic.session.admission_coordinator import _parse_engine_kv_gauges
+
+    # 4 tp_rank lines with an identical per-engine pool size + single-line scheduler gauges.
+    text = "\n".join(
+        [
+            "# HELP sglang:max_total_num_tokens KV pool size",
+            "# TYPE sglang:max_total_num_tokens gauge",
+            'sglang:max_total_num_tokens{tp_rank="0"} 262144.0',
+            'sglang:max_total_num_tokens{tp_rank="1"} 262144.0',
+            'sglang:max_total_num_tokens{tp_rank="2"} 262144.0',
+            'sglang:max_total_num_tokens{tp_rank="3"} 262144.0',
+            'sglang:num_used_tokens{tp_rank="0"} 239901.0',
+            'sglang:token_usage{tp_rank="0"} 0.915',
+            'sglang:num_running_reqs{tp_rank="0"} 16.0',
+        ]
+    )
+    gauges = _parse_engine_kv_gauges(text)
+    # max, NOT the 4x sum (1048576) the generic parser produced.
+    assert gauges["sglang:max_total_num_tokens"] == 262144.0
+    assert gauges["sglang:num_used_tokens"] == 239901.0
+    assert abs(gauges["sglang:token_usage"] - 0.915) < 1e-9
+    # Derived usage from absolute counts must reflect the true ~0.92, not the 4x-deflated 0.23.
+    assert abs(gauges["sglang:num_used_tokens"] / gauges["sglang:max_total_num_tokens"] - 0.915) < 1e-3
+
+
+def test_budget_state_peak_usage_running_max() -> None:
+    """The once-per-step metrics read (coordinator health) is sampled after the
+    rollout has drained, so the instantaneous usage undershoots.
+
+    capacity_hint must expose a running peak/mean over reconciles, drained only
+    on the resetting read; the resume-pump read must not steal it.
+    """
+    st = BudgetState(headroom=1.0, pressure_threshold=2.0, emergency_reserve_frac=0.0, staleness_s=1e9)
+    # A rollout window: usage rises to a peak, then drains to near-idle before the per-step read.
+    st.reconcile([WorkerSnapshot("e0", 1000, 0.30)], now=0.0)
+    st.reconcile([WorkerSnapshot("e0", 1000, 0.90)], now=1.0)  # peak
+    st.reconcile([WorkerSnapshot("e0", 1000, 0.05)], now=2.0)  # drained to idle
+
+    # Resume-pump style read: sees the true peak, keeps the instantaneous, does NOT drain.
+    hint = st.capacity_hint(now=2.0)
+    assert abs(hint["peak_usage"] - 0.90) < 1e-9
+    assert hint["max_usage"] == 0.05
+    assert abs(hint["window_mean_usage"] - (0.30 + 0.90 + 0.05) / 3) < 1e-9
+
+    # Per-step read drains the window; this read still reports the peak.
+    drained = st.capacity_hint(now=2.0, reset_peak=True)
+    assert abs(drained["peak_usage"] - 0.90) < 1e-9
+
+    # Next window starts fresh from post-drain reconciles only.
+    st.reconcile([WorkerSnapshot("e0", 1000, 0.10)], now=3.0)
+    after = st.capacity_hint(now=3.0)
+    assert abs(after["peak_usage"] - 0.10) < 1e-9
+    assert abs(after["window_mean_usage"] - 0.10) < 1e-9
+
+
+def test_interpret_budget_response() -> None:
+    features = _admission_features()
+    admit = interpret_budget_response(
+        {
+            "granted": True,
+            "reason": "capacity_available",
+            "lease_id": "L",
+            "owner_epoch": 3,
+            "reservation_tokens": 108,
+        },
+        features,
+    )
+    assert admit.action is AdmissionAction.ADMIT and admit.lease_id == "L"
+    degraded = interpret_budget_response(
+        {"granted": False, "reason": "degraded", "lease_id": None, "owner_epoch": -1, "reservation_tokens": 108},
+        features,
+    )
+    assert degraded.action is AdmissionAction.BYPASS
+    for reason in ("capacity_exhausted", "pressure_guard"):
+        deferred = interpret_budget_response(
+            {"granted": False, "reason": reason, "lease_id": None, "owner_epoch": 2, "reservation_tokens": 108},
+            features,
+        )
+        assert deferred.action is AdmissionAction.DEFER
+
+
+def test_admit_ir_grant_defer_failopen_and_aged() -> None:
+    granted = _make_admission_shard(client=_FakeBudgetClient())
+    admit = asyncio.run(granted[0]._admit_ir(granted[1], features=_admission_features()))
+    assert admit.action is AdmissionAction.ADMIT and admit.lease_id
+    assert granted[1]._admission_client.reserve_reqs[0]["tokens"] == 108
+
+    exhausted_grant = {
+        "granted": False,
+        "reason": "capacity_exhausted",
+        "lease_id": None,
+        "owner_epoch": 1,
+        "reservation_tokens": 108,
+    }
+    deferring = _make_admission_shard(client=_FakeBudgetClient(grants=[dict(exhausted_grant)]))
+    deferred = asyncio.run(deferring[0]._admit_ir(deferring[1], features=_admission_features()))
+    assert deferred.action is AdmissionAction.DEFER and deferred.reason_code is AdmissionReason.CAPACITY_EXHAUSTED
+
+    failing = _make_admission_shard(client=_RaisingBudgetClient())
+    degraded = asyncio.run(failing[0]._admit_ir(failing[1], features=_admission_features()))
+    assert degraded.action is AdmissionAction.BYPASS and degraded.reason_code is AdmissionReason.DEGRADED
+
+    aged_client = _make_admission_shard(client=_FakeBudgetClient(grants=[dict(exhausted_grant)]))
+    aged = asyncio.run(aged_client[0]._admit_ir(aged_client[1], features=_admission_features(aged=True)))
+    assert aged.action is AdmissionAction.BYPASS and aged.reason_code is AdmissionReason.FAIRNESS_RESERVE
+
+    disabled = _make_admission_shard(client=_FakeBudgetClient())
+    bypass = asyncio.run(disabled[0]._admit_ir(disabled[1], features=_admission_features(enabled=False)))
+    assert bypass.reason_code is AdmissionReason.FEATURE_DISABLED
+    assert disabled[1]._admission_client.reserve_reqs == []  # never consulted the coordinator
+
+
+def test_admission_defer_requeues_and_gates_release() -> None:
+    shard_cls, shard = _make_admission_shard(client=_FakeBudgetClient(), enabled=False)  # disable pump in unit test
+    record = _SessionRecord()
+    ir = InflightRequest(request_id="r1", parent_state_hash="p", rollout_id=0, kind=RequestKind.FRESH, abort_count=0)
+    record.irs_by_id["r1"] = ir
+    record.active_ir_runner_tasks["r1"] = object()
+    record.ir_queue = deque(["r1"])
+    shard_cls._admission_defer_ir_locked(shard, record=record, ir_id="r1", ir=ir)
+    assert record.admission_deferred is True
+    assert record.admission_deferred_since > 0.0
+    assert "r1" not in record.active_ir_runner_tasks
+    assert list(record.ir_queue) == ["r1"]
+    assert _decide_ir_release(record).allow is False
+    record.protected_until_finalize = True
+    assert _decide_ir_release(record).allow is True  # protected work is never held by the admission gate
+
+
+def test_resume_pump_resumes_oldest_first() -> None:
+    shard_cls, shard = _make_admission_shard(client=_FakeBudgetClient(), max_wait_s=1000.0)
+    resumed: list[str] = []
+    shard._maybe_start_next_ir_locked = lambda *, session_id, record: (resumed.append(session_id), True)[1]
+    now = time.monotonic()
+    r_old = _SessionRecord()
+    r_old.admission_deferred = True
+    r_old.admission_deferred_since = now - 5.0
+    r_new = _SessionRecord()
+    r_new.admission_deferred = True
+    r_new.admission_deferred_since = now - 1.0
+    shard._session_records = {"new": r_new, "old": r_old}
+    shard._session_locks = {"new": asyncio.Lock(), "old": asyncio.Lock()}
+    asyncio.run(shard_cls._resume_deferred_sessions_once(shard))
+    assert resumed == ["old", "new"]  # oldest deferral first (aging)
+    assert r_old.admission_deferred is False and r_new.admission_deferred is False
+
+
+def test_resume_pump_forced_resume_respects_cap() -> None:
+    starved = _FakeBudgetClient(
+        hint={"degraded": False, "available": 0, "ceiling": 10**9, "reserved": 10**9, "epoch": 1}
+    )
+    shard_cls, shard = _make_admission_shard(client=starved, max_wait_s=0.0, forced_cap=2)
+    resumed: list[str] = []
+    shard._maybe_start_next_ir_locked = lambda *, session_id, record: (resumed.append(session_id), True)[1]
+    now = time.monotonic()
+    records = {}
+    for i in range(3):
+        rec = _SessionRecord()
+        rec.admission_deferred = True
+        rec.admission_deferred_since = now - 100.0
+        records[f"s{i}"] = rec
+    shard._session_records = records
+    shard._session_locks = {key: asyncio.Lock() for key in records}
+    asyncio.run(shard_cls._resume_deferred_sessions_once(shard))
+    assert len(resumed) == 2  # forced-resume cap honored
+    assert sum(1 for rec in records.values() if rec.admission_aged_resume) == 2
+    assert sum(1 for rec in records.values() if rec.admission_deferred) == 1  # remainder stays deferred
+
+
+def test_resume_pump_fails_open_when_capacity_signal_unavailable() -> None:
+    shard_cls, shard = _make_admission_shard(client=_RaisingBudgetClient(), max_wait_s=1000.0)
+    resumed: list[str] = []
+    shard._maybe_start_next_ir_locked = lambda *, session_id, record: (resumed.append(session_id), True)[1]
+    now = time.monotonic()
+    rec = _SessionRecord()
+    rec.admission_deferred = True
+    rec.admission_deferred_since = now - 1.0
+    shard._session_records = {"s": rec}
+    shard._session_locks = {"s": asyncio.Lock()}
+    asyncio.run(shard_cls._resume_deferred_sessions_once(shard))
+    assert resumed == ["s"] and rec.admission_deferred is False  # degraded signal -> fail open (resume)
