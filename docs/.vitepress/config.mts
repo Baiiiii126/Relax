@@ -265,6 +265,7 @@ export default defineConfig({
               items: [
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
                 { text: 'Agentic Rollout', link: '/en/guide/agentic-rollout' },
+                { text: 'Agentic KV Scheduling', link: '/en/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
                 { text: 'Dynamic Context Parallelism', link: '/en/guide/dynamic-context-parallel' },
@@ -377,6 +378,7 @@ export default defineConfig({
               items: [
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
                 { text: 'Agentic Rollout', link: '/zh/guide/agentic-rollout' },
+                { text: 'Agentic KV 调度', link: '/zh/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
                 { text: 'Dynamic Context Parallelism', link: '/zh/guide/dynamic-context-parallel' },

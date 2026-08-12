@@ -416,6 +416,10 @@ class InflightRequest:
     latest_backend_meta: dict[str, Any] = field(default_factory=dict)
     backend_started: bool = False
     runner_epoch: int = 0
+    # Admission provenance (trace-only ids + the active execution-budget lease).
+    admission_decision_id: str = ""
+    admission_dispatch_id: str = ""
+    admission_lease_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -716,6 +720,7 @@ class SessionForest:
             "rollout_id": node.rollout_id,
             "request_id": patch.get("request_id"),
             "request_kind": patch.get("request_kind"),
+            "admission": patch.get("admission"),
             "base_state_hash": patch.get("base_state_hash"),
             "abort_count": node.abort_count,
             "status": str(node.status),

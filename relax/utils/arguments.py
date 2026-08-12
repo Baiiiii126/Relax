@@ -1479,6 +1479,104 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If unset, derives from the train prepare pool session budget."
                 ),
             )
+            # Session KV lifecycle (top-level session_id + idempotent close_session).
+            parser.add_argument(
+                "--agentic-session-lifecycle",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable session KV lifecycle: send the engine session id as a top-level "
+                    "`session_id` on generate (tagging the server's session-radix cache) and issue "
+                    "an idempotent /close_session on finalize/discard to release the session's KV. "
+                    "Requires the server to run with --sglang-enable-session-radix-cache; fail-open "
+                    "(no-op) otherwise. Does not change generation results."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-session-close-timeout-ms",
+                type=int,
+                default=500,
+                help="Per-call timeout (ms) for the fail-open /close_session fan-out. 0 disables the bound.",
+            )
+            parser.add_argument(
+                "--agentic-session-close-max-retries",
+                type=int,
+                default=2,
+                help="Max retries for each /close_session call (transient HTTP errors only).",
+            )
+            # Program-aware admission (Bypass/Admit/Defer at the request boundary).
+            parser.add_argument(
+                "--agentic-program-admission",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable program-aware admission: gate each request boundary with a "
+                    "cluster-wide execution-token budget (Bypass/Admit/Defer) to bound the active "
+                    "working set. Fail-open: any missing/stale signal falls back to the existing "
+                    "request limiter. Does not select workers or interrupt in-flight decode."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-admission-headroom",
+                type=float,
+                default=0.90,
+                help="Fraction of aggregate KV token capacity usable as the admission ceiling (0, 1].",
+            )
+            parser.add_argument(
+                "--agentic-admission-expected-decode-cap",
+                type=int,
+                default=None,
+                help="Upper bound on expected decode tokens per reservation. Defaults to --rollout-max-response-len.",
+            )
+            parser.add_argument(
+                "--agentic-admission-pressure-threshold",
+                type=float,
+                default=0.92,
+                help="Per-worker KV token_usage at/above which the pressure guard defers non-aged requests, in (0, 1].",
+            )
+            parser.add_argument(
+                "--agentic-admission-max-wait-s",
+                type=float,
+                default=30.0,
+                help="Max time a deferred request waits before forced resume (aging). >= 0.",
+            )
+            parser.add_argument(
+                "--agentic-admission-reconcile-interval-s",
+                type=float,
+                default=2.0,
+                help="Coordinator capacity-reconcile and per-shard resume-pump tick interval (s). > 0.",
+            )
+            parser.add_argument(
+                "--agentic-admission-lease-ttl-s",
+                type=float,
+                default=600.0,
+                help="TTL (s) for an execution reservation lease; reclaims leases from dead shards. > 0.",
+            )
+            parser.add_argument(
+                "--agentic-admission-reserve-timeout-ms",
+                type=int,
+                default=100,
+                help="Timeout (ms) for a coordinator reserve RPC; on timeout the request fails open to bypass. > 0.",
+            )
+            parser.add_argument(
+                "--agentic-admission-emergency-reserve-frac",
+                type=float,
+                default=0.05,
+                help="Fraction of the ceiling reserved for aged/forced-resume requests, in [0, 1).",
+            )
+            parser.add_argument(
+                "--agentic-admission-forced-resume-cap",
+                type=int,
+                default=8,
+                help="Max forced resumes per shard per reconcile tick. >= 1.",
+            )
+            parser.add_argument(
+                "--agentic-admission-scope",
+                type=str,
+                default="train",
+                choices=["train", "all"],
+                help="Which scopes admission applies to: 'train' only (default) or 'all' (train + eval).",
+            )
             return parser
 
         def add_eval_arguments(parser):
@@ -2870,6 +2968,33 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-prepare-pool-size must be >= 0.")
     if args.agentic_eval_prepare_pool_size is not None and args.agentic_eval_prepare_pool_size <= 0:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
+    # Session lifecycle bounds.
+    if args.agentic_session_close_timeout_ms < 0:
+        raise ValueError("--agentic-session-close-timeout-ms must be >= 0.")
+    if args.agentic_session_close_max_retries < 1:
+        raise ValueError("--agentic-session-close-max-retries must be >= 1.")
+    # Admission bounds (only enforced when the feature is enabled).
+    if args.agentic_admission_expected_decode_cap is None:
+        args.agentic_admission_expected_decode_cap = args.rollout_max_response_len
+    elif args.agentic_admission_expected_decode_cap <= 0:
+        raise ValueError("--agentic-admission-expected-decode-cap must be > 0.")
+    if args.agentic_program_admission:
+        if not 0.0 < args.agentic_admission_headroom <= 1.0:
+            raise ValueError("--agentic-admission-headroom must be in (0, 1].")
+        if not 0.0 < args.agentic_admission_pressure_threshold <= 1.0:
+            raise ValueError("--agentic-admission-pressure-threshold must be in (0, 1].")
+        if not 0.0 <= args.agentic_admission_emergency_reserve_frac < 1.0:
+            raise ValueError("--agentic-admission-emergency-reserve-frac must be in [0, 1).")
+        if args.agentic_admission_max_wait_s < 0:
+            raise ValueError("--agentic-admission-max-wait-s must be >= 0.")
+        if args.agentic_admission_reconcile_interval_s <= 0:
+            raise ValueError("--agentic-admission-reconcile-interval-s must be > 0.")
+        if args.agentic_admission_lease_ttl_s <= 0:
+            raise ValueError("--agentic-admission-lease-ttl-s must be > 0.")
+        if args.agentic_admission_reserve_timeout_ms <= 0:
+            raise ValueError("--agentic-admission-reserve-timeout-ms must be > 0.")
+        if args.agentic_admission_forced_resume_cap < 1:
+            raise ValueError("--agentic-admission-forced-resume-cap must be >= 1.")
 
 
 def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:

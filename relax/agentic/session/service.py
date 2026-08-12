@@ -9,6 +9,7 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 import zlib
 from argparse import Namespace
 from collections import Counter, deque
@@ -36,6 +37,21 @@ from relax.agentic.profile import (
     mark_agentic_event,
     mark_agentic_event_once,
     mark_metadata_agentic_event,
+)
+from relax.agentic.session.admission import (
+    AdmissionAction,
+    AdmissionDecision,
+    AdmissionFeatures,
+    AdmissionReason,
+    build_reserve_request,
+    compute_reservation_tokens,
+    decide_admission_prelude,
+    interpret_budget_response,
+)
+from relax.agentic.session.admission_coordinator import (
+    RayBudgetClient,
+    get_or_create_admission_coordinator,
+    shutdown_admission_coordinator,
 )
 from relax.agentic.session.state import (
     FinalizedResultTransport,
@@ -105,6 +121,7 @@ def shutdown_agentic_chat_api_services() -> None:
         serve.delete(AGENTIC_CHAT_API_SERVICE_NAME)
     except Exception:
         pass
+    shutdown_admission_coordinator()
     for idx in range(_STALE_SESSION_SHARD_CLEANUP_LIMIT):
         try:
             ray.kill(ray.get_actor(agentic_session_shard_name(idx)), no_restart=True)
@@ -123,11 +140,13 @@ class IRBlockedReason(str, Enum):
     PREPARE_GATE = "prepare_gate"
     PARTIAL_RESUME_GATE = "partial_resume_gate"
     TERMINAL_SHUTDOWN_GATE = "terminal_shutdown_gate"
+    ADMISSION_DEFER_GATE = "admission_defer_gate"
 
 
 _WAITING_REASON_PREPARE_GATE = IRBlockedReason.PREPARE_GATE.value
 _WAITING_REASON_PARTIAL_RESUME_GATE = IRBlockedReason.PARTIAL_RESUME_GATE.value
 _WAITING_REASON_TERMINAL_SHUTDOWN_GATE = IRBlockedReason.TERMINAL_SHUTDOWN_GATE.value
+_WAITING_REASON_ADMISSION_DEFER_GATE = IRBlockedReason.ADMISSION_DEFER_GATE.value
 _GATE_REASON_PREPARE = SessionGateReason.PREPARE.value
 _GATE_REASON_PARTIAL_RESUME = SessionGateReason.PARTIAL_RESUME.value
 _GATE_REASON_TERMINAL_SHUTDOWN = SessionGateReason.TERMINAL_SHUTDOWN.value
@@ -155,6 +174,12 @@ class _SessionRecord:
     pending_chat_waiters: dict[str, asyncio.Future[Any]] = field(default_factory=dict)
     gate_reason: str | None = None
     protected_until_finalize: bool = False
+    # Admission overlay (program == session here). `admission_deferred` gates the
+    # queue at lowest precedence; `admission_marked` requests a defer at the next boundary.
+    admission_deferred: bool = False
+    admission_deferred_since: float = 0.0
+    admission_marked: bool = False
+    admission_aged_resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -217,6 +242,11 @@ def _decide_ir_release(record: _SessionRecord) -> IRReleaseDecision:
         return IRReleaseDecision(allow=True)
     if blocked_reason is not None:
         return IRReleaseDecision(allow=False, blocked_reason=blocked_reason)
+    # Lowest-precedence admission gate. Kept separate from `gate_reason` so it never
+    # perturbs the prepare/partial-resume/terminal state machine; protected work (which bypasses
+    # admission and never sets the flag) is defended here too.
+    if record.admission_deferred and not record.protected_until_finalize:
+        return IRReleaseDecision(allow=False, blocked_reason=_WAITING_REASON_ADMISSION_DEFER_GATE)
     return IRReleaseDecision(allow=True)
 
 
@@ -306,6 +336,12 @@ def _openai_error_response(result: dict[str, Any]) -> JSONResponse:
 
 
 async def _sglang_worker_urls(args: Namespace) -> list[str]:
+    """Return SGLang engine URLs suitable for a direct HTTP connection.
+
+    The dp-aware router appends a ``@<dp_rank>`` suffix to worker URLs; callers
+    here connect to workers directly (bypassing the router), so URLs pass
+    through :func:`router_worker_base_urls` to strip that suffix and dedupe.
+    """
     router_ip = args.sglang_router_ip
     router_port = args.sglang_router_port
     if not router_ip or not router_port:
@@ -678,6 +714,7 @@ class AgenticSessionShard:
         *,
         sglang_request_capacity: int | None = None,
         sglang_request_limiter: Any | None = None,
+        admission_client: Any | None = None,
     ) -> None:
         if isinstance(config_payload, Namespace):
             self.args = config_payload
@@ -694,6 +731,21 @@ class AgenticSessionShard:
             threading.BoundedSemaphore(sglang_request_capacity) if sglang_request_capacity is not None else None
         )
         self._sglang_request_limiter = sglang_request_limiter
+        # Program-aware admission (fail-open: disabled unless a coordinator client is wired).
+        self._admission_client = admission_client
+        self._admission_enabled = (
+            bool(getattr(self.args, "agentic_program_admission", False)) and admission_client is not None
+        )
+        self._admission_scope = getattr(self.args, "agentic_admission_scope", "train")
+        self._admission_expected_decode_cap = getattr(self.args, "agentic_admission_expected_decode_cap", None)
+        self._rollout_max_response_len = getattr(self.args, "rollout_max_response_len", None)
+        self._admission_reconcile_interval_s = max(
+            0.1, float(getattr(self.args, "agentic_admission_reconcile_interval_s", 2.0))
+        )
+        self._admission_max_wait_s = max(0.0, float(getattr(self.args, "agentic_admission_max_wait_s", 30.0)))
+        self._admission_forced_resume_cap = max(1, int(getattr(self.args, "agentic_admission_forced_resume_cap", 8)))
+        self._admission_pump_task: asyncio.Task[Any] | None = None
+        self._admission_stats: dict[str, float] = {}
 
     def _ensure_session_lock(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -1351,6 +1403,10 @@ class AgenticSessionShard:
         record.pending_chat_waiters.clear()
         record.gate_reason = None
         record.protected_until_finalize = False
+        record.admission_deferred = False
+        record.admission_deferred_since = 0.0
+        record.admission_marked = False
+        record.admission_aged_resume = False
 
     def _remove_ir_from_runnable_state_locked(self, record: _SessionRecord, ir_id: str) -> None:
         # A gated IR must stop being runnable locally. Backend-started IRs are handled by abort_all.
@@ -1696,6 +1752,220 @@ class AgenticSessionShard:
         except Exception:
             logger.exception("Failed to release remote SGLang permit acquired after cancellation.")
 
+    # ── Program-aware admission ────────────────────────────────────────────────────────
+    def _bump_admission_stat(self, key: str, amount: float = 1.0) -> None:
+        self._admission_stats[key] = self._admission_stats.get(key, 0) + amount
+
+    def _gather_admission_features_locked(
+        self, *, session_id: str, record: _SessionRecord, ir: InflightRequest
+    ) -> AdmissionFeatures | None:
+        """Synchronously (under the session lock) snapshot everything admission
+        needs.
+
+        Consumes the one-shot ``marked``/``aged`` record flags and stamps the
+        IR with the trace-only decision/dispatch ids. Returns ``None`` when
+        admission is disabled so the caller keeps today's exact path.
+        """
+        if not self._admission_enabled:
+            return None
+        scope_allowed = self._admission_scope == "all" or record.scope_id == "train"
+        prompt_tokens = len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta)
+        reservation_tokens = compute_reservation_tokens(
+            prompt_tokens=prompt_tokens,
+            sampling_max_new_tokens=ir.sampling_params.get("max_new_tokens"),
+            expected_decode_cap=self._admission_expected_decode_cap,
+            rollout_max_response_len=self._rollout_max_response_len,
+        )
+        decision_id = uuid.uuid4().hex
+        dispatch_id = f"{ir.request_id}:{ir.runner_epoch}"
+        ir.admission_decision_id = decision_id
+        ir.admission_dispatch_id = dispatch_id
+        aged = record.admission_aged_resume
+        record.admission_aged_resume = False
+        marked = record.admission_marked
+        record.admission_marked = False
+        is_protected = ir.kind == RequestKind.PROTECTED or record.protected_until_finalize
+        return AdmissionFeatures(
+            enabled=True,
+            session_id=session_id,
+            scope_allowed=scope_allowed,
+            is_protected=is_protected,
+            marked=marked,
+            prompt_tokens=prompt_tokens,
+            expected_decode_tokens=max(0, reservation_tokens - prompt_tokens),
+            reservation_tokens=reservation_tokens,
+            dispatch_id=dispatch_id,
+            admission_decision_id=decision_id,
+            serving_weight_version=None,
+            aged=aged,
+        )
+
+    async def _admit_ir(self, *, features: AdmissionFeatures) -> AdmissionDecision:
+        """Bypass/Admit/Defer for one request boundary; any failure fails open
+        to bypass."""
+        prelude = decide_admission_prelude(features)
+        if prelude is not None:
+            return prelude
+        client = self._admission_client
+        if client is None:
+            return AdmissionDecision(
+                AdmissionAction.BYPASS,
+                AdmissionReason.DEGRADED,
+                features.reservation_tokens,
+                features.admission_decision_id,
+            )
+        try:
+            grant = await client.reserve(build_reserve_request(features))
+        except Exception:
+            self._bump_admission_stat("reserve_error")
+            return AdmissionDecision(
+                AdmissionAction.BYPASS,
+                AdmissionReason.DEGRADED,
+                features.reservation_tokens,
+                features.admission_decision_id,
+            )
+        decision = interpret_budget_response(grant, features)
+        if features.aged and decision.action is AdmissionAction.DEFER:
+            # A forced/aged resume must make progress: bypass rather than defer again.
+            return AdmissionDecision(
+                AdmissionAction.BYPASS,
+                AdmissionReason.FAIRNESS_RESERVE,
+                features.reservation_tokens,
+                features.admission_decision_id,
+            )
+        return decision
+
+    def _record_admission_decision(self, ir: InflightRequest, decision: AdmissionDecision) -> None:
+        self._bump_admission_stat(decision.action.value)
+        self._bump_admission_stat(f"reason_{decision.reason_code.value}")
+        # Trace-only stash (high-cardinality ids stay out of aggregate metrics).
+        ir.pending_export_metadata_patch["admission"] = {
+            "action": decision.action.value,
+            "reason": decision.reason_code.value,
+            "decision_id": decision.admission_decision_id,
+            "owner_epoch": decision.owner_epoch,
+            "reservation_tokens": decision.reservation_tokens,
+        }
+
+    def _admission_defer_ir_locked(self, *, record: _SessionRecord, ir_id: str, ir: InflightRequest) -> None:
+        """Park a not-yet-started IR behind the admission gate (shard-owned, no
+        permit)."""
+        record.admission_deferred = True
+        if record.admission_deferred_since <= 0.0:
+            record.admission_deferred_since = time.monotonic()
+        self._remove_ir_from_runnable_state_locked(record, ir_id)
+        self._enqueue_ir_locked(record, ir)
+        self._ensure_admission_pump()
+
+    async def _admission_release(self, lease_id: str | None) -> None:
+        client = self._admission_client
+        if client is None or not lease_id:
+            return
+        try:
+            await client.release(lease_id)
+        except Exception:
+            logger.debug("Admission lease release failed (TTL reclaims): %s", lease_id)
+
+    def _ensure_admission_pump(self) -> None:
+        if not self._admission_enabled:
+            return
+        if self._admission_pump_task is None or self._admission_pump_task.done():
+            self._admission_pump_task = asyncio.create_task(self._admission_resume_pump())
+
+    async def _admission_resume_pump(self) -> None:
+        while True:
+            await asyncio.sleep(self._admission_reconcile_interval_s)
+            try:
+                await self._resume_deferred_sessions_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Admission resume pump tick failed.")
+
+    def _admission_head_reservation(self, record: _SessionRecord) -> int:
+        if not record.ir_queue:
+            return 0
+        ir = record.irs_by_id.get(record.ir_queue[0])
+        if ir is None:
+            return 0
+        return compute_reservation_tokens(
+            prompt_tokens=len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta),
+            sampling_max_new_tokens=ir.sampling_params.get("max_new_tokens"),
+            expected_decode_cap=self._admission_expected_decode_cap,
+            rollout_max_response_len=self._rollout_max_response_len,
+        )
+
+    async def _resume_deferred_sessions_once(self) -> None:
+        """Resume deferred sessions oldest-first (aging); force-resume past the
+        max wait."""
+        deferred = sorted(
+            (item for item in self._session_records.items() if item[1].admission_deferred),
+            key=lambda item: item[1].admission_deferred_since,
+        )
+        if not deferred:
+            return
+        hint: dict[str, Any] | None = None
+        if self._admission_client is not None:
+            try:
+                hint = await self._admission_client.capacity_hint()
+            except Exception:
+                hint = None
+        now = time.monotonic()
+        degraded = hint is None or bool(hint.get("degraded", True))
+        available = 0 if hint is None else int(hint.get("available", 0))
+        forced = 0
+        for session_id, _ in deferred:
+            lock = self._get_session_lock(session_id)
+            if lock is None:
+                continue
+            async with lock:
+                record = self._session_records.get(session_id)
+                if record is None or not record.admission_deferred:
+                    continue
+                waited_s = max(0.0, now - record.admission_deferred_since)
+                aged = waited_s >= self._admission_max_wait_s
+                if aged:
+                    if forced >= self._admission_forced_resume_cap:
+                        continue
+                    forced += 1
+                    record.admission_aged_resume = True
+                    self._bump_admission_stat("forced_resume")
+                elif degraded:
+                    pass  # fail open: resume now; the re-admit will bypass under degraded signals
+                else:
+                    reservation = self._admission_head_reservation(record)
+                    if available < reservation:
+                        continue  # no plausible room; keep waiting
+                    available -= reservation
+                record.admission_deferred = False
+                self._bump_admission_stat("resume")
+                self._bump_admission_stat("defer_wait_ms_sum", waited_s * 1000.0)
+                self._bump_admission_stat("defer_wait_events")
+                self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+
+    @staticmethod
+    def _classify_program_state(record: _SessionRecord) -> str:
+        if record.admission_deferred:
+            return "deferred"
+        if any(ir.backend_started for ir in record.irs_by_id.values()):
+            return "in_flight"
+        if record.ir_queue:
+            return "ready"
+        return "acting"
+
+    @ray.method(concurrency_group="sglang_request_control")
+    async def get_admission_stats(self, *, reset: bool = True) -> dict[str, Any]:
+        stats: dict[str, Any] = dict(self._admission_stats)
+        state_counts = {"ready": 0, "in_flight": 0, "acting": 0, "deferred": 0}
+        for record in self._session_records.values():
+            state_counts[self._classify_program_state(record)] += 1
+        for key, value in state_counts.items():
+            stats[f"state_{key}"] = value
+        stats["admission_enabled"] = 1 if self._admission_enabled else 0
+        if reset:
+            self._admission_stats = {}
+        return stats
+
     async def _run_ir(self, *, session_id: str, ir_id: str, runner_epoch: int) -> None:
         lock = self._get_session_lock(session_id)
         if lock is None:
@@ -1713,6 +1983,30 @@ class AgenticSessionShard:
                 return
             profile = agentic_trace_events(ir.pending_export_metadata_patch)
             mark_agentic_event(profile, "generation_queue_enter_at")
+            admission_features = self._gather_admission_features_locked(session_id=session_id, record=record, ir=ir)
+        # Program-aware admission at the request boundary — the IR is built and queued but
+        # has not taken the SGLang permit or called generate(). Bypass keeps today's path; Defer
+        # parks the IR (shard-owned, resumable, no permit); Admit holds an execution-budget lease
+        # released in the finally below. Any failure fails open to bypass.
+        admission_lease_id: str | None = None
+        if admission_features is not None:
+            admission = await self._admit_ir(features=admission_features)
+            self._record_admission_decision(ir, admission)
+            if admission.action is AdmissionAction.DEFER:
+                lock = self._get_session_lock(session_id)
+                if lock is None:
+                    return
+                async with lock:
+                    record = self._session_records.get(session_id)
+                    if record is None:
+                        return
+                    ir = record.irs_by_id.get(ir_id)
+                    if ir is None or ir_id not in record.active_ir_runner_tasks or ir.runner_epoch != runner_epoch:
+                        return
+                    self._admission_defer_ir_locked(record=record, ir_id=ir_id, ir=ir)
+                return
+            if admission.action is AdmissionAction.ADMIT:
+                admission_lease_id = admission.lease_id
         permit_acquired = False
         generation_profile: dict[str, Any] | None = None
         try:
@@ -1750,6 +2044,9 @@ class AgenticSessionShard:
                     self._maybe_start_next_ir_locked(session_id=session_id, record=record)
                     return
                 ir.backend_started = True
+                # The IR cleared admission and is about to generate — reset the aging clock.
+                record.admission_deferred = False
+                record.admission_deferred_since = 0.0
                 generation_profile = agentic_trace_events(ir.pending_export_metadata_patch)
             mark_agentic_event(generation_profile, "generation_start_at")
             result = await self.backend.generate(
@@ -1812,6 +2109,8 @@ class AgenticSessionShard:
                     self._sglang_request_semaphore.release()
                 else:
                     await self._sglang_request_limiter.release_sglang_request_permit.remote()
+            if admission_lease_id is not None:
+                await self._admission_release(admission_lease_id)
 
         lock = self._get_session_lock(session_id)
         if lock is None:
@@ -2333,6 +2632,52 @@ class AgenticSessionShard:
         if failed:
             raise RuntimeError(f"Failed to abort {failed} discarded agentic session request(s).")
 
+    async def _close_engine_sessions(self, engine_session_ids: list[str]) -> None:
+        """Best-effort, idempotent release of engine-session KV via
+        ``/close_session``.
+
+        Mirrors :meth:`_abort_backend_request_ids` — fans out directly to each
+        engine base URL (the sgl-router does not proxy ``/close_session``; the
+        engine's DP controller broadcasts the release across all DP ranks, and
+        ranks that do not hold the session no-op). Unlike abort, close is only
+        a KV-release optimization: failures/timeouts are logged and swallowed
+        so they never block the logical terminal state, and the full replay
+        payload keeps generation correct regardless.
+        """
+        if not engine_session_ids:
+            return
+        if not getattr(self.args, "agentic_session_lifecycle", False):
+            return
+        try:
+            urls = await _sglang_worker_urls(self.args)
+        except Exception as exc:
+            logger.warning("close_session skipped: cannot list SGLang workers: %s", exc)
+            return
+        if not urls:
+            logger.warning("close_session skipped: no SGLang worker urls available.")
+            return
+        timeout_s = max(0.0, int(getattr(self.args, "agentic_session_close_timeout_ms", 500)) / 1000.0)
+        max_retries = max(1, int(getattr(self.args, "agentic_session_close_max_retries", 2)))
+
+        async def _close_one(url: str, session_id: str) -> None:
+            request = post(f"{url}/close_session", {"session_id": session_id}, max_retries=max_retries)
+            if timeout_s > 0:
+                await asyncio.wait_for(request, timeout=timeout_s)
+            else:
+                await request
+
+        results = await asyncio.gather(
+            *(_close_one(url, sid) for sid in engine_session_ids for url in urls),
+            return_exceptions=True,
+        )
+        failed = sum(1 for result in results if isinstance(result, BaseException))
+        if failed:
+            logger.warning(
+                "close_session: %d/%d call(s) failed; affected sessions fall back to LRU eviction.",
+                failed,
+                len(results),
+            )
+
     async def _finish_discarded_session(
         self,
         *,
@@ -2360,6 +2705,11 @@ class AgenticSessionShard:
             if not active_runner_task.done():
                 active_runner_task.cancel()
         await self._abort_backend_request_ids(backend_request_ids)
+        if removed is not None:
+            # After in-flight requests are aborted/quiesced, release this engine
+            # session's KV. engine_session_id == session_id in this version (no subagents);
+            # a future subagent hierarchy would pass the collected set of engine session ids.
+            await self._close_engine_sessions([session_id])
         for active_runner_task in active_tasks:
             active_runner_task.add_done_callback(_log_discarded_runner_result)
         for waiter in waiters:
@@ -2498,6 +2848,17 @@ def create_agentic_session_shards(config: Namespace):
             ray.kill(ray.get_actor(agentic_session_shard_name(idx)), no_restart=True)
         except ValueError:
             pass
+    # One cluster-wide execution-budget coordinator (single logical writer), shared by
+    # every shard via a lightweight RayBudgetClient — mirrors how shard 0 owns the permit.
+    admission_client = None
+    if getattr(config, "agentic_program_admission", False):
+        coordinator = get_or_create_admission_coordinator(config)
+        try:
+            ray.get(coordinator.start.remote())
+        except Exception as exc:
+            logger.warning("Admission coordinator start failed; it will warm up lazily: %s", exc)
+        reserve_timeout_s = max(0.01, int(getattr(config, "agentic_admission_reserve_timeout_ms", 100)) / 1000.0)
+        admission_client = RayBudgetClient(coordinator, reserve_timeout_s=reserve_timeout_s)
     shard_handles = []
     for idx in range(shard_count):
         shard_name = agentic_session_shard_name(idx)
@@ -2513,6 +2874,7 @@ def create_agentic_session_shards(config: Namespace):
                 config,
                 sglang_request_capacity=request_capacity if idx == 0 else None,
                 sglang_request_limiter=shard_handles[0] if idx > 0 else None,
+                admission_client=admission_client,
             )
         )
     return shard_handles

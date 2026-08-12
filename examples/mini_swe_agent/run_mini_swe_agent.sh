@@ -103,13 +103,6 @@ CKPT_ARGS=(
 
 ROLLOUT_ARGS=(
    --prompt-data "${DUMMY_DATA}"
-   --use-agentic-rollout
-   --agent-command "bash ${SCRIPT_DIR}/agent_client.sh"
-   --agent-cwd "${SCRIPT_DIR}"
-   --agent-timeout 7200
-   --agent-env "AGENT_SERVER_URL=${AGENT_SERVER_URL}" "AGENT_CLIENT_TRACE_DIR=${AGENT_SERVER_WORK_DIR}/client_events"
-   --agentic-tool-call-parser qwen3_coder
-   --agentic-reasoning-parser qwen3
    --dump-details "${EXP_ROOT}/dump"
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
@@ -118,7 +111,6 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len 32768
    --rollout-temperature 1
    --global-batch-size ${GLOBAL_BATCH_SIZE}
-   --agentic-prepare-pool-size 0
    --use-fault-tolerance
 )
 
@@ -214,7 +206,25 @@ RAY_RESOURCE_ARGS=(
    --max-staleness 0
    --num-data-storage-units 1
    --colocate
-   --use-health-check
+   # --use-health-check
+)
+
+# agentic rollout: agent exec + parsers + prepare pool + session lifecycle + program admission ───────
+AGENTIC_ARGS=(
+   --use-agentic-rollout
+   --agent-command "bash ${SCRIPT_DIR}/agent_client.sh"
+   --agent-cwd "${SCRIPT_DIR}"
+   --agent-timeout 7200
+   --agent-env "AGENT_SERVER_URL=${AGENT_SERVER_URL}" "AGENT_CLIENT_TRACE_DIR=${AGENT_SERVER_WORK_DIR}/client_events"
+   --agentic-tool-call-parser qwen3_coder
+   --agentic-reasoning-parser qwen3
+   --agentic-prepare-pool-size 0
+   # --sglang-enable-session-radix-cache
+   # --sglang-radix-eviction-policy priority
+   # --agentic-session-lifecycle
+   # --agentic-program-admission
+   # --agentic-admission-headroom 0.90
+   # --agentic-admission-pressure-threshold 0.92
 )
 
    # "${PARTIAL_ROLLOUT_ARGS[@]}" \
@@ -231,5 +241,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${GRPO_ARGS[@]}" \
    "${LOG_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
+   "${AGENTIC_ARGS[@]}" \
    "${MEGATRON_ARGS[@]}" \
    2>&1 | tee "logs/${EXP_NAME}.log"

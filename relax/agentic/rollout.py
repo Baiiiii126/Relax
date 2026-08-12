@@ -1292,6 +1292,13 @@ def _dict_add_prefix(d, prefix):
     return {f"{prefix}{k}": v for k, v in d.items()}
 
 
+# One ClearML panel for every agentic KV-scheduling metric. The adapter splits a key on its
+# FIRST "/" into (title, series), so a single shared prefix collapses the former session/,
+# admission/ and budget/ panels into one while the rest of the path keeps each series
+# self-describing in the legend.
+_AGENTIC_KV_METRIC_GROUP = "agentic_kv/"
+
+
 def _compute_zero_std_metrics(args, all_samples: list[Sample]) -> dict[str, float]:
     if args.advantage_estimator == "ppo":
         return {}
@@ -1384,6 +1391,82 @@ def _compute_rollout_perf_metrics_from_samples(args, samples: list[Sample], roll
     return log_dict
 
 
+def _compute_session_lifecycle_metrics(args) -> dict[str, float]:
+    """Mark whether session lifecycle is enabled for this run.
+
+    Engine-side KV-release gains (peak pool, forced eviction, freed tokens) are
+    read from the engine's Prometheus /metrics — see
+    examples/mini_swe_agent/kv-admission-lifecycle-implementation-report.md.
+    """
+    if not getattr(args, "agentic_session_lifecycle", False):
+        return {}
+    return _dict_add_prefix({"session/lifecycle_enabled": 1.0}, _AGENTIC_KV_METRIC_GROUP)
+
+
+def _compute_admission_metrics(args) -> dict[str, float]:
+    """Aggregate per-shard admission counters + coordinator budget health.
+
+    Reads shard stats by name (reset each step for per-step deltas) and the
+    coordinator's health snapshot. Fail-open: returns whatever it can reach, or
+    ``{}`` when admission is off. High-cardinality ids are never emitted here —
+    only low-cardinality aggregates.
+    """
+    if not getattr(args, "agentic_program_admission", False):
+        return {}
+    import ray
+
+    from relax.agentic.session.admission_coordinator import ADMISSION_BUDGET_COORDINATOR_NAME
+    from relax.agentic.session.service import _DEFAULT_SESSION_SHARD_COUNT, agentic_session_shard_name
+
+    agg: dict[str, float] = {}
+    refs = []
+    for idx in range(_DEFAULT_SESSION_SHARD_COUNT):
+        try:
+            refs.append(ray.get_actor(agentic_session_shard_name(idx)).get_admission_stats.remote(reset=True))
+        except Exception:
+            continue
+    for ref in refs:
+        try:
+            stats = ray.get(ref)
+        except Exception:
+            continue
+        for key, value in stats.items():
+            if isinstance(value, (int, float)):
+                agg[key] = agg.get(key, 0) + value
+
+    metrics: dict[str, float] = {}
+    admit, defer, bypass = agg.get("admit", 0), agg.get("defer", 0), agg.get("bypass", 0)
+    total = admit + defer + bypass
+    if total > 0:
+        metrics["admission/admit"] = admit
+        metrics["admission/defer"] = defer
+        metrics["admission/bypass"] = bypass
+        metrics["admission/defer_rate"] = defer / total
+        metrics["admission/degraded_rate"] = agg.get("reason_degraded", 0) / total
+    metrics["admission/forced_resume"] = agg.get("forced_resume", 0)
+    metrics["admission/reserve_error"] = agg.get("reserve_error", 0)
+    defer_wait_events = agg.get("defer_wait_events", 0)
+    if defer_wait_events > 0:
+        metrics["admission/defer_wait_ms_mean"] = agg.get("defer_wait_ms_sum", 0.0) / defer_wait_events
+    for state in ("ready", "in_flight", "acting", "deferred"):
+        metrics[f"admission/state_{state}"] = agg.get(f"state_{state}", 0)
+
+    try:
+        health = ray.get(ray.get_actor(ADMISSION_BUDGET_COORDINATOR_NAME).health.remote())
+        ceiling = float(health.get("ceiling", 0))
+        metrics["budget/ceiling"] = ceiling
+        metrics["budget/reserved"] = float(health.get("reserved", 0))
+        if ceiling > 0:
+            metrics["budget/reserved_utilization"] = float(health.get("reserved", 0)) / ceiling
+        metrics["budget/kv_token_usage_mean"] = float(health.get("window_mean_usage", health.get("avg_usage", 0.0)))
+        metrics["budget/kv_token_usage_max"] = float(health.get("peak_usage", health.get("max_usage", 0.0)))
+        metrics["budget/epoch"] = float(health.get("epoch", 0))
+        metrics["budget/degraded"] = 1.0 if health.get("degraded", False) else 0.0
+    except Exception:
+        pass
+    return _dict_add_prefix(metrics, _AGENTIC_KV_METRIC_GROUP)
+
+
 def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time) -> None:
     from relax.utils import tracking_utils
 
@@ -1402,6 +1485,8 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict = {**(rollout_extra_metrics or {})}
     log_dict |= _dict_add_prefix(_compute_rollout_metrics_from_samples(args, samples), "rollout/")
     log_dict |= _dict_add_prefix(_compute_rollout_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
+    log_dict |= _compute_session_lifecycle_metrics(args)
+    log_dict |= _compute_admission_metrics(args)
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
