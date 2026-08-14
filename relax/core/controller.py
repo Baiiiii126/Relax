@@ -25,6 +25,7 @@ except ImportError as e:
         "or use the latest image."
     ) from e
 
+from relax import utils as relax_utils
 from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
 from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
@@ -524,6 +525,7 @@ class Controller:
             roles_to_create.append((role, cls, num_gpus, data_source))
 
         self._maybe_resolve_num_rollout(roles_to_create)
+        relax_utils.report_train_start(self.config)
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
         self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)
