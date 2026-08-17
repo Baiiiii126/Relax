@@ -27,7 +27,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
-from relax.engine.sft.runtime import is_sft_mode
+from relax.engine.sft.runtime import should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.env import Envs
@@ -47,7 +47,11 @@ from relax.utils.training.ppo_utils import (
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
-from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
+from .model_provider import (
+    get_model_provider_func,
+    validate_mtp_only_trainable_params,
+    wrap_model_provider_with_freeze,
+)
 
 
 logger = get_logger(__name__)
@@ -88,6 +92,7 @@ def _bypass_output_layer(
     model: torch.nn.Module,
     *,
     mtp_output_layer_calls: int = 0,
+    gather_passthrough: bool = True,
 ) -> Iterator[Callable | None]:
     """Defer the main output_layer so model() returns hidden_states.
 
@@ -102,7 +107,9 @@ def _bypass_output_layer(
     only the following main-head call becomes a passthrough. This preserves
     MTP loss computation while still deferring the main SFT logits.
 
-    No-op on PP stages with no output layer (the loss never runs there).
+    ``gather_passthrough=False`` keeps sequence-parallel hidden states local;
+    MTP-only needs only a zero-valued autograd anchor and does not consume the
+    gathered sequence. No-op on PP stages with no output layer.
     """
     assert mtp_output_layer_calls >= 0, f"{mtp_output_layer_calls=}"
     output_layer = _find_lm_output_layer(model)
@@ -117,7 +124,7 @@ def _bypass_output_layer(
     deferred_weight = None
     main_head_deferred = False
 
-    if sp_enabled:
+    if sp_enabled and gather_passthrough:
         from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
     def _passthrough(input_, weight=None, runtime_gather_output=None, **kwargs):
@@ -134,7 +141,7 @@ def _bypass_output_layer(
             raise RuntimeError("output_layer was called more than once after all MTP head calls")
         main_head_deferred = True
         deferred_weight = weight
-        if sp_enabled:
+        if sp_enabled and gather_passthrough:
             input_ = gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=False, group=tp_group)
         return input_, None
 
@@ -169,20 +176,6 @@ def _bypass_output_layer(
             del output_layer.forward
         except AttributeError:
             output_layer.forward = original_forward
-
-
-def _should_use_sft_chunked(args: Namespace) -> bool:
-    """Gate for the SFT chunked-logits path.
-
-    Two conditions all must hold:
-    - SFT mode (loss_type == "sft")
-    - User explicitly opted in via --sft-chunked-logits
-
-    Remaining incompatibilities (tied embeddings, combined-1f1b) are enforced
-    earlier as hard AssertionErrors in arguments.py.slime_validate_args, so
-    by the time we reach this gate sft_chunked_logits=True is guaranteed safe.
-    """
-    return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
 
 
 def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dict) -> None:
@@ -320,6 +313,7 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+    validate_mtp_only_trainable_params(args, model)
 
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
@@ -1007,7 +1001,7 @@ def train_one_step(
 
         nonlocal main_loss_has_tokens
         is_vl_model = getattr(args, "is_vl_model", False)
-        sft_chunked = _should_use_sft_chunked(args)
+        mtp_only = getattr(args, "mtp_only_training", False)
         # Get the batch.
         with timer(f"get_data_batch_{uuid.uuid4().hex[:8]}", keep=False):
             _opd_keys: list[str] = []
@@ -1051,7 +1045,7 @@ def train_one_step(
             # build_schedule_plan path doesn't go through model() so the
             # _bypass_output_layer wrapping can't apply. The combined-1f1b ×
             # chunked-logits incompatibility is enforced as a hard assert in
-            # arguments.py.slime_validate_args, so sft_chunked is guaranteed
+            # arguments.py.slime_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
             output_tensor = model.build_schedule_plan(
                 input_ids=batch["tokens"],
@@ -1103,15 +1097,17 @@ def train_one_step(
                     inner = inner.module
                 inner.pg_collection.cp = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
 
-            # SFT: defer lm_head into the loss (sft_loss_function_chunked)
-            # so the full [B, S, V/TP] fp32 logits tensor never materializes.
-            if sft_chunked:
+            # SFT chunking defers the main lm_head into the loss. MTP-only
+            # bypasses that main head entirely while preserving the preceding
+            # MTP head calls that build the auxiliary-loss autograd graph.
+            if should_bypass_main_output_layer(args):
                 mtp_output_layer_calls = (
                     int(getattr(args, "mtp_num_layers", 0) or 0) if getattr(args, "enable_mtp_training", False) else 0
                 )
                 with _bypass_output_layer(
                     model,
                     mtp_output_layer_calls=mtp_output_layer_calls,
+                    gather_passthrough=not mtp_only,
                 ) as lm_head_forward:
                     output_tensor = model(**forward_kwargs)
             else:
@@ -1120,10 +1116,9 @@ def train_one_step(
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        # Always dispatch via loss_function. lm_head_forward is None unless the
-        # SFT chunked path entered the bypass above; loss_function's "sft" case
-        # routes to sft_loss_function_chunked when both --sft-chunked-logits
-        # and lm_head_forward are set.
+        # Always dispatch via loss_function. MTP-only consumes the bypassed
+        # hidden states directly; chunked SFT uses lm_head_forward to compute
+        # the regular language loss in bounded chunks.
         return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
 
     # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);

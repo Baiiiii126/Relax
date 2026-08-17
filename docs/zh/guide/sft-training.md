@@ -196,6 +196,8 @@ export DATA_DIR=/root
 
 MTP SFT 脚本开启 `--mtp-num-layers ${MTP_NUM_LAYERS:-1}`、`--enable-mtp-training` 和 `--mtp-loss-scaling-factor ${MTP_LOSS_SCALING_FACTOR:-0.2}`。只有模型和 checkpoint 确实包含对应 MTP 层时才调大 `MTP_NUM_LAYERS`；`MTP_LOSS_SCALING_FACTOR` 是辅助 loss 权重，建议从 `0.2` 起调。
 
+联合训练、MTP-only 两阶段训练及 Pokémon 实测结果见 [MTP 训练](./mtp-rl-training.md)。
+
 ### SFT 数据参数
 
 SFT 必需参数：
@@ -278,7 +280,7 @@ PPL 评估由以下参数控制：
 --eval-interval 10
 ```
 
-`--eval-size` 会从 `--prompt-data` 末尾切出 eval 集，并从训练池移除。小于 1 的值表示比例；10 或更大的值可视为绝对样本数。也可以使用 `--eval-prompt-data name path` 提供独立评估集，但 SFT 模式下不要使用 `--eval-config`。
+`--eval-size` 会使用 `--seed` 对 `--prompt-data` 的行做一次随机切分，固定 eval 子集，并将其从每个 shuffle 后的训练 epoch 中移除。小于 1 的值表示比例；大于等于 1 的值表示绝对样本数。这是 row-level 切分；同一图片的多语言 caption 等关联行不会自动分组。也可以使用 `--eval-prompt-data name path` 提供独立评估集，但 SFT 模式下不要使用 `--eval-config`。
 
 生成式 predict 由以下参数控制：
 

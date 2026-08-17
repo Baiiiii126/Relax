@@ -388,6 +388,25 @@ class SFTStreamingDataset:
     def prefetch_enabled(self) -> bool:
         return self._prefetch is not None
 
+    def restrict_training_size(self, size: int) -> None:
+        """Restrict shuffled training indices to the leading ``size`` rows."""
+        if not 0 < size <= len(self.reader):
+            raise ValueError(f"training size must be in [1, {len(self.reader)}], got {size}")
+        self.restrict_training_indices(range(size))
+
+    def restrict_training_indices(self, indices: Iterable[int]) -> None:
+        """Restrict epoch shuffling to the provided physical row IDs."""
+        if self.index_manager.current_epoch >= 0 or self.index_manager.position != 0:
+            raise RuntimeError("training indices must be restricted before the dataset is shuffled or consumed")
+        index_pool = tuple(indices)
+        if not index_pool:
+            raise ValueError("training indices must not be empty")
+        if len(set(index_pool)) != len(index_pool):
+            raise ValueError("training indices must be unique")
+        if any(not isinstance(index, int) or index < 0 or index >= len(self.reader) for index in index_pool):
+            raise ValueError(f"training indices must be integers in [0, {len(self.reader)})")
+        self.index_manager = IndexManager(len(index_pool), seed=self.index_manager.seed, index_pool=index_pool)
+
     def shuffle(self, epoch_id: int, position: int = 0) -> None:
         self.index_manager.shuffle(epoch_id)
         if position:
@@ -417,6 +436,18 @@ class SFTStreamingDataset:
             idx = start + offset
             if idx >= len(self.reader):
                 break
+            sample = self._process_one(idx)
+            if sample is not None:
+                out.append(sample)
+        return out
+
+    def get_batch_by_indices(self, indices: Iterable[int]) -> list[ProcessedSample]:
+        """Render physical row IDs in the provided deterministic order."""
+        self._raise_if_failed()
+        out: list[ProcessedSample] = []
+        for idx in indices:
+            if idx < 0 or idx >= len(self.reader):
+                raise IndexError(f"index {idx} out of range [0, {len(self.reader)})")
             sample = self._process_one(idx)
             if sample is not None:
                 out.append(sample)

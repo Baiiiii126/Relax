@@ -17,9 +17,9 @@ Megatron actor parses ``N`` from the partition name to know how many chunks
 to consume. The eval source is one of:
 
 - ``--eval-prompt-data NAME PATH`` — load a separate prompt-data dataset.
-- ``--eval-size N`` — carve a tail slice off the train dataset (``N<1`` is a
-  fraction, ``N>=1`` an absolute count); the reserved tail is excluded from
-  the train pool so train/eval samples never overlap.
+- ``--eval-size N`` — deterministically shuffle row IDs once and carve out an
+  eval subset (``N<1`` is a fraction, ``N>=1`` an absolute count); the held-out
+  rows are excluded from every shuffled training epoch.
 
 Mirrors `relax/components/advantages.py` in shape: no FastAPI ingress, plain
 `@serve.deployment` + async `run()` loop.
@@ -36,6 +36,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.components.base import Base
 from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingDataset, pack_samples_for_tq
 from relax.engine.sft.debug_print import print_first_sample
+from relax.engine.sft.runtime import resolve_sft_split_indices
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.misc import load_function
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
@@ -86,7 +87,7 @@ class SFT(Base):
 
         self._dataset: Any | None = None
         self._eval_dataset: Any | None = None
-        self._eval_indices: range | None = None
+        self._eval_indices: tuple[int, ...] | None = None
         self._train_size: int = 0
         self._tokenizer = None
         self._processor_pool: ProcessorPool | None = None
@@ -163,25 +164,29 @@ class SFT(Base):
         eval_prompt_data = build_named_prompt_data_configs(getattr(self.config, "eval_prompt_data", None))
         eval_size_arg = getattr(self.config, "eval_size", None)
         if eval_size_arg is not None:
-            # Reserve the tail of the train dataset for eval so train and eval
-            # samples never overlap. Mutual exclusion with --eval-prompt-data
-            # is enforced in arguments.py.
-            if eval_size_arg < 1:
-                n_eval = max(1, int(n_avail * eval_size_arg))
-            else:
-                n_eval = int(eval_size_arg)
-            n_eval = min(n_eval, max(n_avail - 1, 0))
+            # Randomize the split once with a fixed seed. Each epoch reshuffles
+            # only the resulting train row IDs; eval membership stays fixed.
+            train_indices, eval_indices = resolve_sft_split_indices(n_avail, eval_size_arg, seed)
+            self._train_size = len(train_indices)
+            n_eval = len(eval_indices)
             if n_eval == 0:
                 self._logger.warning(
                     f"--eval-size {eval_size_arg} resolves to 0 samples on a dataset of size {n_avail}; "
                     "eval will be skipped."
                 )
             else:
-                self._train_size = n_avail - n_eval
-                self._eval_indices = range(self._train_size, n_avail)
+                self._eval_indices = eval_indices
+                restrict_training_indices = getattr(self._dataset, "restrict_training_indices", None)
+                get_batch_by_indices = getattr(self._dataset, "get_batch_by_indices", None)
+                if not callable(restrict_training_indices) or not callable(get_batch_by_indices):
+                    raise TypeError(
+                        "--eval-size requires the SFT dataset to implement restrict_training_indices(indices) "
+                        "and get_batch_by_indices(indices) for a deterministic random split."
+                    )
+                restrict_training_indices(train_indices)
                 self._logger.info(
-                    f"--eval-size carved {n_eval} samples (indices {self._train_size}..{n_avail - 1}) "
-                    f"out of train dataset; train pool size now {self._train_size}."
+                    f"--eval-size randomly held out {n_eval} samples with seed={seed}; "
+                    f"train pool size now {self._train_size}."
                 )
         elif eval_prompt_data:
             eval_input_key = getattr(self.config, "eval_input_key", None) or self.config.input_key
@@ -353,7 +358,7 @@ class SFT(Base):
         """
         if self._eval_indices is not None:
             assert self._dataset is not None
-            return self._dataset.get_batch_in_order(self._eval_indices.start, len(self._eval_indices))
+            return self._dataset.get_batch_by_indices(self._eval_indices)
         if self._eval_dataset is not None:
             return self._eval_dataset.get_batch_in_order(0, len(self._eval_dataset))
         return None

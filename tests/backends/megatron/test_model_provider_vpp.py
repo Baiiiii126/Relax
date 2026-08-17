@@ -13,7 +13,7 @@ class _FakeProvider:
     def __init__(self, model=None):
         self.calls = []
         self.finalized = False
-        self.model = model or SimpleNamespace(named_modules=lambda: [])
+        self.model = model or torch.nn.Module()
         self.attention_backend = None
         self.tensor_model_parallel_size = 1
         self.sequence_parallel = False

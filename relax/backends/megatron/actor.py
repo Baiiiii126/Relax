@@ -36,6 +36,7 @@ from relax.engine.sft.runtime import (
     sft_task_name,
     should_run_sft_eval,
     should_run_sft_predict,
+    should_skip_mtp_only_weight_management,
 )
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
@@ -247,7 +248,12 @@ class MegatronTrainRayActor(TrainRayActor):
         # Hybrid mode uses the TensorBackuper path: actor handles ref/actor_fwd
         # internally via _switch_model and pushes weights to rollout via
         # UpdateWeightFromTensor instead of DCS.
-        use_tensor_backuper = not self.args.fully_async or self.args.hybrid
+        skip_weight_management = should_skip_mtp_only_weight_management(
+            self.args,
+            with_ref=with_ref,
+            with_opd_teacher=with_opd_teacher,
+        )
+        use_tensor_backuper = not skip_weight_management and (not self.args.fully_async or self.args.hybrid)
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
                 source_getter=lambda: named_params_and_buffers(
@@ -301,7 +307,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 else self.args.model_name,
                 quantization_config=push_quant_config,
             )
-        else:
+        elif not skip_weight_management:
             is_pp_src_rank = (
                 mpu.get_data_parallel_rank(with_context_parallel=True) == 0
                 and mpu.get_tensor_model_parallel_rank() == 0
@@ -347,6 +353,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     lock=self.lock,
                 )
             )
+        else:
+            logger.info("MTP-only SFT: skipping weight snapshots, rollout updater, and DCS client")
         # empty cache after initialization
         clear_memory()
 
@@ -907,12 +915,14 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
-        self.weights_backuper.backup("actor")
+        if hasattr(self, "weights_backuper"):
+            self.weights_backuper.backup("actor")
 
         # Update ref model if needed
         if (
             self.args.ref_update_interval is not None
             and (rollout_id + 1) % self.args.ref_update_interval == 0
+            and hasattr(self, "weights_backuper")
             and "ref" in self.weights_backuper.backup_tags
         ):
             with timer("ref_model_update"):
