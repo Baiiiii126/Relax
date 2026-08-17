@@ -345,16 +345,18 @@ index bd9d7eafa1..c74f7666a9 100644
  
      server_args = _global_state.tokenizer_manager.server_args
  
-@@ -1322,6 +1330,20 @@ async def update_weights_from_ipc(
+@@ -1322,6 +1330,22 @@ async def update_weights_from_ipc(
          return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
  
  
 +@app.post("/post_process_weights")
 +@auth_level(AuthLevel.ADMIN_OPTIONAL)
-+async def post_process_weights(req: PostProcessWeightsReqInput, request: Request):
++async def post_process_weights(
++    obj: Annotated[PostProcessWeightsReqInput, Body()], request: Request
++):
 +    """Optional post-processing for updated weights, e.g. quantization packing."""
 +    success, message = await _global_state.tokenizer_manager.post_process_weights(
-+        req, request
++        obj, request
 +    )
 +
 +    content = {"success": success, "message": message}
