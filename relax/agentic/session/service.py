@@ -67,6 +67,7 @@ from relax.agentic.session.state import (
 )
 from relax.utils.http_utils import get, init_http_client, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
+from relax.utils.types import get_spec_token_counts
 
 
 app = FastAPI(title="Relax Agentic Chat API")
@@ -1341,8 +1342,9 @@ class AgenticSessionShard:
         weight_version = meta_info.get("weight_version")
         if weight_version is not None:
             request.pending_weight_version_delta.append(str(weight_version))
-        request.pending_spec_delta["spec_accept_token_num"] += int(meta_info.get("spec_accept_token_num", 0) or 0)
-        request.pending_spec_delta["spec_draft_token_num"] += int(meta_info.get("spec_draft_token_num", 0) or 0)
+        spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
+        request.pending_spec_delta["spec_accept_token_num"] += spec_accept_token_num
+        request.pending_spec_delta["spec_draft_token_num"] += spec_draft_token_num
         request.pending_spec_delta["spec_verify_ct"] += int(meta_info.get("spec_verify_ct", 0) or 0)
         request.pending_spec_delta["completion_token_num"] += int(meta_info.get("completion_tokens", 0) or 0)
         request.pending_prefix_cache_delta["cached_tokens"] += int(meta_info.get("cached_tokens", 0) or 0)
