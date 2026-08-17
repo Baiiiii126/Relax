@@ -196,6 +196,8 @@ For a fresh run, keep `--load` and `--save` pointing at the same experiment dire
 
 The MTP SFT script enables `--mtp-num-layers ${MTP_NUM_LAYERS:-1}`, `--enable-mtp-training`, and `--mtp-loss-scaling-factor ${MTP_LOSS_SCALING_FACTOR:-0.2}`. Increase `MTP_NUM_LAYERS` only for models/checkpoints with matching MTP layers; tune `MTP_LOSS_SCALING_FACTOR` as an auxiliary-loss weight, starting from `0.2`.
 
+See [MTP Training](./mtp-rl-training.md) for joint training, MTP-only two-stage training, and Pokémon measurements.
+
 ### SFT Data Arguments
 
 Required SFT flags:
@@ -278,7 +280,7 @@ PPL evaluation is controlled by:
 --eval-interval 10
 ```
 
-`--eval-size` reserves the tail of `--prompt-data` for eval and removes it from the train pool. A value below 1 is a fraction; a value of 10 or higher is an absolute sample count. You may use `--eval-prompt-data name path` instead, but in SFT mode do not use `--eval-config`.
+`--eval-size` randomly splits rows from `--prompt-data` once using `--seed`, keeps that eval subset fixed, and removes it from every shuffled training epoch. A value below 1 is a fraction; a value of 1 or higher is an absolute sample count. This is a row-level split; related rows such as multilingual captions for the same image are not grouped automatically. You may use `--eval-prompt-data name path` instead, but in SFT mode do not use `--eval-config`.
 
 Generative prediction is controlled by:
 

@@ -40,6 +40,9 @@ _TQ_UPGRADE_CMD = (
     'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
 )
 
+_MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
+_REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
+
 
 def check_transfer_queue_version() -> None:
     """Fail fast if the installed TransferQueue is older than the required
@@ -597,9 +600,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Carve a held-out eval split from --prompt-data instead of providing a separate "
                     "--eval-prompt-data. A value <1 is treated as a fraction of the train dataset "
-                    "(e.g. 0.05 → last 5%); a value ≥1 is treated as an absolute sample count. "
-                    "The reserved tail is removed from the train pool so train and eval samples never "
-                    "overlap. Mutually exclusive with --eval-prompt-data."
+                    "(e.g. 0.05 → 5%); a value ≥1 is treated as an absolute sample count. "
+                    "Rows are randomly split once using --seed; held-out rows are excluded from every "
+                    "training epoch. Mutually exclusive with --eval-prompt-data."
                 ),
             )
             parser.add_argument(
@@ -2591,6 +2594,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Enable MTP layer parameter updates during training",
             )
+            parser.add_argument(
+                "--mtp-detach-paths",
+                nargs="+",
+                choices=(*_MTP_DETACH_PATHS, "none"),
+                default=_MTP_DETACH_PATHS,
+                help=(
+                    "MTP auxiliary-loss gradient paths to detach. Choose any combination of embedding, "
+                    "backbone, and lm-head, or use none by itself for fully joint gradients. "
+                    "Defaults to detaching all three paths."
+                ),
+            )
+            parser.add_argument(
+                "--mtp-only-training",
+                action="store_true",
+                default=False,
+                help=(
+                    "Train only MTP parameters on SFT data. This enables MTP training, freezes every "
+                    "non-MTP parameter before DDP/optimizer construction, and skips the main language-model loss. "
+                    "Defaults --mtp-num-layers to 1 when it is not specified."
+                ),
+            )
 
             return parser
 
@@ -2767,9 +2791,18 @@ def parse_args(add_custom_arguments=None):
         sys.argv = original_argv
 
 
+def _reject_removed_mtp_detach_flags(argv: list[str]) -> None:
+    for token in argv:
+        option = token.split("=", 1)[0]
+        if option in _REMOVED_MTP_DETACH_FLAGS:
+            raise ValueError(f"{option} has been removed; use --mtp-detach-paths instead.")
+
+
 def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     from relax.utils.s3_model_loader import is_s3_uri
+
+    _reject_removed_mtp_detach_flags(sys.argv[1:])
 
     model_source = provider_source or _pre_parse_cli_model_source()
 
@@ -2881,6 +2914,64 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
         args.eval_prompt_data = None
 
     return eval_datasets
+
+
+_MTP_ONLY_PARAM_PATTERN = r"(^|\.)mtp(\.|$)"
+
+
+def _normalize_mtp_detach_paths(args) -> None:
+    """Validate and canonicalize the MTP auxiliary-loss detach paths."""
+    requested_paths = tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS))
+    if "none" in requested_paths:
+        if requested_paths != ("none",):
+            raise ValueError("--mtp-detach-paths none cannot be combined with other paths.")
+        args.mtp_detach_paths = ()
+        return
+
+    unknown_paths = sorted(set(requested_paths) - set(_MTP_DETACH_PATHS))
+    if unknown_paths:
+        raise ValueError(f"Unknown --mtp-detach-paths values: {', '.join(unknown_paths)}.")
+    args.mtp_detach_paths = tuple(path for path in _MTP_DETACH_PATHS if path in requested_paths)
+
+
+def _normalize_mtp_only_training_args(args) -> None:
+    """Resolve the public MTP-only mode into existing training primitives."""
+    if not getattr(args, "mtp_only_training", False):
+        return
+
+    if getattr(args, "loss_type", None) != "sft":
+        raise ValueError("--mtp-only-training requires --loss-type sft.")
+
+    conflicts = []
+    if getattr(args, "only_train_params_name_list", None):
+        conflicts.append("--only-train-params-name-list")
+    if getattr(args, "freeze_params_name_list", None):
+        conflicts.append("--freeze-params-name-list")
+    if getattr(args, "lora_rank", 0) > 0:
+        conflicts.append("--lora-rank")
+    if getattr(args, "sft_chunked_logits", False):
+        conflicts.append("--sft-chunked-logits")
+    if getattr(args, "overlap_moe_expert_parallel_comm", False):
+        conflicts.append("--overlap-moe-expert-parallel-comm")
+    if getattr(args, "fully_async", False):
+        conflicts.append("--fully-async")
+    if getattr(args, "hybrid", False):
+        conflicts.append("--hybrid")
+    if tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS)) != _MTP_DETACH_PATHS:
+        conflicts.append("--mtp-detach-paths")
+    if conflicts:
+        raise ValueError(f"--mtp-only-training is incompatible with: {', '.join(conflicts)}.")
+
+    if args.mtp_num_layers is None:
+        args.mtp_num_layers = 1
+    if args.mtp_num_layers != 1:
+        raise ValueError("--mtp-only-training currently supports exactly one Qwen3.5 MTP layer.")
+    if args.mtp_loss_scaling_factor <= 0:
+        raise ValueError("--mtp-loss-scaling-factor must be greater than 0 with --mtp-only-training.")
+
+    args.enable_mtp_training = True
+    args.mtp_detach_paths = _MTP_DETACH_PATHS
+    args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
 
 
 def _normalize_sft_max_in_flight_steps(args, is_sft: bool) -> None:
@@ -3630,11 +3721,14 @@ def slime_validate_args(args):
             "please remove --disable-rollout-global-dataset to use num_epoch"
         )
 
+    _normalize_mtp_detach_paths(args)
+    _normalize_mtp_only_training_args(args)
+
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
     # --sft-chunked-logits incompatibilities. Both are flagged here so
-    # downstream (model.py _should_use_sft_chunked + the three loss.py direct
+    # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
     # Both are hard asserts — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.

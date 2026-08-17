@@ -1304,6 +1304,18 @@ def sft_loss_function_chunked(
     return loss, {"loss": loss.clone().detach()}
 
 
+def mtp_only_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    hidden_states: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Trigger the attached MTP auxiliary loss without a main language loss."""
+    del args, batch, sum_of_sample_mean
+    loss = 0.0 * hidden_states.sum()
+    return loss, {"loss": loss.detach()}
+
+
 def loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1371,23 +1383,26 @@ def loss_function(
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
-    match args.loss_type:
-        case "policy_loss":
-            func = policy_loss_function
-        case "value_loss":
-            func = value_loss_function
-        case "sft":
-            if getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
-                # Bind lm_head_forward so chunked path matches the standard
-                # inner-func signature; outer body (recompute, CP guard,
-                # Megatron scaling, return-tuple) is then shared with legacy.
-                func = partial(sft_loss_function_chunked, lm_head_forward=lm_head_forward)
-            else:
-                func = sft_loss_function
-        case "custom_loss":
-            func = load_function(args.custom_loss_function_path)
-        case _:
-            raise ValueError(f"Unknown loss type: {args.loss_type}")
+    if getattr(args, "mtp_only_training", False):
+        func = mtp_only_loss_function
+    else:
+        match args.loss_type:
+            case "policy_loss":
+                func = policy_loss_function
+            case "value_loss":
+                func = value_loss_function
+            case "sft":
+                if getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
+                    # Bind lm_head_forward so chunked path matches the standard
+                    # inner-func signature; outer body (recompute, CP guard,
+                    # Megatron scaling, return-tuple) is then shared with legacy.
+                    func = partial(sft_loss_function_chunked, lm_head_forward=lm_head_forward)
+                else:
+                    func = sft_loss_function
+            case "custom_loss":
+                func = load_function(args.custom_loss_function_path)
+            case _:
+                raise ValueError(f"Unknown loss type: {args.loss_type}")
 
     if args.recompute_loss_function:
         loss, log = checkpoint(

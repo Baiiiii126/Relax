@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from relax.engine.sft.dataset.streaming import ProcessedSample
+from relax.engine.sft.runtime import resolve_sft_split_indices
 
 
 def _make_processed(idx: int = 0, n_tokens: int = 8) -> ProcessedSample:
@@ -54,6 +55,8 @@ def _patch_pipeline_dependencies(monkeypatch, n_samples: int = 8):
     fake_ds = MagicMock()
     fake_ds.__len__ = MagicMock(return_value=len(fake_processed))
     fake_ds.shuffle = MagicMock(return_value=None)
+    fake_ds.restrict_training_size = MagicMock(return_value=None)
+    fake_ds.restrict_training_indices = MagicMock(return_value=None)
     fake_ds.stop = MagicMock(return_value=None)
     fake_ds.index_manager = SimpleNamespace(current_epoch=0)
 
@@ -62,6 +65,7 @@ def _patch_pipeline_dependencies(monkeypatch, n_samples: int = 8):
 
     fake_ds.get_batch_async = AsyncMock(side_effect=_get_batch_async)
     fake_ds.get_batch_in_order = MagicMock(side_effect=lambda start, n: fake_processed[start : start + n])
+    fake_ds.get_batch_by_indices = MagicMock(side_effect=lambda indices: [fake_processed[i] for i in indices])
 
     fake_tok = MagicMock()
     fake_tok.chat_template = "{% generation %}assistant{% endgeneration %}"
@@ -72,6 +76,41 @@ def _patch_pipeline_dependencies(monkeypatch, n_samples: int = 8):
     monkeypatch.setattr("relax.components.sft._resolve_pad_token_ids_from_config", lambda *a, **kw: frozenset())
     monkeypatch.setattr("relax.components.sft.print_first_sample", lambda **kw: None)
     return fake_ds, fake_tok
+
+
+def test_sft_eval_size_randomly_splits_and_restricts_the_shuffled_train_pool(monkeypatch):
+    from relax.components.sft import SFT
+
+    fake_ds, _ = _patch_pipeline_dependencies(monkeypatch, n_samples=10)
+    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
+    monkeypatch.setattr("relax.components.sft.tq.get_client", MagicMock())
+
+    args = _make_args(global_batch_size=2)
+    args.eval_size = 0.2
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = args
+    sft.role = "sft"
+    sft.step = 0
+    sft._dataset = None
+    sft._eval_dataset = None
+    sft._eval_indices = None
+    sft._train_size = 0
+    sft._tokenizer = None
+    sft._processor_pool = None
+    sft._logger_instance = None
+
+    sft._init_data_pipeline()
+
+    train_indices, eval_indices = resolve_sft_split_indices(10, 0.2, seed=args.seed)
+    assert sft._train_size == 8
+    assert sft._eval_indices == eval_indices
+    assert eval_indices != (8, 9)
+    fake_ds.restrict_training_indices.assert_called_once_with(train_indices)
+    fake_ds.shuffle.assert_called_once_with(0, position=0)
+
+    assert [sample.source_idx for sample in sft._build_eval_batches()] == list(eval_indices)
+    fake_ds.get_batch_by_indices.assert_called_once_with(eval_indices)
 
 
 def test_sft_component_imports_without_ray():

@@ -5,6 +5,7 @@
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -23,6 +24,93 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     with path.open("w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
+
+
+def test_restrict_training_size_excludes_held_out_tail_from_every_epoch(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    dataset = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=7)
+
+    dataset.restrict_training_size(8)
+    dataset.shuffle(0)
+    indices, crossed_epoch = dataset.index_manager.get_next_indices(24)
+
+    assert crossed_epoch is True
+    assert set(indices) == set(range(8))
+    assert all(index < 8 for index in indices)
+    assert len(dataset) == 10
+
+
+def test_restrict_training_indices_shuffles_only_physical_row_ids_and_resumes(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    train_indices = (0, 2, 5, 7, 9)
+
+    uninterrupted = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=7)
+    uninterrupted.restrict_training_indices(train_indices)
+    uninterrupted.shuffle(0)
+    uninterrupted.index_manager.get_next_indices(7)
+    expected, _ = uninterrupted.index_manager.get_next_indices(8)
+
+    resumed = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=7)
+    resumed.restrict_training_indices(train_indices)
+    resumed.shuffle(1, position=2)
+    actual, crossed_epoch = resumed.index_manager.get_next_indices(8)
+
+    assert actual == expected
+    assert crossed_epoch is True
+    assert set(actual).issubset(train_indices)
+
+
+def test_restrict_training_indices_prefetches_physical_row_ids(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    train_indices = (0, 2, 5, 7, 9)
+    dataset = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=7)
+    dataset._prefetch = MagicMock()
+
+    dataset.restrict_training_indices(train_indices)
+    dataset.shuffle(0)
+
+    prefetched_indices = dataset._prefetch.set_index_order.call_args.args[0]
+    assert set(prefetched_indices) == set(train_indices)
+    assert len(prefetched_indices) == len(train_indices)
+
+
+@pytest.mark.parametrize("indices", [(), (1, 1), (0, 10)])
+def test_restrict_training_indices_rejects_invalid_row_ids(tmp_path, indices):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    dataset = SFTStreamingDataset(path=str(path), prefetch_max_cached=0)
+
+    with pytest.raises(ValueError):
+        dataset.restrict_training_indices(indices)
+
+
+def test_get_batch_by_indices_preserves_requested_physical_order(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"Q{index}"},
+                    {"role": "assistant", "content": f"A{index}"},
+                ]
+            }
+            for index in range(6)
+        ],
+    )
+    dataset = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        prompt_key="messages",
+        prefetch_max_cached=0,
+    )
+
+    samples = dataset.get_batch_by_indices((4, 1, 5))
+
+    assert [sample.source_idx for sample in samples] == [4, 1, 5]
 
 
 class _FakeTokenizer:

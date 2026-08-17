@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import re
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Literal
 
@@ -33,6 +34,20 @@ from .conditional_branch_sync import install_conditional_branch_sync
 
 
 logger = get_logger(__name__)
+
+
+def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
+    """Propagate MTP detach-path settings to every Megatron model config."""
+    detach_paths = frozenset(getattr(args, "mtp_detach_paths", ("embedding", "backbone", "lm-head")))
+    seen_configs: set[int] = set()
+    for module in model.modules():
+        config = getattr(module, "config", None)
+        if config is None or id(config) in seen_configs:
+            continue
+        setattr(config, "mtp_detach_embedding", "embedding" in detach_paths)
+        setattr(config, "mtp_detach_backbone", "backbone" in detach_paths)
+        setattr(config, "mtp_detach_lm_head", "lm-head" in detach_paths)
+        seen_configs.add(id(config))
 
 
 def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
@@ -195,6 +210,7 @@ def get_model_provider_func(
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             else:
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
@@ -325,6 +341,7 @@ def get_model_provider_func(
 
         def provide_with_cp_probe(*p_args, **p_kwargs):
             model = original_provide(*p_args, **p_kwargs)
+            configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
             _maybe_mark_unsplit_forward(args, model)
@@ -439,6 +456,7 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)
@@ -530,3 +548,41 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                 if re.search(pattern, name):
                     param.requires_grad = False
                     break
+
+
+def validate_mtp_only_trainable_params(args: argparse.Namespace, model: Sequence[torch.nn.Module]) -> None:
+    """Fail fast when MTP-only mode exposes any non-MTP trainable parameter."""
+    if not getattr(args, "mtp_only_training", False):
+        return
+
+    trainable = [
+        (name, param) for model_chunk in model for name, param in model_chunk.named_parameters() if param.requires_grad
+    ]
+    unexpected = [name for name, _ in trainable if re.search(r"(^|\.)mtp(\.|$)", name) is None]
+    local_param_count = len(trainable)
+    global_param_count = local_param_count
+    global_unexpected_count = len(unexpected)
+    if dist.is_available() and dist.is_initialized():
+        first_param = next(param for model_chunk in model for param in model_chunk.parameters())
+        counts = torch.tensor(
+            [local_param_count, len(unexpected)],
+            dtype=torch.long,
+            device=first_param.device,
+        )
+        dist.all_reduce(counts, group=dist.group.WORLD)
+        global_param_count, global_unexpected_count = (int(value) for value in counts.tolist())
+
+    if global_unexpected_count:
+        details = ", ".join(unexpected[:10]) if unexpected else "reported by another distributed rank"
+        raise RuntimeError(f"--mtp-only-training left non-MTP parameters trainable: {details}")
+
+    if global_param_count == 0:
+        raise RuntimeError("--mtp-only-training found no trainable MTP parameters in the distributed model.")
+
+    local_numel = sum(param.numel() for _, param in trainable)
+    logger.info(
+        "MTP-only trainable parameters on this rank: tensors=%d, elements=%d; distributed tensors=%d",
+        local_param_count,
+        local_numel,
+        global_param_count,
+    )
