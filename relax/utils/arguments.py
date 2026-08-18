@@ -1680,6 +1680,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--lora-scope",
+                type=str,
+                choices=["all", "language", "vision"],
+                default="all",
+                help=(
+                    "Which model region receives LoRA adapters (VL models only; no effect "
+                    "on text models, which have no vision tower). 'all' (default) wraps every "
+                    "matched module including the vision tower; 'language' excludes the vision "
+                    "tower / projector / audio encoder (typical for language-only RL); 'vision' "
+                    "wraps only those. Controls adapter INJECTION, not base-weight freezing."
+                ),
+            )
+            parser.add_argument(
                 "--lora-dropout",
                 type=float,
                 default=0.0,
@@ -3162,6 +3175,68 @@ def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
         )
 
 
+def _declares_non_language_encoder(hf_checkpoint: str) -> bool | None:
+    """Whether the HF config declares a vision / audio encoder next to the LM.
+
+    Tri-state on purpose: ``None`` means the config could not be read (path not
+    materialized yet, or custom code that needs ``trust_remote_code``). Callers
+    degrade to a warning in that case — a best-effort guard must not become a
+    new way for a valid run to fail.
+    """
+    from relax.utils.misc import get_hf_config
+
+    try:
+        config = get_hf_config(hf_checkpoint)
+    except Exception as e:  # noqa: BLE001 - best-effort probe, never fatal
+        logger.warning("Could not read HF config at %s to check for a vision tower: %s", hf_checkpoint, e)
+        return None
+    return any(getattr(config, key, None) is not None for key in ("vision_config", "audio_config"))
+
+
+def _validate_lora_vision_scope(args) -> None:
+    """Reject LoRA adapter mode that would train a vision-tower adapter.
+
+    SGLang hosts LoRA on language-model layers only: ``should_apply_lora`` accepts
+    ``model.layers.*`` and nothing else, and its adapter loader bins tensors by a
+    ``layers.<N>.`` regex that a vision name (``model.visual.blocks.<N>....``) never
+    matches. A vision adapter therefore trains but is dropped on the way to the
+    rollout engine WITHOUT any log line — the actor optimizes a policy the rollout
+    never runs, and the gap widens every step.
+
+    Only adapter mode is affected. Merge mode folds the adapter into the base weights
+    and syncs those, so the engine never sees LoRA at all and any scope is safe.
+    """
+    if not getattr(args, "lora_adapter_mode", False) or getattr(args, "lora_scope", "all") != "all":
+        return
+
+    hf_checkpoint = getattr(args, "hf_checkpoint", None)
+    if not hf_checkpoint:
+        return
+
+    has_encoder = _declares_non_language_encoder(hf_checkpoint)
+    if has_encoder is None:
+        logger.warning(
+            "Skipped the --lora-scope check for --lora-adapter-mode (HF config unreadable). "
+            "If %s is a VL/omni model, pass --lora-scope language: SGLang cannot host a "
+            "vision-tower adapter and would silently drop it.",
+            hf_checkpoint,
+        )
+        return
+    if not has_encoder:
+        return
+
+    raise ValueError(
+        "--lora-adapter-mode with --lora-scope all is not supported on a model that has a "
+        "vision/audio encoder: SGLang only hosts LoRA on language-model layers, so the "
+        "vision-tower adapter would be trained but silently dropped before rollout, breaking "
+        "the on-policy assumption. Either pass --lora-scope language (keeps adapter mode and "
+        "its per-step bandwidth saving; the vision tower is left un-adapted), or switch to "
+        "--lora-merge-mode (folds the vision adapter into the synced base weights, at the cost "
+        "of a full weight sync every step). Pass --lora-scope language explicitly if your "
+        "--lora-target-modules provably match nothing in the vision tower."
+    )
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -3224,6 +3299,18 @@ def slime_validate_args(args):
             raise ValueError(
                 "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
                 "support dp_size > 1)."
+            )
+        _validate_lora_vision_scope(args)
+        if "router" in getattr(args, "lora_target_modules", []) and not getattr(args, "lora_adapter_mode", False):
+            # Merge folds each adapter into its base via LoRAMerge, which only transforms
+            # LoRALinear modules; the router uses LoRATopKRouter, so its adapter would be
+            # silently dropped at sync time. Fail loud instead of training a router LoRA that
+            # never reaches the rollout engine. (Adapter mode exports via the bridge, which
+            # does handle the router, so it is not blocked here.)
+            raise ValueError(
+                "LoRA on 'router' is only supported in --lora-adapter-mode; merge mode cannot fold "
+                "the router adapter (LoRAMerge skips non-LoRALinear modules). Remove 'router' from "
+                "--lora-target-modules or switch to --lora-adapter-mode."
             )
         if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
             logger.info(

@@ -32,7 +32,7 @@ from relax.utils.async_utils import run
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
+from relax.utils.megatron_peft_utils import convert_megatron_to_sglang_target_modules, is_lora_enabled
 from relax.utils.model_source import ModelSource, SGLangLoadPlan
 from relax.utils.s3_model_loader import (
     get_s3_model_cached_path,
@@ -668,9 +668,9 @@ class SGLangEngine(RayActor):
         """Load/refresh a LoRA adapter directly from serialized tensors — no
         disk IO.
 
-        In-memory counterpart to :meth:`load_lora_adapter` (SGLang's ``/load_lora_adapter_from_tensors``,
-        available since 0.5.12). ``config_dict`` is the HF-PEFT adapter config (the same content
-        the disk path writes to ``adapter_config.json``); ``serialized_tensors`` carries the full
+        Wraps SGLang's ``/load_lora_adapter_from_tensors`` (available since 0.5.12), the transport
+        the colocate backend uses. ``config_dict`` is the adapter config (the same content that
+        would go into ``adapter_config.json``); ``serialized_tensors`` carries the full
         (TP-gathered, PP-merged) adapter tensors serialized with SGLang's ``MultiprocessingSerializer``.
 
         Unlike ``update_weights_from_tensor`` (which fans out one shard per TP worker), SGLang
@@ -698,6 +698,56 @@ class SGLangEngine(RayActor):
                 "config_dict": config_dict,
                 "serialized_tensors": serialized_tensors,
                 "load_format": load_format,
+                "pinned": pinned,
+            },
+        )
+
+    def update_lora_from_distributed(
+        self,
+        lora_name: str,
+        names: list[str],
+        dtypes: list,
+        shapes: list,
+        config_dict: dict,
+        group_name: str,
+        pinned: bool = False,
+    ) -> dict | None:
+        """Load/refresh a LoRA adapter whose tensors arrive over an NCCL group.
+
+        — no disk IO.
+
+        NCCL counterpart to :meth:`load_lora_adapter_from_tensors`. The HTTP call
+        only carries metadata (``names``/``dtypes``/``shapes``/``config_dict``); the
+        actual adapter tensors are broadcast ``src=0`` on ``group_name`` (the same
+        weight-update group base weights use) and received on the SGLang side by
+        ``/update_lora_from_distributed``. Fully-async uses this instead of a shared-
+        directory handoff, so no adapter ever touches the network FS.
+
+        Same-name replacement is handled server-side, so no separate
+        ``/unload_lora_adapter`` call is needed. Requires ``--enable-lora`` and
+        ``dp_size == 1``.
+
+        Args:
+            lora_name: Adapter name; rollout requests pass ``lora_path=lora_name``.
+            names: Adapter tensor names (HF-PEFT layout), defining the broadcast order.
+            dtypes: Per-tensor dtypes (``torch.dtype`` or str), serialized as bare names.
+            shapes: Per-tensor shapes.
+            config_dict: HF-PEFT config dict (see ``build_hf_peft_config_dict``).
+            group_name: NCCL group to receive the tensors on.
+            pinned: Pin the adapter against LRU eviction (kept False; one self-managed adapter).
+
+        Returns:
+            Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
+        """
+        return self._make_request(
+            "update_lora_from_distributed",
+            {
+                "lora_name": lora_name,
+                "config_dict": config_dict,
+                "names": names,
+                "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
+                "shapes": shapes,
+                "group_name": group_name,
                 "pinned": pinned,
             },
         )
@@ -1439,8 +1489,10 @@ def _compute_server_args(
     if is_lora_enabled(args) and getattr(args, "lora_adapter_mode", False):
         kwargs["enable_lora"] = True
         kwargs["max_lora_rank"] = args.lora_rank
-        # SGLang expects HF-style module names; CLI holds canonical Megatron names.
-        kwargs["lora_target_modules"] = convert_megatron_to_hf_target_modules(args.lora_target_modules)
+        # SGLang matches modules by leaf name; CLI holds canonical Megatron names. Fused
+        # projections that SGLang groups differently from HF (GDN in_proj -> in_proj_qkvz)
+        # must use the engine flavor, otherwise the module is never wrapped.
+        kwargs["lora_target_modules"] = convert_megatron_to_sglang_target_modules(args.lora_target_modules)
         # We serve exactly one policy adapter. max_loaded_loras >= max_loras_per_batch is a
         # SGLang startup requirement; 2 leaves room for the unload->reload overlap.
         kwargs["max_loras_per_batch"] = 1
