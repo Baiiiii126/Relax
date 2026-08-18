@@ -953,6 +953,20 @@ def post_process_rollout_data(args, rollout_data):
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
+    if "classification_labels" in rollout_data:
+        label_dtype = (
+            torch.long
+            if getattr(args, "problem_type", "single_label_classification") == "single_label_classification"
+            else torch.float32
+        )
+        rollout_data["classification_labels"] = [
+            torch.as_tensor(label, dtype=label_dtype, device=cuda_dev)
+            for label in rollout_data["classification_labels"]
+        ]
+    if "sample_weights" in rollout_data:
+        rollout_data["sample_weights"] = [
+            torch.as_tensor(weight, dtype=torch.float32, device=cuda_dev) for weight in rollout_data["sample_weights"]
+        ]
     # NOTE: multimodal_train_inputs are intentionally left on CPU here. Moving
     # the whole batch's pixel tensors to GPU up front would spike memory
     if args.qkv_format == "bshd":

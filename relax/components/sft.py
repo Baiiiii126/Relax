@@ -29,6 +29,7 @@ import asyncio
 import random
 from typing import Any
 
+import torch.nn.functional as F
 import transfer_queue as tq
 from ray import serve
 from transformers import AutoConfig, AutoTokenizer
@@ -73,6 +74,14 @@ def _resolve_pad_token_ids_from_config(model_path: str) -> frozenset[int]:
     return frozenset(ids)
 
 
+def _resolve_classification_sentinel_token_id(tokenizer) -> int:
+    for attr in ("eos_token_id", "pad_token_id"):
+        token_id = getattr(tokenizer, attr, None)
+        if isinstance(token_id, int) and token_id >= 0:
+            return token_id
+    raise ValueError("--task-type seq_cls requires a tokenizer with a valid EOS or PAD token id.")
+
+
 @serve.deployment
 class SFT(Base):
     def __init__(self, healthy, pgs, num_gpus, config, role, runtime_env=None):  # noqa: ARG002
@@ -113,6 +122,10 @@ class SFT(Base):
         prefetch_chunk_size = getattr(self.config, "sft_prefetch_chunk_size", 32)
         prefetch_num_workers = getattr(self.config, "sft_prefetch_num_workers", 4)
         seed = getattr(self.config, "seed", 42)
+        task_type = getattr(self.config, "task_type", "causal_lm")
+        classification_sentinel_token_id = (
+            _resolve_classification_sentinel_token_id(self._tokenizer) if task_type == "seq_cls" else None
+        )
 
         oversize_strategy = getattr(self.config, "sft_oversize_strategy", "keep")
         invalid_multimodal_strategy = getattr(self.config, "sft_invalid_multimodal_strategy", "error")
@@ -150,6 +163,11 @@ class SFT(Base):
                 oversize_custom_fn=oversize_custom_fn,
                 invalid_multimodal_strategy=invalid_multimodal_strategy,
                 apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                require_response=task_type != "seq_cls",
+                task_type=task_type,
+                num_labels=getattr(self.config, "num_labels", None),
+                problem_type=getattr(self.config, "problem_type", "single_label_classification"),
+                classification_sentinel_token_id=classification_sentinel_token_id,
             )
         else:
             self._dataset = dataset_cls.from_args(
@@ -214,6 +232,11 @@ class SFT(Base):
                 oversize_custom_fn=oversize_custom_fn,
                 invalid_multimodal_strategy=invalid_multimodal_strategy,
                 apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                require_response=task_type != "seq_cls",
+                task_type=task_type,
+                num_labels=getattr(self.config, "num_labels", None),
+                problem_type=getattr(self.config, "problem_type", "single_label_classification"),
+                classification_sentinel_token_id=classification_sentinel_token_id,
             )
 
         # Resume: align IndexManager with `start_rollout_id` so a restart sees
@@ -310,11 +333,15 @@ class SFT(Base):
             return
         s = samples[0]
         try:
+            loss_mask = s.loss_mask
+            if s.classification_label is not None:
+                loss_mask = F.pad(loss_mask, (s.total_length - 2, 1), value=0)
+                self._logger.info(f"First classification sample label: {s.classification_label.tolist()}")
             print_first_sample(
                 step=self.step,
                 sample_idx=s.source_idx,
                 input_ids=s.tokens,
-                loss_mask=s.loss_mask,
+                loss_mask=loss_mask,
                 multimodal_train_inputs=s.multimodal_train_inputs,
                 tokenizer=self._tokenizer,
             )
@@ -397,7 +424,19 @@ class SFT(Base):
         # so the padding is reproducible across restarts.
         gbs = self.config.global_batch_size
         n_original = len(samples)
-        if n_original < gbs:
+        is_classification = getattr(self.config, "task_type", "causal_lm") == "seq_cls"
+        sample_weights = None
+        if is_classification:
+            n_chunks = (n_original + gbs - 1) // gbs
+            pad_count = n_chunks * gbs - n_original
+            if pad_count:
+                samples = list(samples) + [samples[i % n_original] for i in range(pad_count)]
+            sample_weights = [1.0] * n_original + [0.0] * pad_count
+            self._logger.info(
+                f"Classification eval @ step {self.step}: {n_original} real samples, "
+                f"{pad_count} zero-weight padding samples, {n_chunks} chunk(s)."
+            )
+        elif n_original < gbs:
             rng = random.Random(self.step)
             pad_count = gbs - n_original
             samples = list(samples) + rng.choices(samples, k=pad_count)
@@ -408,7 +447,11 @@ class SFT(Base):
                 f"interpret with caution."
             )
 
-        backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
+        backend_batch = pack_samples_for_tq(
+            samples,
+            force_multimodal_field=self.config.multimodal_keys is not None,
+            sample_weights=sample_weights,
+        )
         assert backend_batch is not None
         n_samples = len(backend_batch["tokens"])
 
@@ -417,7 +460,9 @@ class SFT(Base):
         await self._wait_for_partition_drained(f"sft_{self.step}")
 
         chunk_size = self.config.global_batch_size
-        # Drop trailing samples that don't fill a full chunk. The consumer's
+        # Causal-LM eval drops trailing samples that don't fill a full chunk;
+        # classification eval was padded above and therefore has no trailing
+        # real samples. The consumer's
         # `_get_data_from_transfer_queue` calls `tq.get_meta(batch_size=...)`
         # which returns size=0 when the partition has fewer than batch_size
         # samples, so a partial last chunk would never be marked consumed and

@@ -1156,6 +1156,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--input-key", type=str, default="input", help="JSON dataset key")
             parser.add_argument("--label-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument(
+                "--task-type",
+                type=str,
+                choices=["causal_lm", "seq_cls"],
+                default="causal_lm",
+                help="SFT task type. `seq_cls` replaces the vocabulary head with a classification head.",
+            )
+            parser.add_argument(
+                "--num-labels",
+                type=int,
+                default=None,
+                help="Number of classes for --task-type seq_cls.",
+            )
+            parser.add_argument(
+                "--problem-type",
+                type=str,
+                choices=["single_label_classification", "multi_label_classification"],
+                default="single_label_classification",
+                help="Classification objective used by --task-type seq_cls.",
+            )
+            parser.add_argument(
+                "--classification-threshold",
+                type=float,
+                default=0.5,
+                help="Sigmoid threshold used by multi-label classification evaluation.",
+            )
+            parser.add_argument(
                 "--multimodal-keys",
                 type=json.loads,
                 default=None,
@@ -3550,6 +3576,37 @@ def slime_validate_args(args):
         if not args.balance_data:
             logger.info("--loss-type sft: auto-enabling --balance-data for DP-balanced batching.")
             args.balance_data = True
+
+    task_type = getattr(args, "task_type", "causal_lm")
+    if task_type == "seq_cls":
+        if args.loss_type != "sft":
+            raise ValueError("--task-type seq_cls requires --loss-type sft.")
+        if not args.label_key:
+            raise ValueError("--task-type seq_cls requires --label-key.")
+        if args.num_labels is None or args.num_labels < 2:
+            raise ValueError("--task-type seq_cls requires --num-labels >= 2.")
+        if not 0.0 <= args.classification_threshold <= 1.0:
+            raise ValueError("--classification-threshold must be in [0, 1].")
+        if args.multimodal_keys is not None:
+            raise ValueError("--task-type seq_cls currently supports text-only data; remove --multimodal-keys.")
+        incompatible = {
+            "--fully-async": bool(args.fully_async),
+            "--hybrid": bool(args.hybrid),
+            "--sft-predict-interval": args.sft_predict_interval is not None,
+            "--sft-chunked-logits": bool(args.sft_chunked_logits),
+            "--enable-mtp-training": bool(args.enable_mtp_training),
+            "--mtp-num-layers": bool(args.mtp_num_layers),
+            "--save-hf": args.save_hf is not None,
+            "--allgather-cp": bool(args.allgather_cp),
+            "--custom-dataset-class": args.custom_dataset_class_path is not None,
+            "--sft-oversize-strategy custom": args.sft_oversize_strategy == "custom",
+            "--debug-train-only": bool(args.debug_train_only),
+        }
+        enabled = [name for name, is_enabled in incompatible.items() if is_enabled]
+        if enabled:
+            raise ValueError(f"--task-type seq_cls does not support: {', '.join(enabled)}.")
+    elif getattr(args, "num_labels", None) is not None:
+        raise ValueError("--num-labels is only meaningful under --task-type seq_cls.")
 
     args.use_critic = args.advantage_estimator == "ppo"
     # Synchronous PPO has no producer for

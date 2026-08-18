@@ -221,6 +221,169 @@ def test_pack_samples_for_tq_marks_samples_as_sft(tmp_path: Path):
     ds.stop()
 
 
+def _make_classification_dataset(
+    path: Path,
+    *,
+    problem_type: str = "single_label_classification",
+    num_labels: int = 3,
+    capacity: int | None = None,
+) -> SFTStreamingDataset:
+    return SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=capacity,
+        prompt_key="messages",
+        label_key="label",
+        multimodal_keys=None,
+        seed=42,
+        prefetch_max_cached=0,
+        oversize_strategy="truncate_right",
+        task_type="seq_cls",
+        num_labels=num_labels,
+        problem_type=problem_type,
+        classification_sentinel_token_id=99,
+        require_response=False,
+    )
+
+
+def test_streaming_dataset_builds_single_label_classification_sample(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Question"}], "label": 2}])
+    ds = _make_classification_dataset(path)
+
+    sample = ds.get_batch_in_order(0, 1)[0]
+    batch = pack_samples_for_tq([sample])
+
+    assert sample.tokens[-1].item() == 99
+    assert sample.loss_mask.tolist() == [1]
+    assert sample.classification_label.item() == 2
+    assert batch["response_lengths"] == [1]
+    assert batch["classification_labels"] == [2]
+    ds.stop()
+
+
+def test_streaming_dataset_builds_dense_multi_label_targets(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Question"}], "label": [0, 2]}])
+    ds = _make_classification_dataset(
+        path,
+        problem_type="multi_label_classification",
+        num_labels=4,
+    )
+
+    sample = ds.get_batch_in_order(0, 1)[0]
+    batch = pack_samples_for_tq([sample], sample_weights=[1.0])
+
+    assert sample.classification_label.tolist() == [1.0, 0.0, 1.0, 0.0]
+    assert batch["classification_labels"] == [[1.0, 0.0, 1.0, 0.0]]
+    assert batch["sample_weights"] == [1.0]
+    ds.stop()
+
+
+def test_streaming_dataset_truncates_prompt_but_preserves_classification_sentinel(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "long prompt"}], "label": 1}])
+    ds = _make_classification_dataset(path, capacity=5)
+
+    sample = ds.get_batch_in_order(0, 1)[0]
+
+    assert sample.total_length == 5
+    assert sample.tokens[-1].item() == 99
+    assert sample.loss_mask.tolist() == [1]
+    ds.stop()
+
+
+@pytest.mark.parametrize(
+    ("label", "problem_type", "match"),
+    [
+        (True, "single_label_classification", "requires an integer label"),
+        (3, "single_label_classification", "expected 0 <= label < 3"),
+        ([0, 0], "multi_label_classification", "duplicate indices"),
+        ([3], "multi_label_classification", "expected 0 <= index < 3"),
+    ],
+)
+def test_streaming_dataset_rejects_invalid_classification_labels(
+    tmp_path: Path,
+    label,
+    problem_type: str,
+    match: str,
+):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Question"}], "label": label}])
+    ds = _make_classification_dataset(path, problem_type=problem_type)
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        ds.get_batch_in_order(0, 1)
+    ds.stop()
+
+
+class _CountingReader:
+    """Reader wrapper that counts ``__getitem__`` calls without changing
+    behaviour."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.count = 0
+
+    def __len__(self):
+        return len(self._inner)
+
+    def __getitem__(self, idx):
+        self.count += 1
+        return self._inner[idx]
+
+
+def test_render_one_reads_reader_once_for_seq_cls(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Question"}], "label": 1}])
+    ds = _make_classification_dataset(path)
+    counting = _CountingReader(ds.reader)
+    ds.reader = counting
+
+    rendered = ds._render_one(0)
+
+    assert rendered is not None
+    assert rendered.classification_label.item() == 1
+    assert counting.count == 1
+    ds.stop()
+
+
+def test_render_one_reads_reader_once_for_causal_lm(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "Q"},
+                    {"role": "assistant", "content": "A"},
+                ]
+            }
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys=None,
+        seed=42,
+        prefetch_max_cached=0,
+    )
+    counting = _CountingReader(ds.reader)
+    ds.reader = counting
+
+    rendered = ds._render_one(0)
+
+    assert rendered is not None
+    assert rendered.classification_label is None
+    assert counting.count == 1
+    ds.stop()
+
+
 def _make_text_only_sample() -> ProcessedSample:
     """A ProcessedSample with no multimodal inputs (text-only)."""
     return ProcessedSample(

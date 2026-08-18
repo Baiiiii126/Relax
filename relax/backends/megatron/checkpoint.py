@@ -18,7 +18,10 @@ from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias
-from relax.utils.training.ppo_utils import use_critic_lm_head_for_hf_load
+from relax.utils.training.ppo_utils import (
+    use_critic_lm_head_for_hf_load,
+    use_sequence_classification_lm_head_for_hf_load,
+)
 
 
 try:
@@ -257,10 +260,11 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
         warm_hf_checkpoint_page_cache(source_path)
 
     with use_critic_lm_head_for_hf_load(ddp_model):
-        with megatron_bridge_utils.patch_megatron_model(ddp_model):
-            bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)
-            with _patch_scatter_dtype_cast():
-                bridge.load_hf_weights(ddp_model)
+        with use_sequence_classification_lm_head_for_hf_load(ddp_model):
+            with megatron_bridge_utils.patch_megatron_model(ddp_model):
+                bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)
+                with _patch_scatter_dtype_cast():
+                    bridge.load_hf_weights(ddp_model)
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)
     if (args.fp16 or args.bf16) and optimizer is not None:

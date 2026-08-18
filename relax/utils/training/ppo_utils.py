@@ -949,6 +949,7 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
 
 
 _RELAX_HF_OUTPUT_LAYER_ATTR = "_relax_hf_output_layer"
+_RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR = "_relax_seq_cls_hf_output_layer"
 
 _CRITIC_VH_INIT_STATS_ATTR = "_critic_value_head_init_stats"
 _CRITIC_VH_VERIFIED_ATTR = "_critic_value_head_verified"
@@ -1060,6 +1061,102 @@ def install_critic_value_head_in_provider(
     )
 
 
+def install_sequence_classification_head_in_provider(
+    model: torch.nn.Module,
+    args,
+    role: str,
+    post_process: bool,
+    *,
+    stash_lm_head: bool = False,
+) -> None:
+    """Install a replicated ``hidden_size -> num_labels`` head before DDP.
+
+    Only the actor's final PP/VPP chunk owns the classification head. Bridge
+    models stash their vocabulary head under an unregistered attribute so HF
+    CausalLM loading can temporarily restore it.
+    """
+    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+        return
+
+    owner = _find_output_layer_owner(model)
+    if owner is None:
+        return
+
+    num_labels = int(args.num_labels)
+    output_layer = owner.output_layer
+    if isinstance(output_layer, LinearForLastLayer) and output_layer.out_features == num_labels:
+        return
+
+    if stash_lm_head:
+        object.__setattr__(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR, output_layer)
+    owner.output_layer = LinearForLastLayer(
+        input_size=owner.config.hidden_size,
+        output_size=num_labels,
+        config=owner.config,
+        bias=False,
+    )
+
+
+def ensure_sequence_classification_head_trainable(
+    model: torch.nn.Module,
+    args,
+    role: str,
+    post_process: bool,
+) -> None:
+    """Undo PEFT/freeze wrappers that would otherwise freeze the task head."""
+    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+        return
+    owner = _find_output_layer_owner(model)
+    if owner is None:
+        return
+    head = owner.output_layer
+    if not isinstance(head, LinearForLastLayer) or head.out_features != int(args.num_labels):
+        raise TypeError(f"sequence classification output layer is not installed: got {type(head).__name__}")
+    for param in head.parameters():
+        param.requires_grad = True
+
+
+@contextlib.contextmanager
+def use_sequence_classification_lm_head_for_hf_load(model):
+    """Temporarily restore Bridge vocabulary heads while loading HF weights."""
+    restored_heads = []
+    try:
+        for model_chunk in model:
+            owner = _find_output_layer_owner(model_chunk)
+            if owner is None or not hasattr(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR):
+                continue
+
+            classification_head = owner.output_layer
+            classification_param_ids = tuple(id(param) for param in classification_head.parameters())
+            lm_head = getattr(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+            restored_heads.append((owner, classification_head, classification_param_ids))
+
+            classification_param = next(classification_head.parameters(), None)
+            if classification_param is not None:
+                lm_head.to(device=classification_param.device, dtype=classification_param.dtype)
+            owner.output_layer = lm_head
+        yield
+    finally:
+        for owner, classification_head, classification_param_ids in reversed(restored_heads):
+            owner.output_layer = classification_head
+            object.__delattr__(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+            assert owner.output_layer is classification_head, (
+                "sequence classification head object changed during HF checkpoint loading"
+            )
+            assert tuple(id(param) for param in classification_head.parameters()) == classification_param_ids, (
+                "sequence classification head parameters changed during HF checkpoint loading"
+            )
+
+
+def release_sequence_classification_lm_heads(model) -> None:
+    """Drop any unregistered Bridge LM-head references after checkpoint
+    load."""
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is not None and hasattr(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR):
+            object.__delattr__(owner, _RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+
+
 @contextlib.contextmanager
 def use_critic_lm_head_for_hf_load(model):
     """Temporarily restore the stashed LM head for HF Bridge weight loading.
@@ -1114,6 +1211,49 @@ def _ddp_owns_param(model_chunk: torch.nn.Module, param: torch.nn.Parameter) -> 
             if mapping is not None and param in mapping:
                 return True
     return False
+
+
+def validate_sequence_classification_head_registration(model, optimizer, args) -> tuple[int, ...]:
+    """Verify shape, trainability, live-model registration, and DDP
+    ownership."""
+    del optimizer  # DistributedOptimizer shards ownership; DDP is the stable registration contract.
+    classification_head_param_ids = []
+
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        classification_head = owner.output_layer
+        assert isinstance(classification_head, LinearForLastLayer), (
+            "sequence classification output layer must be LinearForLastLayer, "
+            f"got {type(classification_head).__name__}"
+        )
+        expected_shape = (int(args.num_labels), owner.config.hidden_size)
+        assert tuple(classification_head.weight.shape) == expected_shape, (
+            f"sequence classification head weight must have shape {expected_shape}, "
+            f"got {tuple(classification_head.weight.shape)}"
+        )
+        assert classification_head.bias is None, "sequence classification head must use bias=False"
+
+        registered_param_ids = {id(param) for param in model_chunk.parameters()}
+        for name, param in classification_head.named_parameters(recurse=False):
+            param_name = f"output_layer.{name}"
+            assert param.requires_grad, f"sequence classification head parameter {param_name} is frozen"
+            assert id(param) in registered_param_ids, (
+                f"sequence classification head parameter {param_name} is not registered in the live model"
+            )
+            assert _ddp_owns_param(model_chunk, param), (
+                f"DDP does not own sequence classification head parameter {param_name}"
+            )
+            classification_head_param_ids.append(id(param))
+
+    from megatron.core import mpu
+
+    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        assert classification_head_param_ids, "sequence classification head was not found on the final pipeline stage"
+    else:
+        assert not classification_head_param_ids, "sequence classification head exists on a non-final pipeline stage"
+    return tuple(classification_head_param_ids)
 
 
 def validate_critic_value_head_registration(model, optimizer) -> tuple[int, ...]:

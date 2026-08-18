@@ -40,7 +40,11 @@ from relax.utils.megatron_peft_utils import (
     summarize_lora_modules,
 )
 from relax.utils.misc import load_function
-from relax.utils.training.ppo_utils import install_critic_value_head_in_provider
+from relax.utils.training.ppo_utils import (
+    ensure_sequence_classification_head_trainable,
+    install_critic_value_head_in_provider,
+    install_sequence_classification_head_in_provider,
+)
 
 from .conditional_branch_sync import install_conditional_branch_sync
 
@@ -225,11 +229,14 @@ def get_model_provider_func(
             configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
+            install_sequence_classification_head_in_provider(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
             return model
 
+        if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
+            wrapped_model_provider = wrap_model_provider_with_lora(wrapped_model_provider, args)
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
@@ -356,6 +363,13 @@ def get_model_provider_func(
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
+            install_sequence_classification_head_in_provider(
+                model,
+                args,
+                role,
+                post_process,
+                stash_lm_head=True,
+            )
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
@@ -470,6 +484,7 @@ def get_model_provider_func(
 
         configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
+        install_sequence_classification_head_in_provider(model, args, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)
         install_conditional_branch_sync(args, model)
@@ -535,6 +550,7 @@ def wrap_model_provider_with_lora(original_provider, args):
             if scope != "all":
                 peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
             model = peft(model, training=True)
+            ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
             gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0
             adapter_names = [n for n, _ in model.named_parameters() if is_lora_adapter_param(n)]
             by_role = summarize_lora_modules(adapter_names)
@@ -598,6 +614,7 @@ def wrap_model_provider_with_freeze(original_provider, args):
             model = original_provider(pre_process=pre_process, post_process=post_process)
 
         freeze_model_params(model, args)
+        ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
 
         return model
 
