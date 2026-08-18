@@ -148,8 +148,9 @@ def _make_engine(sglang_engine_module):
     return engine
 
 
-def test_missing_load_format_choices_uses_legacy_remote(sglang_engine_module):
-    assert sglang_engine_module._preferred_s3_stream_load_format() == "remote"
+def test_missing_load_format_choices_fails_closed(sglang_engine_module):
+    with pytest.raises(RuntimeError, match="cannot report whether runai_streamer is supported"):
+        sglang_engine_module._preferred_s3_stream_load_format()
 
 
 def test_unregister_uses_registration_worker_id_once(monkeypatch, sglang_engine_module):

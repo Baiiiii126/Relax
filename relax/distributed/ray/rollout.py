@@ -51,7 +51,10 @@ from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
-from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.s3_model_loader import (
+    build_runai_streamer_env_for_load,
+    prepare_model_maybe_update_args,
+)
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -515,6 +518,17 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
+            effective_load_format = self.sglang_overrides.get(
+                "load_format", getattr(self.args, "sglang_load_format", "auto")
+            )
+            env_vars.update(
+                build_runai_streamer_env_for_load(
+                    getattr(self.args, "model_source", None),
+                    effective_model_path,
+                    effective_load_format,
+                )
+            )
             if getattr(self.args, "fp16", False):
                 env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
 

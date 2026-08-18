@@ -1843,3 +1843,16 @@ index 82db90da3b..efb1d5e7f7 100644
          "torch_npu.",
      }
  
+diff --git a/python/sglang/srt/utils/hf_transformers/processor.py b/python/sglang/srt/utils/hf_transformers/processor.py
+index 7dd000c3abc5b7cc8090bed21aa2461bc35ec1e4..38dfa7f0f2163c052ce7311f315355e39e9adb51 100644
+--- a/python/sglang/srt/utils/hf_transformers/processor.py
++++ b/python/sglang/srt/utils/hf_transformers/processor.py
+@@ -153,6 +153,8 @@ def get_processor(
+ 
+     revision = kwargs.pop("revision", tokenizer_revision)
+     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
++    if model_name is not None:
++        model_name = resolve_runai_obj_uri(model_name)
+ 
+     if is_mistral_model(tokenizer_name):
+         config = load_mistral_config(

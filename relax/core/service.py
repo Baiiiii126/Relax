@@ -32,6 +32,8 @@ class Service:
         data_source: Optional[Any] = None,
         actor_rollout_pgs: Optional[Any] = None,
         runtime_env=None,
+        *,
+        defer_deploy: bool = False,
     ) -> None:
         """Service wrapper that deploys a Ray Serve deployment.
 
@@ -44,6 +46,7 @@ class Service:
             data_source: Optional data source actor or factory used by rollout.
             actor_rollout_pgs: Optional placement group for colocated actor-rollout.
             runtime_env: Optional Ray runtime environment dict for the service.
+            defer_deploy: Allocate resources without deploying until ``deploy`` is called.
         """
         logger.info(
             f"[{role}] Initializing service with num_gpus={num_gpus}, actor_rollout_pgs={actor_rollout_pgs is not None}"
@@ -56,6 +59,7 @@ class Service:
         self.data_source = data_source
         self.runtime_env = runtime_env
         self._is_shared_pgs = actor_rollout_pgs is not None
+        self._deployed = False
         self._task_ref: Optional[Any] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
@@ -71,8 +75,16 @@ class Service:
         self.pgs = pgs
         logger.info(f"[{role}] Placement group initialized: {pgs}")
 
-        self._deploy(pgs)
-        logger.info(f"[{role}] Service deployed successfully")
+        if not defer_deploy:
+            self.deploy()
+
+    def deploy(self) -> None:
+        """Deploy a prepared service exactly once."""
+        if self._deployed:
+            raise RuntimeError(f"[{self.role}] Service has already been deployed")
+        self._deploy(self.pgs)
+        self._deployed = True
+        logger.info(f"[{self.role}] Service deployed successfully")
 
     def _deploy(self, pgs: Optional[Any] = None) -> None:
         """Bind and deploy the Ray Serve deployment with the given placement

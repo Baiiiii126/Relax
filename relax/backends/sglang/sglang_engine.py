@@ -19,11 +19,11 @@ from sglang.srt.utils import kill_process_tree
 
 
 try:
-    from sglang.srt.server_args import LOAD_FORMAT_CHOICES
+    from sglang.srt.server_args import LOAD_FORMAT_CHOICES as _SGLANG_LOAD_FORMAT_CHOICES
 except ImportError:
-    # Older SGLang releases expose the legacy remote loader but not the shared
-    # choices constant. Keep module import compatible with those releases.
-    LOAD_FORMAT_CHOICES = ("remote",)
+    # Older SGLang releases do not expose the supported load formats. Keep
+    # imports working, but fail closed if S3 streaming is requested.
+    _SGLANG_LOAD_FORMAT_CHOICES = None
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
@@ -56,23 +56,21 @@ _MIN_HTTP_TIMEOUT_S = 1.0
 
 
 def _preferred_s3_stream_load_format() -> str:
-    if "runai_streamer" in LOAD_FORMAT_CHOICES:
+    if _SGLANG_LOAD_FORMAT_CHOICES is None:
+        raise RuntimeError("The installed SGLang cannot report whether runai_streamer is supported")
+    if "runai_streamer" in _SGLANG_LOAD_FORMAT_CHOICES:
         return "runai_streamer"
-    if "remote" in LOAD_FORMAT_CHOICES:
-        logger.warning("SGLang does not expose runai_streamer; falling back to the legacy remote loader")
-        return "remote"
-    raise RuntimeError("The installed SGLang does not support runai_streamer or the legacy remote loader")
+    raise RuntimeError("The installed SGLang does not support runai_streamer")
 
 
 def _configure_runai_streamer_env(args) -> None:
     model_source = args.model_source
-    if model_source.endpoint:
-        os.environ["AWS_ENDPOINT_URL"] = model_source.endpoint
-        os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = model_source.endpoint
-    if model_source.addressing_style == "path":
+    if "RUNAI_STREAMER_S3_ENDPOINT" not in os.environ:
+        endpoint = model_source.endpoint or os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+        if endpoint:
+            os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = endpoint
+    if "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING" not in os.environ and model_source.addressing_style == "path":
         os.environ["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] = "0"
-    else:
-        os.environ.pop("RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING", None)
     if model_source.credential_mode == "placeholder":
         os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
         os.environ["AWS_ACCESS_KEY_ID"] = "mock"
@@ -94,9 +92,11 @@ def build_sglang_load_plan(server_args: dict, args) -> SGLangLoadPlan:
     if model_path != model_source.uri or not is_s3_uri(model_source.uri):
         return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
 
-    if load_format in {"runai_streamer", "remote"}:
+    if load_format == "runai_streamer":
         _configure_runai_streamer_env(args)
         return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+    if load_format == "remote":
+        raise ValueError("SGLang load_format='remote' is not an S3 model loader; use 'runai_streamer' instead")
 
     cached_path = get_s3_model_cached_path(model_source.uri, args)
     if load_format == "dummy":
@@ -123,6 +123,14 @@ def _apply_sglang_policy_load_plan(server_args: dict, args) -> dict:
     resolved = dict(server_args)
     resolved["model_path"] = plan.model_path
     resolved["load_format"] = plan.load_format
+    if (
+        getattr(args, "model_source", None) is not None
+        and plan.model_path == plan.source.uri
+        and is_s3_uri(plan.source.uri)
+        and plan.load_format == "runai_streamer"
+        and not resolved.get("tokenizer_path")
+    ):
+        resolved["tokenizer_path"] = resolve_s3_model_metadata_to_shm(plan.source.uri, args)
     return resolved
 
 
