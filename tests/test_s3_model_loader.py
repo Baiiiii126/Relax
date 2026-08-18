@@ -2,11 +2,28 @@
 
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from relax.utils import s3_model_loader as m
+
+
+def _assert_cache_payload_removed(dest: str) -> None:
+    for suffix in (
+        "",
+        ".tmp",
+        ".done",
+        ".done.tmp",
+        ".metadata.done",
+        ".metadata.done.tmp",
+        ".manifest.json",
+        ".manifest.json.tmp",
+        ".tmp.manifest.json",
+        ".tmp.manifest.json.tmp",
+    ):
+        assert not os.path.exists(dest + suffix)
 
 
 def test_pre_parse_cli_model_source(monkeypatch):
@@ -19,19 +36,10 @@ def test_pre_parse_cli_model_source(monkeypatch):
             "train.py",
             "--hf-checkpoint",
             "s3://bucket/model/",
-            "--s3-model-endpoint",
-            "http://s3.example",
-            "--s3-model-use-placeholder-credentials",
-            "--s3-model-use-path-style",
         ],
     )
 
-    assert _pre_parse_cli_model_source() == m.ModelSource(
-        uri="s3://bucket/model/",
-        endpoint="http://s3.example",
-        credential_mode="placeholder",
-        addressing_style="path",
-    )
+    assert _pre_parse_cli_model_source() == m.ModelSource(uri="s3://bucket/model/")
 
 
 def test_pre_parse_cli_model_source_disabled(monkeypatch):
@@ -108,7 +116,9 @@ def test_s3_policy_auto_streams_when_shm_not_ready(monkeypatch, tmp_path):
 
     for name in (
         "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
         "AWS_EC2_METADATA_DISABLED",
+        "RUNAI_STREAMER_S3_ENDPOINT",
         "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -116,14 +126,24 @@ def test_s3_policy_auto_streams_when_shm_not_ready(monkeypatch, tmp_path):
         model_source=m.ModelSource("s3://bucket/student/", "http://s3.example", addressing_style="path"),
         s3_model_shm_root=str(tmp_path / "missing"),
     )
-    monkeypatch.setattr(sglang_engine, "LOAD_FORMAT_CHOICES", ["auto", "runai_streamer", "remote"])
+    monkeypatch.setattr(sglang_engine, "_SGLANG_LOAD_FORMAT_CHOICES", ["auto", "runai_streamer", "remote"])
+    monkeypatch.setattr(
+        sglang_engine,
+        "resolve_s3_model_metadata_to_shm",
+        lambda uri, obj: "/dev/shm/student-metadata",
+    )
 
     resolved = sglang_engine._apply_sglang_policy_load_plan(
         {"model_path": args.model_source.uri, "load_format": "auto"}, args
     )
 
-    assert resolved == {"model_path": args.model_source.uri, "load_format": "runai_streamer"}
-    assert os.environ["AWS_ENDPOINT_URL"] == "http://s3.example"
+    assert resolved == {
+        "model_path": args.model_source.uri,
+        "load_format": "runai_streamer",
+        "tokenizer_path": "/dev/shm/student-metadata",
+    }
+    assert "AWS_ENDPOINT_URL" not in os.environ
+    assert os.environ["RUNAI_STREAMER_S3_ENDPOINT"] == "http://s3.example"
     assert os.environ["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] == "0"
     assert "AWS_EC2_METADATA_DISABLED" not in os.environ
 
@@ -133,7 +153,12 @@ def test_s3_policy_auto_streams_uniformly_for_multi_node(monkeypatch):
 
     args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
     monkeypatch.setattr(sglang_engine, "get_s3_model_cached_path", lambda uri, obj: "/dev/shm/student")
-    monkeypatch.setattr(sglang_engine, "LOAD_FORMAT_CHOICES", ["auto", "runai_streamer"])
+    monkeypatch.setattr(sglang_engine, "_SGLANG_LOAD_FORMAT_CHOICES", ["auto", "runai_streamer"])
+    monkeypatch.setattr(
+        sglang_engine,
+        "resolve_s3_model_metadata_to_shm",
+        lambda uri, obj: "/dev/shm/student-metadata",
+    )
 
     resolved = sglang_engine._apply_sglang_policy_load_plan(
         {"model_path": args.model_source.uri, "load_format": "auto", "nnodes": 2}, args
@@ -143,20 +168,71 @@ def test_s3_policy_auto_streams_uniformly_for_multi_node(monkeypatch):
         "model_path": args.model_source.uri,
         "load_format": "runai_streamer",
         "nnodes": 2,
+        "tokenizer_path": "/dev/shm/student-metadata",
     }
 
 
-def test_explicit_s3_stream_does_not_require_shm_root(tmp_path):
+def test_explicit_s3_stream_uses_local_metadata_for_tokenizer(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
     config = m.ModelSource("s3://bucket/student/", "http://s3.example")
-    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path / "missing"))
+    args = SimpleNamespace(model_source=config)
+    monkeypatch.setattr(
+        sglang_engine,
+        "resolve_s3_model_metadata_to_shm",
+        lambda uri, obj: "/dev/shm/student-metadata",
+    )
 
     resolved = sglang_engine._apply_sglang_policy_load_plan(
         {"model_path": config.uri, "load_format": "runai_streamer"}, args
     )
 
-    assert resolved == {"model_path": config.uri, "load_format": "runai_streamer"}
+    assert resolved == {
+        "model_path": config.uri,
+        "load_format": "runai_streamer",
+        "tokenizer_path": "/dev/shm/student-metadata",
+    }
+
+
+def test_explicit_s3_stream_preserves_explicit_tokenizer_path(monkeypatch):
+    from relax.backends.sglang import sglang_engine
+
+    config = m.ModelSource("s3://bucket/student/", "http://s3.example")
+    args = SimpleNamespace(model_source=config)
+    monkeypatch.setattr(
+        sglang_engine,
+        "resolve_s3_model_metadata_to_shm",
+        lambda uri, obj: pytest.fail("explicit tokenizer path must not trigger metadata preparation"),
+    )
+
+    resolved = sglang_engine._apply_sglang_policy_load_plan(
+        {
+            "model_path": config.uri,
+            "load_format": "runai_streamer",
+            "tokenizer_path": "/models/tokenizer",
+        },
+        args,
+    )
+
+    assert resolved == {
+        "model_path": config.uri,
+        "load_format": "runai_streamer",
+        "tokenizer_path": "/models/tokenizer",
+    }
+
+
+def test_s3_stream_for_other_model_does_not_use_policy_metadata(monkeypatch):
+    from relax.backends.sglang import sglang_engine
+
+    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/policy/"))
+    monkeypatch.setattr(
+        sglang_engine,
+        "resolve_s3_model_metadata_to_shm",
+        lambda uri, obj: pytest.fail("another model must not use policy metadata"),
+    )
+    server_args = {"model_path": "s3://bucket/reward/", "load_format": "runai_streamer"}
+
+    assert sglang_engine._apply_sglang_policy_load_plan(server_args, args) == server_args
 
 
 def test_s3_policy_dummy_is_explicit_and_uses_shm(monkeypatch):
@@ -171,6 +247,19 @@ def test_s3_policy_dummy_is_explicit_and_uses_shm(monkeypatch):
     )
 
     assert resolved == {"model_path": "/dev/shm/student", "load_format": "dummy"}
+
+
+def test_s3_policy_remote_load_format_is_rejected():
+    from relax.backends.sglang import sglang_engine
+
+    source = m.ModelSource("s3://bucket/student/")
+    args = SimpleNamespace(model_source=source)
+
+    with pytest.raises(ValueError, match="remote.*not an S3 model loader"):
+        sglang_engine.build_sglang_load_plan(
+            {"model_path": source.uri, "load_format": "remote"},
+            args,
+        )
 
 
 def test_s3_policy_dummy_requires_shm_root(tmp_path):
@@ -200,7 +289,7 @@ def test_runai_streamer_env_overrides_stale_credentials(monkeypatch):
     assert "AWS_SESSION_TOKEN" not in os.environ
 
 
-def test_runai_streamer_env_preserves_standard_credential_chain(monkeypatch):
+def test_runai_streamer_env_preserves_standard_credential_chain_and_explicit_addressing(monkeypatch):
     from relax.backends.sglang import sglang_engine
 
     monkeypatch.setenv("RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING", "0")
@@ -209,8 +298,33 @@ def test_runai_streamer_env_preserves_standard_credential_chain(monkeypatch):
 
     sglang_engine._configure_runai_streamer_env(args)
 
-    assert "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING" not in os.environ
+    assert os.environ["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] == "0"
     assert "AWS_EC2_METADATA_DISABLED" not in os.environ
+
+
+def test_runai_streamer_env_uses_service_specific_aws_endpoint_first(monkeypatch):
+    from relax.backends.sglang import sglang_engine
+
+    monkeypatch.delenv("RUNAI_STREAMER_S3_ENDPOINT", raising=False)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://global.example")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://s3.example")
+    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
+
+    sglang_engine._configure_runai_streamer_env(args)
+
+    assert os.environ["RUNAI_STREAMER_S3_ENDPOINT"] == "http://s3.example"
+
+
+def test_runai_streamer_env_preserves_explicit_runai_endpoint(monkeypatch):
+    from relax.backends.sglang import sglang_engine
+
+    monkeypatch.setenv("RUNAI_STREAMER_S3_ENDPOINT", "http://runai.example")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://s3.example")
+    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/", "http://provider.example"))
+
+    sglang_engine._configure_runai_streamer_env(args)
+
+    assert os.environ["RUNAI_STREAMER_S3_ENDPOINT"] == "http://runai.example"
 
 
 def test_is_s3_uri():
@@ -274,9 +388,12 @@ def test_resolve_noop_for_non_selected_s3_uri():
 def test_prepare_model_maybe_update_args_updates_matching_process_private_paths(monkeypatch):
     source = m.ModelSource("s3://bucket/model/")
     args = SimpleNamespace(
+        model_source=source,
+        _model_source_original_hf_checkpoint="/models/original",
         hf_checkpoint=source.uri,
-        tokenizer_model=source.uri,
-        load="/checkpoints/resume",
+        tokenizer_model="/models/original",
+        load="/models/original",
+        ref_load="/models/original/",
     )
     local_model = m.LocalModel(source=source, path="/dev/shm/model", completeness="full")
     monkeypatch.setattr(
@@ -288,7 +405,47 @@ def test_prepare_model_maybe_update_args_updates_matching_process_private_paths(
     assert m.prepare_model_maybe_update_args(args) is local_model
     assert args.hf_checkpoint == "/dev/shm/model"
     assert args.tokenizer_model == "/dev/shm/model"
-    assert args.load == "/checkpoints/resume"
+    assert args.load == "/models/original"
+    assert args.ref_load == "/dev/shm/model"
+
+
+def test_prepare_model_maybe_update_args_remaps_selected_source_uri_without_provenance(monkeypatch):
+    source = m.ModelSource("s3://bucket/model/")
+    args = SimpleNamespace(
+        model_source=source,
+        hf_checkpoint=source.uri,
+        tokenizer_model=source.uri,
+        load=source.uri,
+        ref_load=source.uri,
+    )
+    local_model = m.LocalModel(source=source, path="/dev/shm/model", completeness="full")
+    monkeypatch.setattr(m, "prepare_local_model", lambda obj, *, completeness="full": local_model)
+
+    assert m.prepare_model_maybe_update_args(args) is local_model
+    assert args.hf_checkpoint == "/dev/shm/model"
+    assert args.tokenizer_model == "/dev/shm/model"
+    assert args.load == source.uri
+    assert args.ref_load == "/dev/shm/model"
+
+
+def test_prepare_model_maybe_update_args_preserves_distinct_model_paths(monkeypatch):
+    source = m.ModelSource("s3://bucket/packed-model/")
+    args = SimpleNamespace(
+        model_source=source,
+        _model_source_original_hf_checkpoint="/models/packed-int4",
+        hf_checkpoint=source.uri,
+        tokenizer_model="/models/tokenizer",
+        load="/checkpoints/megatron-resume",
+        ref_load="/models/bf16-reference",
+    )
+    local_model = m.LocalModel(source=source, path="/dev/shm/packed-model", completeness="full")
+    monkeypatch.setattr(m, "prepare_local_model", lambda obj, *, completeness="full": local_model)
+
+    assert m.prepare_model_maybe_update_args(args) is local_model
+    assert args.hf_checkpoint == "/dev/shm/packed-model"
+    assert args.tokenizer_model == "/models/tokenizer"
+    assert args.load == "/checkpoints/megatron-resume"
+    assert args.ref_load == "/models/bf16-reference"
 
 
 def test_prepare_local_model_metadata_does_not_restore_full_cache(monkeypatch, tmp_path):
@@ -341,9 +498,11 @@ def test_prepare_metadata_then_full_only_rewrites_load_for_full(monkeypatch):
     source = m.ModelSource("s3://bucket/model/")
     args = SimpleNamespace(
         model_source=source,
+        _model_source_original_hf_checkpoint="/models/original",
         hf_checkpoint=source.uri,
-        tokenizer_model=source.uri,
-        load=source.uri,
+        tokenizer_model="/models/original",
+        load="/models/original",
+        ref_load="/models/original",
     )
     calls = []
 
@@ -361,10 +520,12 @@ def test_prepare_metadata_then_full_only_rewrites_load_for_full(monkeypatch):
     m.prepare_model_maybe_update_args(args, completeness="metadata")
     assert args.hf_checkpoint == "/dev/shm/model"
     assert args.tokenizer_model == "/dev/shm/model"
-    assert args.load == source.uri
+    assert args.load == "/models/original"
+    assert args.ref_load == "/models/original"
 
     m.prepare_model_maybe_update_args(args, completeness="full")
-    assert args.load == "/dev/shm/model"
+    assert args.load == "/models/original"
+    assert args.ref_load == "/dev/shm/model"
     assert calls == [("metadata", source.uri), ("full", source.uri)]
 
 
@@ -482,6 +643,9 @@ def test_download_model_metadata_to_shm_once_skips_weights(tmp_path, monkeypatch
     assert (tmp_path / "model" / "processor.bin").is_file()
     assert (tmp_path / "model" / "audio_processor.npy").is_file()
     assert (tmp_path / "model.metadata.done").read_text() == "s3://bkt/pfx/\nendpoint=http://s3.example"
+    manifest = m._read_model_manifest(dest, "s3://bkt/pfx/\nendpoint=http://s3.example")
+    assert manifest is not None
+    assert m._manifest_files_complete(dest, manifest, kind="metadata")
 
 
 def test_download_model_metadata_to_shm_once_checks_available_capacity(tmp_path, monkeypatch):
@@ -493,6 +657,67 @@ def test_download_model_metadata_to_shm_once_checks_available_capacity(tmp_path,
         m._download_model_metadata_to_shm_once(
             "s3://bkt/pfx/", str(tmp_path / "model"), endpoint=None, workers=1, retries=0
         )
+    _assert_cache_payload_removed(str(tmp_path / "model"))
+
+
+def test_download_model_metadata_to_shm_once_cleans_failed_download(tmp_path, monkeypatch):
+    dest = str(tmp_path / "model")
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_list_cli({"pfx/config.json": 2}))
+
+    def fail_metadata_download(_cli, _bucket, _keys, _prefix, staging, **kwargs):
+        if kwargs["description"] == "metadata":
+            (Path(staging) / "partial").write_bytes(b"x")
+            raise RuntimeError("injected metadata failure")
+
+    monkeypatch.setattr(m, "_download_selected_objects", fail_metadata_download)
+
+    with pytest.raises(RuntimeError, match="injected metadata failure"):
+        m._download_model_metadata_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    _assert_cache_payload_removed(dest)
+
+
+def test_download_model_metadata_to_shm_once_rolls_back_marker_failure(tmp_path, monkeypatch):
+    dest = str(tmp_path / "model")
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3({"pfx/config.json": b"{}"}))
+
+    def fail_marker(path, _identity):
+        Path(path + ".tmp").write_text("partial marker")
+        raise OSError("injected marker failure")
+
+    monkeypatch.setattr(m, "_write_ready_marker", fail_marker)
+
+    with pytest.raises(OSError, match="injected marker failure"):
+        m._download_model_metadata_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    _assert_cache_payload_removed(dest)
+
+
+def test_download_model_metadata_to_shm_once_reloads_incomplete_cache(tmp_path, monkeypatch):
+    dest = str(tmp_path / "model")
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3({"pfx/config.json": b"{}"}))
+
+    m._download_model_metadata_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    os.remove(os.path.join(dest, "config.json"))
+    m._download_model_metadata_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+
+    assert Path(dest, "config.json").read_bytes() == b"{}"
+
+
+def test_download_model_metadata_to_shm_once_rejects_manifest_without_metadata(tmp_path, monkeypatch):
+    dest = str(tmp_path / "model")
+    os.makedirs(dest)
+    Path(dest, "model.safetensors").write_bytes(b"weights")
+    m._write_model_manifest(
+        dest,
+        "s3://bkt/pfx/",
+        [("pfx/model.safetensors", len(b"weights"))],
+        "pfx/",
+    )
+    Path(dest + ".metadata.done").write_text("s3://bkt/pfx/")
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3({}))
+
+    with pytest.raises(RuntimeError, match="no objects under"):
+        m._download_model_metadata_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    _assert_cache_payload_removed(dest)
 
 
 def test_download_prefix_size_mismatch_raises(tmp_path, monkeypatch):
@@ -662,7 +887,7 @@ def test_download_model_to_shm_once_marker_hit_skips_precheck(tmp_path, monkeypa
     assert called == {"client": 0, "dl": 0}
 
 
-def test_download_model_to_shm_once_migrates_legacy_marker_without_redownload(tmp_path, monkeypatch):
+def test_download_model_to_shm_once_replaces_legacy_cache_atomically(tmp_path, monkeypatch):
     objects = {"pfx/config.json": b"{}", "pfx/model.safetensors": b"weights"}
     dest = str(tmp_path / "relax_model_legacy")
     os.makedirs(dest, exist_ok=True)
@@ -672,11 +897,13 @@ def test_download_model_to_shm_once_migrates_legacy_marker_without_redownload(tm
         marker_file.write("s3://bkt/pfx/")
 
     monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3(objects))
-    monkeypatch.setattr(
-        m,
-        "_download_prefix",
-        lambda *args, **kwargs: pytest.fail("a complete legacy cache must not be downloaded again"),
-    )
+
+    def download(_bucket, _prefix, staging, **_kwargs):
+        os.makedirs(staging, exist_ok=True)
+        for key, body in objects.items():
+            (Path(staging) / key[len("pfx/") :]).write_bytes(body)
+
+    monkeypatch.setattr(m, "_download_prefix", download)
 
     m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
 
@@ -685,20 +912,65 @@ def test_download_model_to_shm_once_migrates_legacy_marker_without_redownload(tm
     assert {entry["path"] for entry in manifest["files"]} == {"config.json", "model.safetensors"}
 
 
-def test_download_model_to_shm_once_precheck_uses_missing_bytes(tmp_path, monkeypatch):
-    # 全量 200 > free，但本地已存在同 size 文件后 missing=100 <= free → 应通过
+def test_download_model_to_shm_once_rolls_back_manifest_publish_failure(tmp_path, monkeypatch):
+    dest = str(tmp_path / "model")
+    objects = {"pfx/config.json": b"{}"}
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3(objects))
+
+    def download(_bucket, _prefix, staging, **_kwargs):
+        os.makedirs(staging, exist_ok=True)
+        Path(staging, "config.json").write_bytes(b"{}")
+
+    original_replace = m.os.replace
+
+    def fail_manifest_publish(src, dst):
+        if src == dest + ".tmp.manifest.json" and dst == dest + ".manifest.json":
+            raise OSError("injected manifest publish failure")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+    monkeypatch.setattr(m.os, "replace", fail_manifest_publish)
+
+    with pytest.raises(OSError, match="injected manifest publish failure"):
+        m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    _assert_cache_payload_removed(dest)
+
+
+def test_download_model_to_shm_once_rolls_back_marker_failure(tmp_path, monkeypatch):
+    dest = str(tmp_path / "model")
+    objects = {"pfx/config.json": b"{}"}
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3(objects))
+
+    def download(_bucket, _prefix, staging, **_kwargs):
+        os.makedirs(staging, exist_ok=True)
+        Path(staging, "config.json").write_bytes(b"{}")
+
+    def fail_marker(path, _identity):
+        Path(path + ".tmp").write_text("partial marker")
+        raise OSError("injected marker failure")
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+    monkeypatch.setattr(m, "_write_ready_marker", fail_marker)
+
+    with pytest.raises(OSError, match="injected marker failure"):
+        m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    _assert_cache_payload_removed(dest)
+
+
+def test_download_model_to_shm_once_precheck_does_not_resume_partial_cache(tmp_path, monkeypatch):
     dest = tmp_path / "relax_model_y"
     dest.mkdir()
     (dest / "a.bin").write_bytes(b"x" * 100)  # 预置与远端 size 一致
 
     monkeypatch.setattr(m, "_make_s3_client", lambda **kw: _fake_list_cli({"pfx/a.bin": 100, "pfx/b.bin": 100}))
-    monkeypatch.setattr(m, "_free_bytes", lambda p: 150)  # full=200 会拒，missing=100 应过
+    monkeypatch.setattr(m, "_free_bytes", lambda p: 150)
 
     dl = {"n": 0}
     monkeypatch.setattr(m, "_download_prefix", lambda *a, **k: dl.__setitem__("n", dl["n"] + 1))
 
-    m._download_model_to_shm_once("s3://bkt/pfx/", str(dest), endpoint=None, workers=1, retries=0)
-    assert dl["n"] == 1  # 预检通过，进入下载
+    with pytest.raises(RuntimeError, match="Insufficient SHM capacity"):
+        m._download_model_to_shm_once("s3://bkt/pfx/", str(dest), endpoint=None, workers=1, retries=0)
+    assert dl["n"] == 0
 
 
 def test_download_model_to_shm_once_precheck_normalizes_prefix(tmp_path, monkeypatch):
@@ -707,7 +979,13 @@ def test_download_model_to_shm_once_precheck_normalizes_prefix(tmp_path, monkeyp
     monkeypatch.setattr(m, "_make_s3_client", lambda **kw: cli)
     monkeypatch.setattr(m, "_free_bytes", lambda p: 100)  # 兄弟前缀若算入则必拒
     dl = {"n": 0}
-    monkeypatch.setattr(m, "_download_prefix", lambda *a, **k: dl.__setitem__("n", dl["n"] + 1))
+
+    def download(_bucket, _prefix, staging, **_kwargs):
+        dl["n"] += 1
+        os.makedirs(staging, exist_ok=True)
+        Path(staging, "a.bin").write_bytes(b"x" * 10)
+
+    monkeypatch.setattr(m, "_download_prefix", download)
 
     dest = str(tmp_path / "relax_model_z")
     m._download_model_to_shm_once("s3://bkt/pfx", dest, endpoint=None, workers=1, retries=0)  # 注意 uri 无尾 /
@@ -750,7 +1028,24 @@ def test_get_cached_path_returns_none_when_shm_root_is_missing(tmp_path):
     assert m.get_s3_model_cached_path(config.uri, args) is None
 
 
-def test_cleanup_s3_model_weights_preserves_metadata_and_invalidates_full_cache(tmp_path):
+def test_get_cached_path_requires_complete_manifest(tmp_path):
+    config = m.ModelSource("s3://bucket/model/")
+    args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
+    os.makedirs(dest)
+    Path(dest, "config.json").write_bytes(b"{}")
+    Path(dest + ".done").write_text(config.uri)
+
+    assert m.get_s3_model_cached_path(config.uri, args) is None
+
+    m._write_model_manifest(dest, config.uri, [("model/config.json", 2)], "model/")
+    assert m.get_s3_model_cached_path(config.uri, args) == dest
+
+    Path(dest, "config.json").unlink()
+    assert m.get_s3_model_cached_path(config.uri, args) is None
+
+
+def test_cleanup_s3_model_weights_preserves_metadata_and_invalidates_full_cache(tmp_path, monkeypatch):
     config = m.ModelSource("s3://bucket/model/", "http://s3.example")
     args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
@@ -785,6 +1080,15 @@ def test_cleanup_s3_model_weights_preserves_metadata_and_invalidates_full_cache(
     assert not os.path.exists(os.path.join(dest, "model-00001-of-00002.safetensors"))
     assert not os.path.exists(os.path.join(dest, "subdir", "pytorch_model.bin"))
     assert m.get_s3_model_cached_path(config.uri, args) is None
+
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: pytest.fail("metadata cache must be reusable"))
+    m._download_model_metadata_to_shm_once(
+        config.uri,
+        dest,
+        endpoint=config.endpoint,
+        workers=1,
+        retries=0,
+    )
 
 
 def test_cleanup_s3_model_weights_finishes_interrupted_cleanup(tmp_path):
@@ -909,3 +1213,120 @@ def test_resolve_endpoint_comes_from_platform_config():
         model_source = m.ModelSource("s3://bucket/model/", "http://from-platform")
 
     assert m._resolve_endpoint(A()) == "http://from-platform"
+
+
+def test_resolve_endpoint_uses_standard_aws_environment(monkeypatch):
+    class A:
+        model_source = m.ModelSource("s3://bucket/model/")
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://global.example")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://s3.example")
+
+    assert m._resolve_endpoint(A()) == "http://s3.example"
+
+
+def test_resolve_endpoint_falls_back_to_global_aws_environment(monkeypatch):
+    class A:
+        model_source = m.ModelSource("s3://bucket/model/")
+
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://global.example")
+
+    assert m._resolve_endpoint(A()) == "http://global.example"
+
+
+def test_remove_stale_s3_model_caches_only_removes_relax_namespace(tmp_path):
+    cache = tmp_path / "relax_model_0123456789abcdef"
+    cache.mkdir()
+    (cache / "model.safetensors").write_bytes(b"weights")
+    (tmp_path / "relax_model_0123456789abcdef.done").write_text("ready")
+    (tmp_path / "relax_model_0123456789abcdef.state.json").write_text("state")
+    (tmp_path / "relax_model_0123456789abcdef.state.json.tmp").write_text("temporary state")
+    (tmp_path / "relax_model_0123456789abcdef.tmp.manifest.json").write_text("staging manifest")
+    (tmp_path / "relax_model_0123456789abcdef.tmp.manifest.json.tmp").write_text("temporary manifest")
+    unrelated = tmp_path / "another_model_cache"
+    unrelated.mkdir()
+    (unrelated / "keep.bin").write_bytes(b"keep")
+    similar = tmp_path / "relax_model_not-a-digest"
+    similar.mkdir()
+
+    args = SimpleNamespace(s3_model_shm_root=str(tmp_path))
+    removed_entries, removed_bytes = m.remove_stale_s3_model_caches(args)
+
+    assert removed_entries == 6
+    assert removed_bytes == (
+        len(b"weights")
+        + len("ready")
+        + len("state")
+        + len("temporary state")
+        + len("staging manifest")
+        + len("temporary manifest")
+    )
+    assert not cache.exists()
+    assert not (tmp_path / "relax_model_0123456789abcdef.done").exists()
+    assert not (tmp_path / "relax_model_0123456789abcdef.state.json").exists()
+    assert not (tmp_path / "relax_model_0123456789abcdef.state.json.tmp").exists()
+    assert not (tmp_path / "relax_model_0123456789abcdef.tmp.manifest.json").exists()
+    assert not (tmp_path / "relax_model_0123456789abcdef.tmp.manifest.json.tmp").exists()
+    assert (tmp_path / "relax_model_0123456789abcdef.lock").is_file()
+    assert (unrelated / "keep.bin").read_bytes() == b"keep"
+    assert similar.is_dir()
+
+
+def test_remove_stale_s3_model_caches_missing_root_is_noop(tmp_path):
+    args = SimpleNamespace(s3_model_shm_root=str(tmp_path / "missing"))
+
+    assert m.remove_stale_s3_model_caches(args) == (0, 0)
+
+
+def test_remove_stale_s3_model_caches_rescans_after_acquiring_existing_lock(tmp_path, monkeypatch):
+    base = "relax_model_0123456789abcdef"
+    (tmp_path / f"{base}.lock").touch()
+    original_acquire = m._acquire_cleanup_lock
+
+    def acquire_then_publish(lock_file):
+        original_acquire(lock_file)
+        cache = tmp_path / base
+        cache.mkdir()
+        (cache / "late.safetensors").write_bytes(b"late")
+        (tmp_path / f"{base}.done").write_text("ready")
+
+    monkeypatch.setattr(m, "_acquire_cleanup_lock", acquire_then_publish)
+
+    assert m.remove_stale_s3_model_caches(SimpleNamespace(s3_model_shm_root=str(tmp_path))) == (
+        2,
+        len(b"late") + len("ready"),
+    )
+    assert not (tmp_path / base).exists()
+    assert not (tmp_path / f"{base}.done").exists()
+
+
+def test_build_runai_streamer_env_for_load_is_early_copy_overlay():
+    source = m.ModelSource(
+        "s3://bucket/model/",
+        "http://provider.example",
+        credential_mode="placeholder",
+        addressing_style="path",
+    )
+    current = {"AWS_ACCESS_KEY_ID": "original"}
+
+    overlay = m.build_runai_streamer_env_for_load(source, source.uri, "runai_streamer", current)
+
+    assert current == {"AWS_ACCESS_KEY_ID": "original"}
+    assert overlay == {
+        "RUNAI_STREAMER_S3_ENDPOINT": "http://provider.example",
+        "AWS_ENDPOINT_URL": "http://provider.example",
+        "AWS_ENDPOINT_URL_S3": "http://provider.example",
+        "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING": "0",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "AWS_ACCESS_KEY_ID": "mock",
+        "AWS_SECRET_ACCESS_KEY": "mock",
+        "AWS_SESSION_TOKEN": "",
+    }
+
+
+@pytest.mark.parametrize("load_format", ["dummy", "remote", "full"])
+def test_build_runai_streamer_env_for_load_ignores_unsupported_formats(load_format):
+    source = m.ModelSource("s3://bucket/model/", "http://provider.example")
+
+    assert m.build_runai_streamer_env_for_load(source, source.uri, load_format, {}) == {}

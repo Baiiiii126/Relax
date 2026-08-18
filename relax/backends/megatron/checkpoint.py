@@ -2,6 +2,7 @@
 
 import os
 import re
+from argparse import Namespace
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from relax.utils import megatron_bridge_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 from relax.utils.logging_utils import get_logger
+from relax.utils.model_source import is_model_source_alias
 from relax.utils.training.ppo_utils import use_critic_lm_head_for_hf_load
 
 
@@ -229,20 +231,24 @@ def _patch_scatter_dtype_cast():
         dist.scatter = original_scatter
 
 
-def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
-    assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
-    from megatron.bridge import AutoBridge
-
+def _select_hf_load_source(args: Namespace, load_path: str | None) -> str:
+    """Choose an HF source after Megatron resume has been ruled out."""
     # Prefer ref_load (if it's an HF dir) over hf_checkpoint on fallback. INT4 QAT
     # runs set --hf-checkpoint to a compressed-tensors packed dir that the bridge
     # cannot read; --ref-load points at the BF16 HF dir that it can. Mirrors the
     # `args.load = args.ref_load or args.hf_checkpoint` remap in arguments.py.
     if load_path is not None:
-        source_path = load_path
-    elif args.ref_load and _is_hf_checkpoint(args.ref_load):
-        source_path = args.ref_load
-    else:
-        source_path = args.hf_checkpoint
+        return args.hf_checkpoint if is_model_source_alias(args, load_path) else load_path
+    if args.ref_load and _is_hf_checkpoint(args.ref_load):
+        return args.ref_load
+    return args.hf_checkpoint
+
+
+def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
+    assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
+    from megatron.bridge import AutoBridge
+
+    source_path = _select_hf_load_source(args, load_path)
     logger.info(
         f"Load checkpoint from HuggingFace model into Megatron (requested_path={load_path}, source_path={source_path})"
     )

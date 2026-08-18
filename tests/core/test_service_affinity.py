@@ -173,3 +173,28 @@ def test_service_forwards_enable_affinity_true():
     """config.enable_affinity=True -> node_group_affinity=True."""
     mock_cpg = _build_service(Namespace(enable_affinity=True))
     mock_cpg.assert_called_once_with(num_gpus=2, node_group_affinity=True)
+
+
+def test_service_deferred_deploy_keeps_placement_group_ownership():
+    pgs = ("service-owned-pg", [0], [0])
+    with (
+        patch("relax.core.service.create_placement_group", return_value=pgs) as mock_cpg,
+        patch.object(Service, "_deploy", return_value=None) as mock_deploy,
+    ):
+        service = Service(
+            cls=MagicMock(),
+            role="actor",
+            healthy=MagicMock(),
+            config=Namespace(enable_affinity=True),
+            num_gpus=1,
+            defer_deploy=True,
+        )
+        mock_deploy.assert_not_called()
+        service.deploy()
+
+    assert service.pgs is pgs
+    mock_cpg.assert_called_once_with(num_gpus=1, node_group_affinity=True)
+    mock_deploy.assert_called_once_with(pgs)
+
+    with pytest.raises(RuntimeError, match="already been deployed"):
+        service.deploy()

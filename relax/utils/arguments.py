@@ -400,7 +400,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--disable-s3-model-download",
                 action="store_true",
                 default=False,
-                help="Disable Relax-managed S3-to-SHM model materialization",
+                help="Disable Relax-managed S3 model loading, including registered model-source providers",
             )
             parser.add_argument(
                 "--disable-s3-model-cleanup",
@@ -422,24 +422,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "S3 model SHM root; it must already exist on every model consumer node, "
                     "otherwise loading fails without falling back to disk"
                 ),
-            )
-            parser.add_argument(
-                "--s3-model-endpoint",
-                type=str,
-                default=None,
-                help="Optional endpoint URL for an S3-compatible model store",
-            )
-            parser.add_argument(
-                "--s3-model-use-placeholder-credentials",
-                action="store_true",
-                default=False,
-                help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
-            )
-            parser.add_argument(
-                "--s3-model-use-path-style",
-                action="store_true",
-                default=False,
-                help="Use path-style addressing for an S3-compatible model store",
             )
             parser.add_argument(
                 "--custom-model-provider-path",
@@ -2750,45 +2732,21 @@ def _pre_parse_cli_model_source():
     parser.add_argument(
         "--disable-s3-model-download",
         action="store_true",
-        help="Disable Relax-managed S3-to-SHM model materialization",
-    )
-    parser.add_argument(
-        "--s3-model-endpoint",
-        help="Optional endpoint URL for an S3-compatible model store",
-    )
-    parser.add_argument(
-        "--s3-model-use-placeholder-credentials",
-        action="store_true",
-        help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
-    )
-    parser.add_argument(
-        "--s3-model-use-path-style",
-        action="store_true",
-        help="Use path-style addressing for an S3-compatible model store",
+        help="Disable Relax-managed S3 model loading, including registered model-source providers",
     )
     pre, _ = parser.parse_known_args()
     if pre.disable_s3_model_download or not is_s3_uri(pre.hf_checkpoint):
         return None
-    return ModelSource(
-        uri=pre.hf_checkpoint,
-        endpoint=pre.s3_model_endpoint,
-        credential_mode="placeholder" if pre.s3_model_use_placeholder_credentials else "default",
-        addressing_style="path" if pre.s3_model_use_path_style else "auto",
-    )
+    return ModelSource(uri=pre.hf_checkpoint)
 
 
 def parse_args(add_custom_arguments=None):
     """Parse Relax arguments with an optional registered model source."""
-    from relax.utils.model_source import apply_model_source_to_argv, resolve_model_source
+    from relax.utils.model_source import resolve_model_source
 
-    original_argv = sys.argv
-    provider_source = resolve_model_source(original_argv)
-    if provider_source is not None:
-        sys.argv = apply_model_source_to_argv(original_argv, provider_source)
-    try:
-        return _parse_args_impl(add_custom_arguments, provider_source=provider_source)
-    finally:
-        sys.argv = original_argv
+    cli_source = _pre_parse_cli_model_source()
+    provider_source = None if _s3_model_download_disabled() else resolve_model_source(sys.argv)
+    return _parse_args_impl(add_custom_arguments, model_source=provider_source or cli_source)
 
 
 def _reject_removed_mtp_detach_flags(argv: list[str]) -> None:
@@ -2798,13 +2756,18 @@ def _reject_removed_mtp_detach_flags(argv: list[str]) -> None:
             raise ValueError(f"{option} has been removed; use --mtp-detach-paths instead.")
 
 
-def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
+def _s3_model_download_disabled() -> bool:
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--disable-s3-model-download", action="store_true")
+    pre, _ = parser.parse_known_args()
+    return pre.disable_s3_model_download
+
+
+def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     from relax.utils.s3_model_loader import is_s3_uri
 
     _reject_removed_mtp_detach_flags(sys.argv[1:])
-
-    model_source = provider_source or _pre_parse_cli_model_source()
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
@@ -2827,6 +2790,7 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
+        model_source=model_source,
         skip_hf_validate=(
             pre.debug_rollout_only
             or pre.skip_hf_validate
