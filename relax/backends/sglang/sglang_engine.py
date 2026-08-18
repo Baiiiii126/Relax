@@ -1324,6 +1324,16 @@ class GenRMEngine(SGLangEngine):
             logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
 
 
+def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
+    if getattr(args, "enable_mtp_training", False):
+        return False
+
+    speculative_algorithm = getattr(args, "sglang_speculative_algorithm", None)
+    if sglang_overrides and "speculative_algorithm" in sglang_overrides:
+        speculative_algorithm = sglang_overrides["speculative_algorithm"]
+    return speculative_algorithm is not None
+
+
 def _compute_genrm_server_args(
     args,
     rank,
@@ -1380,8 +1390,7 @@ def _compute_genrm_server_args(
         # "max_total_tokens": args.genrm_engine_config['max_total_tokens'],
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": False,
-        # always enable draft weights cpu backup so that we run training without mtp weights.
-        "enable_draft_weights_cpu_backup": True,
+        "enable_draft_weights_cpu_backup": _enable_draft_weights_cpu_backup(args, args.genrm_engine_config),
         # GenRM Only
         "enable_weights_cpu_backup": True,
         # The global load format belongs to policy rollout engines. GenRM must
@@ -1486,8 +1495,9 @@ def _compute_server_args(
         "ep_size": args.sglang_ep_size,
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
-        # always enable draft weights cpu backup so that we run training without mtp weights.
-        "enable_draft_weights_cpu_backup": True,
+        # MTP training syncs draft weights from the actor; otherwise only speculative
+        # rollout needs draft weights backup for checkpoints without MTP weights.
+        "enable_draft_weights_cpu_backup": _enable_draft_weights_cpu_backup(args, sglang_overrides),
         "enable_metrics": True,
     }
 
