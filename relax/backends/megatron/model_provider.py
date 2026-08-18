@@ -4,6 +4,7 @@
 import argparse
 import inspect
 import json
+import logging
 import os
 import pickle
 import re
@@ -24,9 +25,20 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
-from relax.utils.device import is_npu_available
+from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import build_lora_peft, count_adapter_parameters, is_lora_enabled
+from relax.utils.megatron_peft_utils import (
+    _lora_module_key,
+    build_lora_peft,
+    count_adapter_parameters,
+    install_gdn_gate_mask_hooks,
+    is_lora_adapter_mode,
+    is_lora_adapter_param,
+    is_lora_enabled,
+    is_lora_merge_mode,
+    scope_target_modules_to_region,
+    summarize_lora_modules,
+)
 from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import install_critic_value_head_in_provider
 
@@ -470,6 +482,31 @@ def get_model_provider_func(
     return model_provider
 
 
+def _global_vision_lora_count(local_count: int, args) -> int:
+    """Max vision-region LoRA module count across all ranks (adapter mode
+    only).
+
+    The vision tower lives on a single PP stage, so only some ranks can observe it.
+    A rank-local check would raise on those ranks while the rest marched on into the
+    next collective and hung, so the count is all-reduced first and every rank then
+    reaches the same verdict.
+
+    Gated on adapter mode, which is uniform across ranks — no rank can skip the
+    collective while another enters it. Returns ``local_count`` unchanged when
+    ``torch.distributed`` is not initialized (single-process tests).
+    """
+    if not is_lora_adapter_mode(args):
+        return 0
+    if not dist.is_initialized():
+        return local_count
+    group = dist.group.WORLD
+    # NCCL/HCCL cannot reduce a CPU tensor; gloo cannot reduce an accelerator one.
+    on_cpu = dist.get_backend(group) == "gloo"
+    count = torch.tensor([local_count], dtype=torch.int32, device="cpu" if on_cpu else make_current_torch_device())
+    dist.all_reduce(count, op=dist.ReduceOp.MAX, group=group)
+    return int(count.item())
+
+
 def wrap_model_provider_with_lora(original_provider, args):
     """Wrap model provider to add LoRA support.
 
@@ -491,21 +528,55 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             peft = build_lora_peft(args)
+            # Restrict adapter injection to the requested model region (e.g. language-only
+            # for VL models). Overriding target_modules post-construction is supported:
+            # PEFT.__call__ rebuilds its matcher state from the current target_modules.
+            scope = getattr(args, "lora_scope", "all")
+            if scope != "all":
+                peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
             model = peft(model, training=True)
+            gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0
+            adapter_names = [n for n, _ in model.named_parameters() if is_lora_adapter_param(n)]
+            by_role = summarize_lora_modules(adapter_names)
+            vision_wrapped = _global_vision_lora_count(by_role.get("vision", 0), args)
             if dist.is_initialized() and dist.get_rank() == 0:
                 adapter_params, total_params, percentage = count_adapter_parameters(model)
+                mode = "adapter" if is_lora_adapter_mode(args) else ("merge" if is_lora_merge_mode(args) else "plain")
                 logger.info(
-                    f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
-                    f"adapter_params={adapter_params:,} ({percentage:.2f}% of {total_params:,} total)"
+                    "LoRA enabled: mode=%s scope=%s rank=%d alpha=%d dropout=%s targets=%s | "
+                    "wrapped modules by role (rank0-local): %s | adapter_params=%s (%.2f%% of %s total)",
+                    mode,
+                    scope,
+                    args.lora_rank,
+                    args.lora_alpha,
+                    args.lora_dropout,
+                    list(args.lora_target_modules),
+                    by_role,
+                    f"{adapter_params:,}",
+                    percentage,
+                    f"{total_params:,}",
+                )
+                if gdn_gate_masked:
+                    logger.info(
+                        "LoRA: pinned the GDN in_proj adapter's b/a (gate) rows to zero on %d "
+                        "module(s); SGLang hosts the delta on the fused in_proj_qkvz slices only.",
+                        gdn_gate_masked,
+                    )
+                if logger.isEnabledFor(logging.DEBUG):
+                    for module_name in sorted({_lora_module_key(n) for n in adapter_names}):
+                        logger.debug("LoRA wrapped module: %s", module_name)
+            if vision_wrapped:
+                raise ValueError(
+                    f"LoRA adapter mode wrapped {vision_wrapped} vision-region module(s) (scope={scope}). "
+                    "SGLang hosts LoRA on language-model layers only, so this adapter would be trained "
+                    "but silently dropped before rollout, breaking the on-policy assumption. Pass "
+                    "--lora-scope language, or use --lora-merge-mode (which folds the vision adapter "
+                    "into the synced base weights)."
                 )
         except RuntimeError:
             # build_lora_peft already raises a clear upgrade-hint message when the
             # Megatron-Bridge image lacks PEFT support; don't shadow it.
             raise
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to create LoRA (PEFT) wrapper. Ensure Megatron-Bridge PEFT utilities are available: {e}"
-            ) from e
 
         return model
 

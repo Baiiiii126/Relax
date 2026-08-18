@@ -50,6 +50,13 @@ from relax.utils.data.stream_dataloader import (
 )
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.env import Envs
+from relax.utils.megatron_peft_utils import (
+    is_lora_adapter_mode,
+    is_lora_adapter_param,
+    is_lora_enabled,
+    is_lora_merge_mode,
+    summarize_lora_modules,
+)
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.opd.opd_utils import (
@@ -231,6 +238,27 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
+        if is_lora_enabled(args) and dist.get_rank() == 0:
+            self._log_lora_checkpoint_state()
+
+        # MoE LoRA expert fold: forward-only reference models (actor_fwd / reference) receive each
+        # grouped-expert weight ALREADY folded (base + delta) into its base slot via DCS (see
+        # DeviceDirectBackend._update_expert_weight_from_distributed). This holds in BOTH rollout
+        # paths: merge mode always folds, and adapter mode folds on the actor_fwd pass (the rollout
+        # gets the pure adapter via SGLang instead). Their own grouped-expert LoRA adapters are never
+        # re-synced, so they must contribute nothing — otherwise the effective weight would be
+        # base + 2*delta. Zero them here, after the checkpoint load (a resume otherwise restores
+        # trained adapters with linear_out != 0). Non-expert adapters are kept: those ARE re-synced
+        # raw each step and carry the delta for the non-expert path. Colocate/hybrid keep the
+        # reference in-process (role stays "actor"), so this never fires there.
+        if (
+            role in ("actor_fwd", "reference")
+            and is_lora_enabled(args)
+            and (is_lora_merge_mode(args) or is_lora_adapter_mode(args))
+            and args.num_experts
+        ):
+            self._zero_expert_lora_adapters()
+
         # Train-state offload for colocate sleep/wake. Picks torch_memory_saver
         # (VMM pause) or manual selective CPU offload based on TMS availability;
         # both implementations live in the offloader. No-op when offload_train is off.
@@ -382,6 +410,57 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
         return start_rollout_id
+
+    @torch.no_grad()
+    def _log_lora_checkpoint_state(self) -> None:
+        """Log (rank 0) the LoRA adapter state right after checkpoint load.
+
+        Answers "which LoRA was loaded": counts adapter params by architectural
+        role, and reports RESUMED (adapters non-zero -> loaded from a trained
+        checkpoint) vs FRESH (all-zero -> newly initialized). Detection keys on
+        ``linear_out``/``lora_B`` which init to zero; the ``.any()`` GPU sync
+        runs once at init on rank 0 and short-circuits once a non-zero is
+        found.
+        """
+        adapter_names: list[str] = []
+        resumed = False
+        for chunk in self.model:
+            for name, param in chunk.named_parameters():
+                if not is_lora_adapter_param(name):
+                    continue
+                adapter_names.append(name)
+                if not resumed and ("linear_out" in name or ".lora_B." in name):
+                    resumed = bool(param.detach().abs().any().item())
+        logger.info(
+            "LoRA checkpoint state (role=%s): %d adapter params, wrapped modules by role (rank0-local)=%s | %s",
+            self.role,
+            len(adapter_names),
+            summarize_lora_modules(adapter_names),
+            "RESUMED from checkpoint (adapters non-zero)" if resumed else "FRESH init (adapters zero)",
+        )
+
+    @torch.no_grad()
+    def _zero_expert_lora_adapters(self) -> None:
+        """Zero every grouped-expert LoRA adapter param on this (reference)
+        model.
+
+        Used for MoE on the actor_fwd / reference roles in BOTH rollout paths
+        (merge mode always; adapter mode on the actor_fwd fold pass): their
+        expert weights arrive pre-folded (base + delta) in the base slot and
+        their expert adapters are never re-synced, so the adapters must stay at
+        zero to avoid double-counting the delta. Covers both
+        ``.adapter.linear_in``/``.adapter.linear_out`` (Megatron-Bridge) and
+        the shared/per-expert packing (2D or 3D) transparently — a zero tensor
+        of either shape yields a zero delta. Non-expert adapters are left
+        untouched.
+        """
+        zeroed = 0
+        for chunk in self.model:
+            for name, param in chunk.named_parameters():
+                if ".experts." in name and is_lora_adapter_param(name):
+                    param.data.zero_()
+                    zeroed += 1
+        logger.info("[LoRA] zeroed %d grouped-expert adapter params on role=%s", zeroed, self.role)
 
     @timer
     def sleep(self) -> None:

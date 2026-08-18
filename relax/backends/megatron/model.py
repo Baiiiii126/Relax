@@ -1244,6 +1244,24 @@ def train_one_step(
         loss_reduced = {}
         values = values.tolist()
         num_samples_or_tokens = values[0]
+        if num_samples_or_tokens == 0:
+            # Degenerate / zero-signal batch: every micro-batch across all DP ranks contributed
+            # zero loss-normalising units. This happens when the whole batch carries no learning
+            # signal — e.g. every GRPO group has identical reward (zero advantage), all tokens are
+            # masked out by TIS rejection sampling, or the batch is entirely dummy-padded. The
+            # optimizer step above already ran as a (near) no-op on the zero gradients, so this only
+            # affects the *reported* metrics: return zeros instead of dividing by zero and killing
+            # the run. This is a stopgap robustness guard; the proper upstream fix (drop zero-variance
+            # groups + oversample so such batches never form) is tracked in
+            # docs/draft/degenerate_batch_zerodivision.md.
+            logger.warning(
+                "train_one_step: num_samples_or_tokens == 0 (degenerate/zero-signal batch); "
+                "reporting zero loss for this step instead of dividing by zero. keys=%s",
+                keys,
+            )
+            for key in keys:
+                loss_reduced[key] = 0.0
+            return loss_reduced, grad_norm
         for key, value in zip(keys, values[1:], strict=False):
             # No cp_size factor: num_samples_or_tokens is the all-reduced CP-local
             # token count (per-token) or sample count, so each token/sample is

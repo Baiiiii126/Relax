@@ -61,7 +61,7 @@ def sglang_engine_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "relax.utils.logging_utils", logging_utils)
 
     megatron_peft_utils = ModuleType("relax.utils.megatron_peft_utils")
-    megatron_peft_utils.convert_megatron_to_hf_target_modules = lambda value: value
+    megatron_peft_utils.convert_megatron_to_sglang_target_modules = lambda value: value
     megatron_peft_utils.is_lora_enabled = lambda _args: False
     monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
 
