@@ -231,6 +231,50 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("n_real", [1, 3, 4, 5, 8])
+async def test_classification_eval_pads_without_dropping_real_samples(n_real):
+    from relax.components.sft import SFT
+
+    samples = [
+        ProcessedSample(
+            tokens=torch.tensor([idx + 1, 99], dtype=torch.long),
+            loss_mask=torch.ones(1, dtype=torch.long),
+            total_length=2,
+            multimodal_train_inputs=None,
+            source_idx=idx,
+            classification_label=torch.tensor(idx % 2, dtype=torch.long),
+        )
+        for idx in range(n_real)
+    ]
+    fake_client = MagicMock()
+    fake_client.async_put = AsyncMock(return_value=None)
+
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = SimpleNamespace(
+        eval_interval=1,
+        global_batch_size=4,
+        task_type="seq_cls",
+        multimodal_keys=None,
+        sft_eval_chunk_drain_timeout_sec=1,
+    )
+    sft.step = 0
+    sft.data_system_client = fake_client
+    sft._logger_instance = MagicMock()
+    sft._build_eval_batches = MagicMock(return_value=samples)
+    sft._wait_for_partition_drained = AsyncMock(return_value=True)
+
+    await sft._maybe_produce_eval()
+
+    expected_chunks = (n_real + 3) // 4
+    assert fake_client.async_put.await_count == expected_chunks
+    weights = torch.cat([call.kwargs["data"]["sample_weights"] for call in fake_client.async_put.call_args_list])
+    assert weights.tolist() == [1.0] * n_real + [0.0] * (expected_chunks * 4 - n_real)
+    partition_ids = [call.kwargs["partition_id"] for call in fake_client.async_put.call_args_list]
+    assert partition_ids == [f"sft_eval_0_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
+
+
+@pytest.mark.asyncio
 async def test_sft_loop_advances_step(monkeypatch):
     from relax.components.sft import SFT
 

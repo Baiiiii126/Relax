@@ -41,6 +41,18 @@ def test_sft_data_fields_excludes_rl_only_keys():
         assert forbidden not in fields, f"SFT data_fields leaked RL key: {forbidden}"
 
 
+def test_sequence_classification_sft_requests_classification_labels():
+    from relax.utils.training.data_fields import build_data_fields
+
+    args = _mk_actor_args(loss_type="sft")
+    args.task_type = "seq_cls"
+
+    fields = build_data_fields(args)
+
+    assert "classification_labels" in fields
+    assert "sample_weights" not in fields
+
+
 def test_rl_data_fields_unchanged():
     """RL path must keep the existing field set."""
     from relax.utils.training.data_fields import build_data_fields

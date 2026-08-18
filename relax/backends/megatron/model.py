@@ -41,7 +41,9 @@ from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
     maybe_verify_critic_value_head_movement,
     release_critic_lm_heads,
+    release_sequence_classification_lm_heads,
     validate_critic_value_head_registration,
+    validate_sequence_classification_head_registration,
 )
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -761,6 +763,8 @@ def forward_only(
                 "total_lengths",
                 "response_lengths",
                 "max_seq_lens",
+                "classification_labels",
+                "sample_weights",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -842,6 +846,8 @@ def forward_only(
             loss_masks=batch.get("loss_masks", None),
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+            classification_labels=batch.get("classification_labels", None),
+            sample_weights=batch.get("sample_weights", None),
         )
 
         if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
@@ -1016,6 +1022,7 @@ def train_one_step(
                     "total_lengths",
                     "response_lengths",
                     "loss_masks",
+                    "classification_labels",
                     "log_probs",
                     "ref_log_probs",
                     "values",
@@ -1768,8 +1775,11 @@ def initialize_model_and_optimizer(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     value_head_param_ids = ()
+    classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
+    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+        classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
     clear_memory()
     iteration, _ = load_checkpoint(
         model,
@@ -1785,6 +1795,14 @@ def initialize_model_and_optimizer(
             "critic value head parameter identities changed during checkpoint loading"
         )
         install_critic_value_head_runtime_check(model)
+    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+        release_sequence_classification_lm_heads(model)
+        loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
+            model, optimizer, args
+        )
+        assert loaded_classification_head_param_ids == classification_head_param_ids, (
+            "sequence classification head parameter identities changed during checkpoint loading"
+        )
     clear_memory()
 
     return model, optimizer, opt_param_scheduler, iteration

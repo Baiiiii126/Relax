@@ -1259,6 +1259,91 @@ def sft_loss_function(
     )
 
 
+def get_sequence_classification_outputs(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, list[int]]:
+    """Pool one classification logit vector per sample on the owning CP
+    rank."""
+    local_logits: list[torch.Tensor] = []
+    local_indices: list[int] = []
+    for sample_idx, (logits_chunk, _) in enumerate(
+        get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+            max_seq_lens=batch.get("max_seq_lens", None),
+            padded_total_lengths=batch.get("padded_total_lengths", None),
+            apply_temperature=False,
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
+    ):
+        if logits_chunk.shape[0] == 0:
+            continue
+        if logits_chunk.shape != (1, int(args.num_labels)):
+            raise ValueError(
+                "sequence classification pooling expected one logit vector with shape "
+                f"(1, {args.num_labels}), got {tuple(logits_chunk.shape)} for sample {sample_idx}"
+            )
+        local_logits.append(logits_chunk.squeeze(0))
+        local_indices.append(sample_idx)
+
+    if not local_logits:
+        return logits.new_empty((0, int(args.num_labels))), local_indices
+    return torch.stack(local_logits, dim=0), local_indices
+
+
+def sequence_classification_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute single-label CE or multi-label BCE on last-valid-token
+    logits."""
+    labels = batch.get("classification_labels")
+    if labels is None:
+        raise ValueError("sequence classification batch is missing classification_labels")
+
+    metric_name = "accuracy" if args.problem_type == "single_label_classification" else "subset_accuracy"
+    local_logits, local_indices = get_sequence_classification_outputs(args, batch, logits)
+    if local_indices:
+        local_labels = [labels[i] for i in local_indices]
+        if args.problem_type == "single_label_classification":
+            label_tensor = torch.stack([torch.as_tensor(label).reshape(()) for label in local_labels]).to(
+                device=local_logits.device, dtype=torch.long
+            )
+            per_sample_loss = F.cross_entropy(local_logits, label_tensor, reduction="none")
+            per_sample_correct = (local_logits.argmax(dim=-1) == label_tensor).float()
+        else:
+            label_tensor = torch.stack([torch.as_tensor(label).reshape(-1) for label in local_labels]).to(
+                device=local_logits.device, dtype=torch.float32
+            )
+            if label_tensor.shape != local_logits.shape:
+                raise ValueError(
+                    f"multi-label targets must have shape {tuple(local_logits.shape)}, got {tuple(label_tensor.shape)}"
+                )
+            per_sample_loss = F.binary_cross_entropy_with_logits(
+                local_logits,
+                label_tensor,
+                reduction="none",
+            ).mean(dim=-1)
+            predictions = torch.sigmoid(local_logits) >= args.classification_threshold
+            per_sample_correct = predictions.eq(label_tensor.bool()).all(dim=-1).float()
+
+        loss = sum_of_sample_mean(per_sample_loss)
+        accuracy = sum_of_sample_mean(per_sample_correct)
+    else:
+        loss = logits.sum() * 0.0
+        accuracy = logits.detach().sum() * 0.0
+
+    return loss, {"loss": loss.detach(), metric_name: accuracy.detach()}
+
+
 def sft_loss_function_chunked(
     args: Namespace,
     batch: RolloutBatch,
@@ -1392,7 +1477,9 @@ def loss_function(
             case "value_loss":
                 func = value_loss_function
             case "sft":
-                if getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
+                if getattr(args, "task_type", "causal_lm") == "seq_cls":
+                    func = sequence_classification_loss_function
+                elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
                     # Bind lm_head_forward so chunked path matches the standard
                     # inner-func signature; outer body (recompute, CP guard,
                     # Megatron scaling, return-tuple) is then shared with legacy.
@@ -1460,9 +1547,11 @@ def loss_function(
         # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
+    is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+    metric_count = effective_num_tokens if args.calculate_per_token_loss or is_sequence_classification else num_samples
     log_values = torch.tensor(
         [
-            num_samples if not args.calculate_per_token_loss else effective_num_tokens,
+            metric_count,
         ]
         + list(log.values()),
         device=logits.device,

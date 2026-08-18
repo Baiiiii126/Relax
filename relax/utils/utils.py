@@ -260,6 +260,18 @@ def dict_to_tensordict(
     for key, value in data.items():
         if not isinstance(value, list):
             raise TypeError(f"Value for key '{key}' must be a list, got {type(value)}")
+        if key == "classification_labels":
+            depth = _nesting_depth(value)
+            if depth == 1:
+                result[key] = torch.tensor(value, dtype=torch.long, device=device)
+            elif depth == 2:
+                result[key] = torch.tensor(value, dtype=torch.float32, device=device)
+            else:
+                raise ValueError(
+                    "classification_labels must be scalar class ids or fixed-width multi-hot vectors; "
+                    f"got nesting depth {depth}"
+                )
+            continue
         if key == "rollout_routed_experts":
             # Flatten 3D numpy (seq_i, num_layers, topk) -> 2D tensor (seq_i, num_layers*topk)
             # so NestedTensor jagged layout can handle variable seq_len efficiently.
