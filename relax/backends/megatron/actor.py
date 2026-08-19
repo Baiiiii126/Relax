@@ -89,6 +89,7 @@ from .checkpoint import load_checkpoint
 from .collective_utils import _agree_drained
 from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
 from .data import (
+    ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
     build_rollout_minibatch_plan,
@@ -127,6 +128,26 @@ def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
         chunks.append(values[start : start + c])
         start += c
     return chunks
+
+
+def _rollout_mini_row_counts(
+    sample_indices: list[int],
+    identities_per_mini: int,
+    num_rollout_minis: int,
+) -> list[int]:
+    identity_positions = {
+        sample_index: position for position, sample_index in enumerate(dict.fromkeys(sample_indices))
+    }
+    expected_identity_count = identities_per_mini * num_rollout_minis
+    if len(identity_positions) != expected_identity_count:
+        raise RuntimeError(
+            "debug rollout logical sample count does not match rollout mini plan: "
+            f"expected={expected_identity_count}, got={len(identity_positions)}."
+        )
+    counts = [0 for _ in range(num_rollout_minis)]
+    for sample_index in sample_indices:
+        counts[identity_positions[sample_index] // identities_per_mini] += 1
+    return counts
 
 
 def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
@@ -724,18 +745,15 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 plan = build_rollout_minibatch_plan(self.args, dp_size)
                 batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
-                rollout_mini_local_sample_counts = [
-                    plan.mini_local_sample_request for _ in range(plan.num_rollout_minis)
-                ]
+                rollout_mini_local_sample_counts = None
             rollout_data = get_debug_data(self.args, rollout_id, batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, rollout_data)
-            if rollout_mini_local_sample_counts is not None:
-                if sum(rollout_mini_local_sample_counts) != len(rollout_data["total_lengths"]):
-                    raise RuntimeError(
-                        "debug rollout data size does not match rollout mini plan: "
-                        f"counts={rollout_mini_local_sample_counts}, "
-                        f"num_local_samples={len(rollout_data['total_lengths'])}"
-                    )
+            if not is_sft_mode(self.args):
+                rollout_mini_local_sample_counts = _rollout_mini_row_counts(
+                    rollout_data["sample_indices"],
+                    plan.mini_local_sample_request,
+                    plan.num_rollout_minis,
+                )
                 rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
 
             if self.role == "critic":
@@ -799,12 +817,6 @@ class MegatronTrainRayActor(TrainRayActor):
                         return self.train_critic(rollout_id, rollout_data)
                     else:
                         return self.train_actor(rollout_id, rollout_data)
-                if len(rollout_data["total_lengths"]) != batch_size:
-                    raise RuntimeError(
-                        f"rollout mini batch local size mismatch for rollout_id={rollout_id}, "
-                        f"batch_index={batch_index - 1}: expected {batch_size}, "
-                        f"got {len(rollout_data['total_lengths'])}."
-                    )
                 rollout_mini_batches.append(rollout_data)
                 rollout_mini_batch_metas.append(batch_meta)
                 rollout_mini_local_sample_counts.append(len(rollout_data["total_lengths"]))
@@ -818,6 +830,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_data = concat_rollout_batches(rollout_mini_batches)
                 rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
                 rollout_data[ROLLOUT_MINI_BATCH_METAS_KEY] = rollout_mini_batch_metas
+                if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
+                    rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = [dynamic_size]
                 if self.role == "critic":
                     return self.train_critic(rollout_id, rollout_data)
                 else:
@@ -1221,20 +1235,18 @@ class MegatronTrainRayActor(TrainRayActor):
                     RoutingReplay.clear_all_forward()
 
     @staticmethod
-    def _split_rollout_batch(rollout_data: RolloutBatch, num_chunks: int) -> List[RolloutBatch]:
-        """Split a merged rollout batch (dict of per-sample lists) into at most
-        ``num_chunks`` roughly equal sub-batches along the sample dimension.
+    def _split_rollout_batch(rollout_data: RolloutBatch, sample_counts: list[int]) -> List[RolloutBatch]:
+        """Split a merged rollout batch along explicit sample boundaries.
 
         Keys whose value is not a per-sample list are copied into every chunk
         unchanged. Used by the debug_train_only path to feed the collected-
         sub-batch forward loop (one global batch per chunk).
         """
         num_samples = len(rollout_data["tokens"])
-        num_chunks = max(1, min(num_chunks, num_samples))
-        chunk_size = (num_samples + num_chunks - 1) // num_chunks
         chunks: List[RolloutBatch] = []
-        for start in range(0, num_samples, chunk_size):
-            end = min(start + chunk_size, num_samples)
+        start = 0
+        for sample_count in sample_counts:
+            end = start + sample_count
             chunk: RolloutBatch = {}
             for key, value in rollout_data.items():
                 if isinstance(value, list) and len(value) == num_samples:
@@ -1242,6 +1254,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     chunk[key] = value
             chunks.append(chunk)
+            start = end
         return chunks
 
     def _use_streaming_fwd(self) -> bool:
@@ -1335,6 +1348,10 @@ class MegatronTrainRayActor(TrainRayActor):
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
         rollout_mini_local_sample_counts: list[int] = []
+
+        def mark_rollout_mini_boundary(sub_batch: RolloutBatch) -> None:
+            sub_batch[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [len(sub_batch["total_lengths"])]
+
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -1345,12 +1362,13 @@ class MegatronTrainRayActor(TrainRayActor):
             full_batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
             debug_data = get_debug_data(self.args, rollout_id, full_batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, debug_data)
-            for sub_batch in self._split_rollout_batch(debug_data, plan.num_rollout_minis):
-                if len(sub_batch["total_lengths"]) != batch_size:
-                    raise RuntimeError(
-                        f"debug rollout mini batch local size mismatch for train_hybrid({rollout_id}): "
-                        f"expected {batch_size}, got {len(sub_batch['total_lengths'])}."
-                    )
+            debug_mini_row_counts = _rollout_mini_row_counts(
+                debug_data["sample_indices"],
+                plan.mini_local_sample_request,
+                plan.num_rollout_minis,
+            )
+            for sub_batch in self._split_rollout_batch(debug_data, debug_mini_row_counts):
+                mark_rollout_mini_boundary(sub_batch)
                 self._hybrid_forward_subbatch(sub_batch)
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
@@ -1364,7 +1382,7 @@ class MegatronTrainRayActor(TrainRayActor):
             loop_start = time.monotonic()
             last_progress = loop_start
             last_warn = loop_start
-            while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id):
+            while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id, streaming=True):
                 data_fields = [
                     "tokens",
                     "total_lengths",
@@ -1372,7 +1390,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     "loss_masks",
                     "rollout_log_probs",
                     "rewards",
-                    "raw_reward",
+                    "sample_indices",
+                    "sample_index_mask_sums",
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.multimodal_keys is not None:
@@ -1402,12 +1421,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 batch_index += 1
 
                 # Forward passes on this sub-batch (small memory footprint)
-                if len(sub_batch["total_lengths"]) != batch_size:
-                    raise RuntimeError(
-                        f"rollout mini batch local size mismatch for train_hybrid({rollout_id}), "
-                        f"batch_index={batch_index - 1}: expected {batch_size}, "
-                        f"got {len(sub_batch['total_lengths'])}."
-                    )
+                mark_rollout_mini_boundary(sub_batch)
                 self._hybrid_forward_subbatch(sub_batch)
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
@@ -1555,7 +1569,8 @@ class MegatronTrainRayActor(TrainRayActor):
             "returns",
             "rollout_log_probs",
             "rewards",
-            "raw_reward",
+            "sample_indices",
+            "sample_index_mask_sums",
         ]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).

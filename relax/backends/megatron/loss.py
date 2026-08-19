@@ -578,8 +578,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
-        # TODO: is the copy necessary?
-        advantages = [r for r in returns]  # noqa: C416
+        advantages = returns.copy()
 
     elif args.advantage_estimator == "ppo":
         old_rewards = rewards
@@ -1021,8 +1020,8 @@ def policy_loss_function(
             tis_func = vanilla_tis_function
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
 
-        # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
-        # modified_response_masks will be sliced with cp in get_sum_of_sample_mean
+        # Rebuild with the modified numerator mask while preserving the original
+        # logical-sample denominator. The masks are sliced with CP in the reducer.
         sum_of_sample_mean = get_sum_of_sample_mean(
             total_lengths,
             response_lengths,
@@ -1033,6 +1032,7 @@ def policy_loss_function(
             padded_total_lengths,
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+            sample_denoms=batch.get("sample_index_mask_sums", None),
         )
         if is_reinforce_plus_plus:
             sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(
@@ -1436,7 +1436,9 @@ def loss_function(
         - `normalizer` is `num_tokens` (scalar tensor) if
           `args.calculate_per_token_loss` is True, else `1` (int).
         - `logging_dict` has keys "keys" (list of str metric names) and
-          "values" (1D tensor: [count, metric1, metric2, ...]).
+          "values" (1D tensor: [denominator, metric1, metric2, ...]). The
+          denominator is the token count for per-token loss and a zero
+          placeholder for sample-mean loss.
     """
     # CP-local token count (tokens whose loss this rank actually contributes).
     # Summed across the CP group in finalize_model_grads / the metric all-reduce,
@@ -1454,7 +1456,6 @@ def loss_function(
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
-    num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1466,6 +1467,7 @@ def loss_function(
         batch.get("padded_total_lengths", None),
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        sample_denoms=batch.get("sample_index_mask_sums", None),
     )
 
     if getattr(args, "mtp_only_training", False):
@@ -1548,14 +1550,16 @@ def loss_function(
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
     is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
-    metric_count = effective_num_tokens if args.calculate_per_token_loss or is_sequence_classification else num_samples
-    log_values = torch.tensor(
-        [
-            metric_count,
-        ]
-        + list(log.values()),
-        device=logits.device,
+    denominator = (
+        effective_num_tokens
+        if args.calculate_per_token_loss or is_sequence_classification
+        else torch.zeros_like(num_tokens)
     )
+    metric_values = [
+        value.to(logits.device) if isinstance(value, torch.Tensor) else torch.tensor(value, device=logits.device)
+        for value in log.values()
+    ]
+    log_values = torch.stack([denominator] + metric_values)
     if is_dummy:
         # Drop this mb's contribution from logged metric averages.
         log_values = torch.zeros_like(log_values)

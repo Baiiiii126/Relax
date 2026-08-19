@@ -1,43 +1,27 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Ray glue for program-aware admission.
 
-Houses the single-writer :class:`AdmissionBudgetCoordinator` actor, the Ray-backed
-:class:`RayBudgetClient` the shards depend on, and a background poller that reconciles the
-execution-token ledger from each engine's Prometheus ``/metrics``. All budget math lives in
-the pure :class:`~relax.agentic.session.admission.BudgetState`; this module only adds Ray,
-HTTP, and the wall clock.
-
-Atomicity: the coordinator is an asyncio actor and every ledger mutation
-(:meth:`reserve`/:meth:`release`/reconcile) is synchronous with no ``await`` in the middle,
-so on the single event loop they cannot interleave — the same guarantee shard 0's semaphore
-gives the request permit.
-"""
+"""Runtime-owned global admission queue for agentic backend attempts."""
 
 from __future__ import annotations
 
 import asyncio
 import re
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 import ray
 
-from relax.agentic.session.admission import BudgetState, WorkerSnapshot
+from relax.agentic.session.admission import AdmissionAction, AdmissionReason, BudgetState, GrantResult, WorkerSnapshot
 from relax.utils.http_utils import router_worker_base_urls
-from relax.utils.logging_utils import get_logger
 
 
-logger = get_logger(__name__)
-
-ADMISSION_BUDGET_COORDINATOR_NAME = "agentic_admission_budget_coordinator"
-
-# KV-pool gauges we read from each engine's Prometheus /metrics. SGLang replicates
-# these once per (tp_rank/pp_rank/...) label with an identical per-engine value, so the
-# generic ``parse_prometheus_metrics`` (which SUMS same-name lines) inflates absolute
-# gauges by the TP degree. These are per-engine pool readings, not additive shards, so we
-# aggregate by MAX across label sets instead — which also yields a conservative worst-case
-# pressure under dp-attention.
+_RECONCILE_INTERVAL_S = 2.0
+_LEASE_TTL_S = 600.0
+_METRICS_TIMEOUT_S = 5.0
+_MAX_CONCURRENCY = 131072
 _KV_GAUGE_NAMES = (
     "sglang:max_total_num_tokens",
     "sglang:num_used_tokens",
@@ -47,228 +31,331 @@ _KV_GAUGE_NAMES = (
 _PROM_LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+(.+)$")
 
 
-def _parse_engine_kv_gauges(text: str) -> dict[str, float]:
-    """Aggregate the KV-pool gauges we need by MAX across label sets.
+@dataclass
+class _Waiter:
+    ticket_id: str
+    tokens: int
+    enqueued_at: float
+    result: asyncio.Future[dict[str, Any]]
 
-    See :data:`_KV_GAUGE_NAMES`: summing TP-replicated ``max_total_num_tokens``
-    (as the generic parser does) would over-count capacity by the TP degree and
-    deflate the derived usage ratio by the same factor, so a saturated engine
-    reads as nearly idle. Taking the max per gauge is correct for the
-    replicated capacity and conservative for pressure.
-    """
+
+def _parse_engine_kv_gauges(text: str) -> dict[str, float]:
     gauges: dict[str, float] = {}
-    for line in text.strip().split("\n"):
+    for line in text.split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         match = _PROM_LINE_RE.match(line)
-        if not match:
-            continue
-        name = match.group(1)
-        if name not in _KV_GAUGE_NAMES:
+        if match is None or match.group(1) not in _KV_GAUGE_NAMES:
             continue
         try:
             value = float(match.group(2))
         except ValueError:
             continue
-        prev = gauges.get(name)
-        gauges[name] = value if prev is None else max(prev, value)
+        name = match.group(1)
+        gauges[name] = max(gauges.get(name, value), value)
     return gauges
 
 
-@ray.remote
-class AdmissionBudgetCoordinator:
-    """Single logical writer for cluster-wide execution-token reservations.
+def _decision(
+    action: AdmissionAction,
+    reason: AdmissionReason,
+    *,
+    ticket_id: str,
+    tokens: int,
+    lease_id: str | None = None,
+    owner_epoch: int = -1,
+    wait_s: float = 0.0,
+) -> dict[str, Any]:
+    return {
+        "action": action.value,
+        "reason": reason.value,
+        "ticket_id": ticket_id,
+        "reservation_tokens": tokens,
+        "lease_id": lease_id,
+        "owner_epoch": owner_epoch,
+        "wait_s": wait_s,
+    }
 
-    Wraps one pure :class:`BudgetState`. A background poller scrapes engine
-    ``/metrics`` every reconcile interval to refresh the ceiling and per-worker
-    pressure and to expire stale leases. Fails open: when signals are
-    stale/absent the ledger reports ``degraded`` and callers bypass to the
-    existing request limiter.
-    """
 
-    def __init__(self, *, args: Any) -> None:
-        self._router_ip = getattr(args, "sglang_router_ip", None)
-        self._router_port = getattr(args, "sglang_router_port", None)
-        self._reconcile_interval_s = max(0.1, float(getattr(args, "agentic_admission_reconcile_interval_s", 2.0)))
-        # A snapshot is "stale" after a few missed reconciles; then reserve() degrades to bypass.
-        staleness_s = max(self._reconcile_interval_s * 3.0, 5.0)
+@ray.remote(max_concurrency=_MAX_CONCURRENCY)
+class AdmissionCoordinator:
+    """Single-writer token ledger and FIFO waiter queue shared by all
+    Shards."""
+
+    def __init__(self, args: Any) -> None:
+        self._router_ip = args.sglang_router_ip
+        self._router_port = args.sglang_router_port
+        self._max_wait_s = float(args.agentic_admission_max_wait_s)
         self._state = BudgetState(
-            headroom=float(getattr(args, "agentic_admission_headroom", 0.90)),
-            pressure_threshold=float(getattr(args, "agentic_admission_pressure_threshold", 0.92)),
-            emergency_reserve_frac=float(getattr(args, "agentic_admission_emergency_reserve_frac", 0.05)),
-            lease_ttl_s=float(getattr(args, "agentic_admission_lease_ttl_s", 600.0)),
-            staleness_s=staleness_s,
+            headroom=float(args.agentic_admission_headroom),
+            pressure_threshold=float(args.agentic_admission_pressure_threshold),
+            lease_ttl_s=_LEASE_TTL_S,
+            staleness_s=max(3 * _RECONCILE_INTERVAL_S, 5.0),
         )
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
-        self._poll_task: asyncio.Task | None = None
-        self._last_reconcile_ok = False
+        self._waiters: dict[str, _Waiter] = {}
+        self._waiter_order: deque[str] = deque()
+        self._cancelled_tickets: dict[str, float] = {}
+        self._counters: dict[str, float] = {}
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(_METRICS_TIMEOUT_S))
+        self._poll_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
-        """Do one immediate reconcile (reduce cold warmup) and launch the
-        poller."""
-        try:
-            await self._reconcile_once()
-        except Exception as exc:
-            logger.warning("Admission coordinator initial reconcile failed: %s", exc)
-        self._ensure_poller()
+        await self._reconcile_once()
+        self._poll_task = asyncio.create_task(self._poll_loop(), name="agentic-admission-reconcile")
 
-    def _ensure_poller(self) -> None:
-        if self._poll_task is None or self._poll_task.done():
-            self._poll_task = asyncio.create_task(self._poll_loop())
+    async def acquire(self, request: dict[str, Any]) -> dict[str, Any]:
+        ticket_id = str(request["ticket_id"])
+        tokens = max(0, int(request["reservation_tokens"]))
+        if self._cancelled_tickets.pop(ticket_id, None) is not None:
+            return _decision(AdmissionAction.BYPASS, AdmissionReason.CANCELLED, ticket_id=ticket_id, tokens=tokens)
+        if bool(request.get("protected")):
+            self._increment("bypass")
+            self._increment("bypass_protected")
+            return _decision(AdmissionAction.BYPASS, AdmissionReason.PROTECTED, ticket_id=ticket_id, tokens=tokens)
 
-    async def reserve(self, req: dict) -> dict:
-        self._ensure_poller()
-        now = time.monotonic()
-        self._state.expire_ttl(now)
-        grant = self._state.reserve(
-            tokens=int(req.get("tokens", 0)),
-            dispatch_id=str(req.get("dispatch_id", "")),
-            admission_decision_id=str(req.get("admission_decision_id", "")),
-            aged=bool(req.get("aged", False)),
-            now=now,
+        lease = self._state.lease_for_ticket(ticket_id)
+        if lease is not None:
+            return _decision(
+                AdmissionAction.ADMIT,
+                AdmissionReason.CAPACITY_AVAILABLE,
+                ticket_id=ticket_id,
+                tokens=lease.tokens,
+                lease_id=lease.lease_id,
+                owner_epoch=lease.owner_epoch,
+            )
+        waiter = self._waiters.get(ticket_id)
+        if waiter is not None and waiter.tokens != tokens:
+            raise RuntimeError(f"admission ticket {ticket_id!r} was retried with a different reservation")
+        if waiter is None:
+            if not self._waiters:
+                immediate = self._state.reserve(ticket_id=ticket_id, tokens=tokens, now=time.monotonic())
+                if immediate.granted or immediate.reason is AdmissionReason.DEGRADED:
+                    return self._finish_grant(ticket_id, immediate)
+            waiter = _Waiter(ticket_id, tokens, time.monotonic(), asyncio.get_running_loop().create_future())
+            self._waiters[ticket_id] = waiter
+            self._waiter_order.append(ticket_id)
+            self._increment("wait")
+            self._drain_waiters()
+        return await waiter.result
+
+    async def cancel(self, ticket_id: str) -> None:
+        waiter = self._waiters.pop(ticket_id, None)
+        lease = self._state.lease_for_ticket(ticket_id)
+        if waiter is not None:
+            self._increment("cancelled")
+            if not waiter.result.done():
+                waiter.result.set_result(
+                    _decision(
+                        AdmissionAction.BYPASS,
+                        AdmissionReason.CANCELLED,
+                        ticket_id=ticket_id,
+                        tokens=waiter.tokens,
+                        wait_s=time.monotonic() - waiter.enqueued_at,
+                    )
+                )
+        elif lease is None:
+            self._cancelled_tickets[ticket_id] = time.monotonic()
+        self._state.release_ticket(ticket_id)
+        self._drain_waiters()
+
+    async def release(self, lease_id: str) -> None:
+        self._state.release(lease_id)
+        self._drain_waiters()
+
+    async def metrics(self, reset: bool = False) -> dict[str, float]:
+        snapshot = self._state.snapshot(now=time.monotonic(), reset_usage_window=reset)
+        counters = self._counters.copy()
+        wait_granted = counters.pop("wait_granted", 0)
+        wait_seconds_sum = counters.pop("wait_seconds_sum", 0.0)
+        lease_expired = counters.pop("lease_expired", 0)
+        metrics = {f"admission/{key}": value for key, value in counters.items()}
+        metrics["admission/waiting"] = float(len(self._waiters))
+        if wait_granted:
+            metrics["admission/wait_seconds_mean"] = wait_seconds_sum / wait_granted
+        ceiling = float(snapshot["capacity"])
+        reserved = float(snapshot["reserved_tokens"])
+        metrics.update(
+            {
+                "budget/ceiling": ceiling,
+                "budget/reserved": reserved,
+                "budget/available_tokens": float(snapshot["available_tokens"]),
+                "budget/lease_count": float(snapshot["lease_count"]),
+                "budget/kv_token_usage_mean": float(snapshot["kv_usage_mean"]),
+                "budget/kv_token_usage_max": float(snapshot["kv_usage_max"]),
+                "budget/epoch": float(snapshot["epoch"]),
+                "budget/degraded": float(snapshot["degraded"]),
+            }
         )
-        return grant.as_dict()
+        if ceiling > 0:
+            metrics["budget/reserved_utilization"] = reserved / ceiling
+        if lease_expired:
+            metrics["budget/lease_expired"] = lease_expired
+        if reset:
+            self._counters.clear()
+        return metrics
 
-    async def release(self, lease_id: str, actual_tokens: int | None = None) -> None:
-        self._state.release(lease_id, actual_tokens=actual_tokens)
+    async def shutdown(self) -> None:
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            await asyncio.gather(self._poll_task, return_exceptions=True)
+            self._poll_task = None
+        for waiter in self._waiters.values():
+            if not waiter.result.done():
+                waiter.result.set_result(
+                    _decision(
+                        AdmissionAction.BYPASS,
+                        AdmissionReason.DEGRADED,
+                        ticket_id=waiter.ticket_id,
+                        tokens=waiter.tokens,
+                    )
+                )
+        self._waiters.clear()
+        self._waiter_order.clear()
+        self._cancelled_tickets.clear()
+        await self._client.aclose()
 
-    async def capacity_hint(self) -> dict:
-        self._ensure_poller()
-        return self._state.capacity_hint(time.monotonic())
+    def _finish_grant(self, ticket_id: str, grant: GrantResult, *, wait_s: float = 0.0) -> dict[str, Any]:
+        if grant.granted:
+            assert grant.lease_id is not None
+            self._increment("admit")
+            if wait_s:
+                self._increment("wait_granted")
+                self._increment("wait_seconds_sum", wait_s)
+            return _decision(
+                AdmissionAction.ADMIT,
+                grant.reason,
+                ticket_id=ticket_id,
+                tokens=grant.reservation_tokens,
+                lease_id=grant.lease_id,
+                owner_epoch=grant.owner_epoch,
+                wait_s=wait_s,
+            )
+        assert grant.reason is AdmissionReason.DEGRADED
+        self._increment("bypass")
+        self._increment("bypass_degraded")
+        return _decision(
+            AdmissionAction.BYPASS,
+            grant.reason,
+            ticket_id=ticket_id,
+            tokens=grant.reservation_tokens,
+            wait_s=wait_s,
+        )
 
-    async def health(self) -> dict:
-        # reset_peak drains the running usage window: health() is the once-per-step metrics read,
-        # so the returned peak/mean cover the whole step rather than the drain-instant sample.
-        hint = self._state.capacity_hint(time.monotonic(), reset_peak=True)
-        hint["last_reconcile_ok"] = self._last_reconcile_ok
-        hint["reconcile_interval_s"] = self._reconcile_interval_s
-        return hint
+    def _drain_waiters(self) -> None:
+        now = time.monotonic()
+        while self._waiter_order:
+            ticket_id = self._waiter_order[0]
+            waiter = self._waiters.get(ticket_id)
+            if waiter is None:
+                self._waiter_order.popleft()
+                continue
+            waited = now - waiter.enqueued_at
+            if waited >= self._max_wait_s:
+                self._waiter_order.popleft()
+                self._waiters.pop(ticket_id)
+                self._increment("bypass")
+                self._increment("bypass_aged")
+                waiter.result.set_result(
+                    _decision(
+                        AdmissionAction.BYPASS,
+                        AdmissionReason.AGED,
+                        ticket_id=ticket_id,
+                        tokens=waiter.tokens,
+                        wait_s=waited,
+                    )
+                )
+                continue
+            grant = self._state.reserve(ticket_id=ticket_id, tokens=waiter.tokens, now=now)
+            if not grant.granted and grant.reason is not AdmissionReason.DEGRADED:
+                break
+            self._waiter_order.popleft()
+            self._waiters.pop(ticket_id)
+            waiter.result.set_result(self._finish_grant(ticket_id, grant, wait_s=waited))
 
     async def _poll_loop(self) -> None:
         while True:
-            await asyncio.sleep(self._reconcile_interval_s)
-            try:
-                await self._reconcile_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._last_reconcile_ok = False
-                logger.warning("Admission coordinator reconcile failed: %s", exc)
+            await asyncio.sleep(_RECONCILE_INTERVAL_S)
+            await self._reconcile_once()
 
     async def _reconcile_once(self) -> None:
-        snapshots = await self._fetch_worker_snapshots()
+        try:
+            snapshots = await self._fetch_worker_snapshots()
+        except Exception:
+            snapshots = []
         now = time.monotonic()
         self._state.reconcile(snapshots, now=now)
-        self._state.expire_ttl(now)
-        self._last_reconcile_ok = True
+        expired = set(self._state.expire_ttl(now))
+        if expired:
+            self._increment("lease_expired", len(expired))
+        self._cancelled_tickets = {
+            ticket_id: cancelled_at
+            for ticket_id, cancelled_at in self._cancelled_tickets.items()
+            if now - cancelled_at <= _LEASE_TTL_S
+        }
+        self._drain_waiters()
 
     async def _fetch_worker_snapshots(self) -> list[WorkerSnapshot]:
-        if not self._router_ip or not self._router_port:
-            return []
-
-        base = f"http://{self._router_ip}:{self._router_port}"
-        raw_urls: list[str] = []
+        base_url = f"http://{self._router_ip}:{self._router_port}"
+        raw_urls: list[str]
         try:
-            resp = await self._client.get(f"{base}/workers")
-            resp.raise_for_status()
-            workers = resp.json().get("workers", [])
+            response = await self._client.get(f"{base_url}/workers")
+            response.raise_for_status()
             raw_urls = [
-                worker.get("url")
-                for worker in workers
-                if isinstance(worker, dict) and worker.get("url") and bool(worker.get("is_healthy", False))
+                worker["url"] for worker in response.json()["workers"] if worker["url"] and worker["is_healthy"]
             ]
         except Exception:
-            try:
-                resp = await self._client.get(f"{base}/list_workers")
-                resp.raise_for_status()
-                raw_urls = list(resp.json().get("urls", []))
-            except Exception as exc:
-                logger.debug("Admission coordinator worker discovery failed: %s", exc)
-                return []
-
-        engine_urls = router_worker_base_urls(u for u in raw_urls if isinstance(u, str) and u)
-        snapshots: list[WorkerSnapshot] = []
-        for url in engine_urls:
-            try:
-                resp = await self._client.get(f"{url}/metrics")
-                resp.raise_for_status()
-                gauges = _parse_engine_kv_gauges(resp.text)
-            except Exception as exc:
-                logger.debug("Admission coordinator /metrics scrape failed for %s: %s", url, exc)
-                continue
-            # Gauges are aggregated by MAX (see _parse_engine_kv_gauges): TP replicates
-            # max_total_num_tokens per rank, so summing it would inflate capacity and deflate
-            # usage by the TP degree. Prefer the engine's own usage ratio; fall back to the
-            # absolute counts only when the ratio gauge is absent.
-            max_total = int(gauges.get("sglang:max_total_num_tokens", 0) or 0)
-            num_used = int(gauges.get("sglang:num_used_tokens", 0) or 0)
-            usage = gauges.get("sglang:token_usage") or gauges.get("sglang:full_token_usage") or 0.0
-            if usage <= 0.0 and max_total > 0:
-                usage = num_used / max_total
-            usage = min(1.0, max(0.0, usage))
-            snapshots.append(
-                WorkerSnapshot(
-                    engine_id=url,
-                    max_total_num_tokens=max_total,
-                    token_usage=usage,
-                    num_used_tokens=num_used,
-                    healthy=True,
-                )
-            )
+            response = await self._client.get(f"{base_url}/list_workers")
+            response.raise_for_status()
+            raw_urls = list(response.json()["urls"])
+        urls = router_worker_base_urls(raw_urls)
+        responses = await asyncio.gather(*(self._client.get(f"{url}/metrics") for url in urls))
+        snapshots = []
+        for url, response in zip(urls, responses, strict=True):
+            response.raise_for_status()
+            gauges = _parse_engine_kv_gauges(response.text)
+            capacity = int(gauges.get("sglang:max_total_num_tokens", 0))
+            used = int(gauges.get("sglang:num_used_tokens", 0))
+            usage = gauges.get("sglang:token_usage", gauges.get("sglang:full_token_usage", 0.0))
+            if usage == 0.0 and capacity:
+                usage = used / capacity
+            snapshots.append(WorkerSnapshot(url, capacity, usage, used))
         return snapshots
 
+    def _increment(self, key: str, value: float = 1.0) -> None:
+        self._counters[key] = self._counters.get(key, 0.0) + value
 
-class RayBudgetClient:
-    """A :class:`~relax.agentic.session.admission.BudgetClient` backed by the
-    actor handle.
 
-    Bounds the reserve RPC with a timeout and swallows release errors (the
-    lease TTL reclaims anything a failed release would leak), so the shard's
-    admission path can always fail open.
-    """
+class RayAdmissionClient:
+    """Cancellation-safe client for one runtime-owned Coordinator."""
 
-    def __init__(self, handle: Any, *, reserve_timeout_s: float) -> None:
-        self._handle = handle
-        self._reserve_timeout_s = max(0.01, reserve_timeout_s)
-        self._hint_timeout_s = max(1.0, reserve_timeout_s * 5.0)
+    def __init__(self, handle: Any) -> None:
+        self.handle = handle
 
-    async def reserve(self, req: dict) -> dict:
-        return await asyncio.wait_for(self._handle.reserve.remote(req), timeout=self._reserve_timeout_s)
-
-    async def release(self, lease_id: str, actual_tokens: int | None = None) -> None:
+    async def acquire(self, request: dict[str, Any]) -> dict[str, Any]:
+        ticket_id = str(request["ticket_id"])
+        acquire_ref = self.handle.acquire.remote(request)
         try:
-            await self._handle.release.remote(lease_id, actual_tokens)
-        except Exception as exc:
-            logger.debug("Admission lease release failed (TTL will reclaim): %s", exc)
+            return await asyncio.shield(acquire_ref)
+        except asyncio.CancelledError:
+            cleanup = asyncio.gather(self.handle.cancel.remote(ticket_id), acquire_ref, return_exceptions=True)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            raise
+        except Exception:
+            await asyncio.gather(self.handle.cancel.remote(ticket_id), return_exceptions=True)
+            return _decision(
+                AdmissionAction.BYPASS,
+                AdmissionReason.DEGRADED,
+                ticket_id=ticket_id,
+                tokens=int(request["reservation_tokens"]),
+            )
 
-    async def capacity_hint(self) -> dict:
-        return await asyncio.wait_for(self._handle.capacity_hint.remote(), timeout=self._hint_timeout_s)
-
-
-def get_or_create_admission_coordinator(args: Any) -> Any:
-    """Create (or fetch) the detached, named coordinator actor; returns the
-    handle.
-
-    Idempotent via ``get_if_exists`` so re-deploys reuse the running
-    coordinator.
-    """
-    return AdmissionBudgetCoordinator.options(
-        name=ADMISSION_BUDGET_COORDINATOR_NAME,
-        lifetime="detached",
-        num_cpus=0,
-        get_if_exists=True,
-        max_restarts=-1,
-    ).remote(args=args)
-
-
-def shutdown_admission_coordinator() -> None:
-    """Best-effort teardown of the detached coordinator actor."""
-    try:
-        handle = ray.get_actor(ADMISSION_BUDGET_COORDINATOR_NAME)
-    except Exception:
-        return
-    try:
-        ray.kill(handle)
-    except Exception as exc:
-        logger.debug("Failed to kill admission coordinator: %s", exc)
+    async def release(self, lease_id: str) -> None:
+        try:
+            await asyncio.shield(self.handle.release.remote(lease_id))
+        except Exception:
+            return

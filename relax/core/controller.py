@@ -14,21 +14,9 @@ import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
-from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
-
-
-try:
-    from transfer_queue import StreamingTokenBudgetSampler
-except ImportError as e:
-    raise ImportError(
-        "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
-        '    pip install "transferqueue @ git+https://github.com/redai-infra/'
-        'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps\n'
-        "or use the latest image."
-    ) from e
+from transfer_queue import SeqlenBalancedSampler
 
 from relax import utils as relax_utils
-from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
 from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
     shutdown_agentic_chat_api_services,
@@ -41,6 +29,7 @@ from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrie
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
+from relax.utils.data.identity_window_sampler import IdentityWindowSampler
 from relax.utils.env import Envs
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
@@ -277,34 +266,26 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
-        batch_size_for_capacity = (
-            self.config.over_sampling_batch_size
-            if self.config.partial_rollout and self.config.use_dynamic_global_batch_size
-            else self.config.rollout_batch_size
-        )
-        total_storage_size = (
-            batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
-        )
+        dp_size = compute_dp_size(self.config)
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
-            # Fully-async + dynamic-batch path streams data per DP via token
-            # budget; the controller-side sampler maintains per-DP buckets and
-            # balances tokens at small-unit granularity.  See
-            # docs/zh/guide/fully-async-training.md.
-            sampler = StreamingTokenBudgetSampler(
-                n_samples_per_prompt=self.config.n_samples_per_prompt,
+            sampler = IdentityWindowSampler(
+                dp_size=dp_size,
+                placement="streaming",
+                balance_unit_multiplier=self.config.n_samples_per_prompt,
             )
-            logger.info("Using StreamingTokenBudgetSampler (fully_async + dynamic batch)")
-        elif algo_key == "sft" or getattr(self.config, "balance_data", False):
-            # SFT walks the SeqlenBalancedSampler branch (sequential / balanced sampling),
-            # since the GRPO grouped sampler assumes n_samples_per_prompt > 1 rollouts.
-            dp_size = compute_dp_size(self.config)
+            logger.info("Using IdentityWindowSampler (fully_async + dynamic batch)")
+        elif algo_key == "sft":
             sampler = SeqlenBalancedSampler(
                 n_samples_per_prompt=self.config.n_samples_per_prompt,
                 dp_size=dp_size,
             )
             logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
+        elif getattr(self.config, "balance_data", False):
+            sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
+            logger.info(f"Using IdentityWindowSampler with balanced row placement, dp_size={dp_size}")
         else:
-            sampler = GRPOGroupNSampler(n_samples_per_prompt=self.config.n_samples_per_prompt)
+            sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")
+            logger.info(f"Using IdentityWindowSampler with sequential row placement, dp_size={dp_size}")
 
         tq_config = OmegaConf.create(
             {
@@ -314,7 +295,6 @@ class Controller:
                 },
                 "backend": {
                     "SimpleStorage": {
-                        "total_storage_size": total_storage_size,
                         "num_data_storage_units": self.config.num_data_storage_units,
                     },
                 },
@@ -800,14 +780,10 @@ class Controller:
         except Exception as e:
             logger.error(f"Failed to report error to metrics service: {e}")
 
-    def _shutdown_agentic_rollout_services(self, *, warning_prefix: str = "") -> None:
+    def _shutdown_agentic_rollout_services(self) -> None:
         if not self.config.use_agentic_rollout:
             return
         shutdown_agentic_chat_api_services()
-        try:
-            clear_agentic_runtime_caches()
-        except Exception as e:
-            logger.warning(f"{warning_prefix}Failed to clear agentic runtime caches: {e}")
 
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
@@ -1148,7 +1124,7 @@ class Controller:
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to delete metrics deployment: {e}")
 
-        self._shutdown_agentic_rollout_services(warning_prefix="[Global Restart] ")
+        self._shutdown_agentic_rollout_services()
 
         # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:
