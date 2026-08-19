@@ -566,7 +566,6 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 |------|------|--------|------|
 | `--log-passrate` | flag | False | 启用 pass@n 通过率日志 |
 | `--log-multi-turn` | flag | False | 启用多轮 Rollout 信息日志 |
-| `--log-correct-samples` | flag | False | 记录正确样本 |
 | `--log-reward-category` | str | None | 记录 reward 分类统计。指定 reward dict 中的 key |
 
 ### 通知

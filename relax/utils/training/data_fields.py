@@ -11,7 +11,8 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "loss_masks",
         "rollout_log_probs",
         "rewards",
-        "raw_reward",
+        "sample_indices",
+        "sample_index_mask_sums",
     ]
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")

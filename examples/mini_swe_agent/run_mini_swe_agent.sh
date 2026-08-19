@@ -35,14 +35,8 @@ N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:=8}"
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
 AGENT_SERVER_URL="http://127.0.0.1:8765"
 AGENT_SERVER_WORK_DIR="${EXP_ROOT}/agent_server"
-# Must be >= (prepare pool groups) * N_SAMPLES_PER_PROMPT, i.e. the number of
-# sessions the prepare pool launches at once. A group is only admitted once ALL
-# its samples reach the prepare gate, and a gate-blocked session holds its
-# server thread the whole time -- so a smaller cap spreads the slots thinly over
-# every group, no group ever completes, and the step deadlocks. Lower it only
-# together with --agentic-prepare-pool-size.
 AGENT_SERVER_TRAIN_CONCURRENCY="${AGENT_SERVER_TRAIN_CONCURRENCY:=128}"
-AGENT_SERVER_EVAL_CONCURRENCY="${AGENT_SERVER_EVAL_CONCURRENCY:=64}"
+AGENT_SERVER_EVAL_CONCURRENCY="${AGENT_SERVER_EVAL_CONCURRENCY:=128}"
 # Shuffle the training sample order (per-epoch reshuffle seeded by SEED+epoch).
 AGENT_SERVER_SHUFFLE="${AGENT_SERVER_SHUFFLE:=1}"
 AGENT_SERVER_SEED="${AGENT_SERVER_SEED:=42}"
@@ -120,7 +114,7 @@ if [ "${ENABLE_EVAL:-0}" = "1" ]; then
       --eval-interval 100
       --eval-prompt-data r2e_eval "${DUMMY_DATA}"
       --n-samples-per-eval-prompt 1
-      --agentic-eval-prepare-pool-size 50
+      --agentic-eval-concurrency 50
    )
 fi
 
@@ -209,7 +203,7 @@ RAY_RESOURCE_ARGS=(
    # --use-health-check
 )
 
-# agentic rollout: agent exec + parsers + prepare pool + session lifecycle + program admission ───────
+# agentic rollout: agent exec + parsers + session lifecycle + program admission ──────────────────────
 AGENTIC_ARGS=(
    --use-agentic-rollout
    --agent-command "bash ${SCRIPT_DIR}/agent_client.sh"
@@ -218,7 +212,6 @@ AGENTIC_ARGS=(
    --agent-env "AGENT_SERVER_URL=${AGENT_SERVER_URL}" "AGENT_CLIENT_TRACE_DIR=${AGENT_SERVER_WORK_DIR}/client_events"
    --agentic-tool-call-parser qwen3_coder
    --agentic-reasoning-parser qwen3
-   --agentic-prepare-pool-size 0
    # --sglang-enable-session-radix-cache
    # --sglang-radix-eviction-policy priority
    # --agentic-session-lifecycle
@@ -231,7 +224,7 @@ AGENTIC_ARGS=(
 mkdir -p logs
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 relax/entrypoints/train.py \
+   -- python3 -m relax.entrypoints.train \
    "${RAY_RESOURCE_ARGS[@]}" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \

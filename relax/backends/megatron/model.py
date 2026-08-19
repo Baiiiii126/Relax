@@ -47,7 +47,7 @@ from relax.utils.training.ppo_utils import (
 )
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .data import DataIterator, get_batch
+from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function
 from .model_provider import (
     get_model_provider_func,
@@ -927,18 +927,39 @@ def forward_only(
             if args.use_dynamic_batch_size and per_sample_output:
                 # TODO: This is ugly... Find a better way to make the data have the same order.
                 # TODO: move this out of the loop.
-                origin_indices = sum(data_iterator[0].micro_batch_indices, [])
-                # Per-sample callbacks (log_probs/values) emit one tensor per
-                # sample, so values aligns with origin_indices and we can
-                # restore the pre-balance order. Per-microbatch callbacks
-                # (e.g. compute_sft_eval_step) emit one aggregate per
-                # microbatch — len(values) == num_microbatches, not
-                # num_samples — and have no per-sample order to restore.
-                if len(values) == len(origin_indices):
-                    origin_values = [None] * len(values)
-                    for value, origin_index in zip(values, origin_indices, strict=False):
-                        origin_values[origin_index] = value
-                    values = origin_values
+                iterator = data_iterator[0]
+                micro_batch_indices = getattr(iterator, "micro_batch_indices", None)
+                if micro_batch_indices is not None and len(forward_data_store) == len(micro_batch_indices):
+                    dummy_offsets = getattr(iterator, "dummy_micro_batch_offsets", set())
+                    origin_values = [None] * len(iterator.rollout_data["total_lengths"])
+                    can_restore_order = True
+                    for offset, value in enumerate(forward_data_store):
+                        if offset in dummy_offsets:
+                            continue
+                        micro_values = value[key]
+                        indices = micro_batch_indices[offset]
+                        if len(micro_values) != len(indices):
+                            can_restore_order = False
+                            break
+                        for micro_value, origin_index in zip(micro_values, indices, strict=False):
+                            origin_values[origin_index] = micro_value
+                    if can_restore_order:
+                        if any(value is None for value in origin_values):
+                            raise RuntimeError("Dynamic forward output did not cover every local row.")
+                        values = origin_values
+                else:
+                    origin_indices = sum(data_iterator[0].micro_batch_indices, [])
+                    # Per-sample callbacks (log_probs/values) emit one tensor per
+                    # sample, so values aligns with origin_indices and we can
+                    # restore the pre-balance order. Per-microbatch callbacks
+                    # (e.g. compute_sft_eval_step) emit one aggregate per
+                    # microbatch — len(values) == num_microbatches, not
+                    # num_samples — and have no per-sample order to restore.
+                    if len(values) == len(origin_indices):
+                        origin_values = [None] * len(values)
+                        for value, origin_index in zip(values, origin_indices, strict=False):
+                            origin_values[origin_index] = value
+                        values = origin_values
             rollout_data[f"{store_prefix}{key}"] = values
     return rollout_data
 
@@ -952,6 +973,7 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
+    step_global_batch_size: int,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -967,6 +989,7 @@ def train_one_step(
         optimizer (MegatronOptimizer): Optimizer instance.
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         num_microbatches (int): Number of microbatches to process.
+        step_global_batch_size (int): Number of distinct sample indices in this optimizer step.
 
     Returns:
         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
@@ -1030,6 +1053,7 @@ def train_one_step(
                     "returns",
                     "rollout_log_probs",
                     "max_seq_lens",
+                    "sample_index_mask_sums",
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1216,7 +1240,7 @@ def train_one_step(
     if valid_step:
         # Update learning rate.
         assert update_successful
-        opt_param_scheduler.step(increment=args.global_batch_size)
+        opt_param_scheduler.step(increment=step_global_batch_size)
     else:
         grad_norm = float("nan")
 
@@ -1250,7 +1274,10 @@ def train_one_step(
 
         loss_reduced = {}
         values = values.tolist()
-        num_samples_or_tokens = values[0]
+        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+        num_samples_or_tokens = (
+            values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
+        )
         if num_samples_or_tokens == 0:
             # Degenerate / zero-signal batch: every micro-batch across all DP ranks contributed
             # zero loss-normalising units. This happens when the whole batch carries no learning
@@ -1270,11 +1297,8 @@ def train_one_step(
                 loss_reduced[key] = 0.0
             return loss_reduced, grad_norm
         for key, value in zip(keys, values[1:], strict=False):
-            # No cp_size factor: num_samples_or_tokens is the all-reduced CP-local
-            # token count (per-token) or sample count, so each token/sample is
-            # already counted once. A `* cp_size` here would over-weight metrics by
-            # CP degree under dynamic CP (and is a no-op under static CP, where the
-            # count previously carried the cancelling cp factor).
+            # Per-token and sequence-classification metrics use the all-reduced
+            # effective count. RL sample-mean metrics use the step's logical GBS.
             loss_reduced[key] = value / num_samples_or_tokens
         return loss_reduced, grad_norm
     return {}, grad_norm
@@ -1399,6 +1423,24 @@ def train(
             f"streaming data_iterator length ({len(data_iterator)}) must match "
             f"num_steps_per_rollout ({num_steps_per_rollout})"
         )
+    first_iterator = data_iterator[0]
+    if is_data_iterator:
+        global_batch_sizes = first_iterator.rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, None)
+    elif use_step_iterators:
+        global_batch_sizes = [
+            iterator.window_quota if iterator.window_quota is not None else args.global_batch_size
+            for iterator in data_iterator
+        ]
+    else:
+        global_batch_sizes = None
+    if global_batch_sizes is None:
+        global_batch_sizes = [args.global_batch_size for _ in range(num_steps_per_rollout)]
+    global_batch_sizes = [int(size) for size in global_batch_sizes]
+    if len(global_batch_sizes) != num_steps_per_rollout:
+        raise RuntimeError(
+            f"global_batch_sizes length {len(global_batch_sizes)} does not match "
+            f"num_microbatches length {num_steps_per_rollout}."
+        )
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
@@ -1414,6 +1456,7 @@ def train(
                 optimizer,
                 opt_param_scheduler,
                 num_microbatches[step_id],
+                global_batch_sizes[step_id],
             )
         if keep_forward_pre_hook_disabled:
             force_param_sync(model)
@@ -1467,6 +1510,7 @@ def train(
             )
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
+            log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)

@@ -10,7 +10,7 @@ Relax 从 session 生命周期的两端分别处理这个问题：
 
 | 特性 | Flag | 作用位置 | 效果 |
 |---|---|---|---|
-| Session KV lifecycle | `--agentic-session-lifecycle` | session 结束时 | 立即释放 session 的 KV，而不是等 LRU eviction |
+| Session KV lifecycle | `--agentic-session-lifecycle` | session 结束时 | 立即释放 session 的 KV，而不是等待 priority-aware radix-cache eviction（同 priority 内按 LRU） |
 | Program-aware admission | `--agentic-program-admission` | 每次 request 开始前 | 限制集群同时承诺出去的 KV 总量 |
 
 两个特性都**默认关闭**、**彼此独立**（可以只开其中一个）、并且都**fail-open**——任何信号缺失、过期或失败都会回退到原有行为。两者都不改变生成结果：完整的 replay payload（`input_ids`）始终会被发送，所以即使 cache 是冷的也能正确服务。
@@ -23,7 +23,7 @@ Relax 从 session 生命周期的两端分别处理这个问题：
 
 ### 做了什么
 
-开启后，SGLang backend adapter 会在每次 `generate` 调用时把 engine session id 作为顶层 `session_id` 字段发送，从而在 server 的 session-radix cache 上标记该叶子节点。当 session 进入终态时——`finalize_and_discard` 或 `discard_session`——Relax 会先 abort 或静默掉在途 request，然后发出幂等的 `/close_session`，立即释放该 session 的 KV。
+开启后，SGLang backend adapter 会在每次 `generate` 调用时把 Relax session ID 作为顶层 `session_id` 字段发送。同一 session 的并发 request 与 SessionForest branch 共享该 ID，每次 backend attempt 仍保留独立 request ID。session 进入终态或被 drop 时，Relax 会先 abort 或等待在途 request，再发出幂等的 `/close_session`，立即释放该 session 的 KV。Partial rollout 和 fully async 会跨 step 保留未完成 session，因此不会提前关闭其 KV。
 
 ### 路由
 
@@ -43,41 +43,33 @@ sgl-router **不会**代理 `/close_session`。因此 Relax 直接向每个 engi
 
 ### 前置条件
 
-SGLang server 必须带 `--sglang-enable-session-radix-cache` 启动。否则 `session_id` 字段会被直接忽略、close 调用也是 no-op——只开 Relax 这一侧的 flag 没有任何收益。
+支持的 SGLang 目标版本为 0.5.15.post1。Server 必须同时启用 `--sglang-enable-session-radix-cache` 和 `--sglang-radix-eviction-policy priority`；Relax 会在启动时校验这一组合。
 
 ::: warning
-`--sglang-enable-session-radix-cache` 和 `--sglang-radix-eviction-policy` 不是 Relax 定义的参数。它们是 SGLang `ServerArgs` 通过 `--sglang-` 前缀自动暴露出来的（见 `relax/backends/sglang/arguments.py`），因此只有当你安装的 SGLang 提供这两个参数时它们才存在。SGLang 0.5.15 中两者均存在。
+`--sglang-enable-session-radix-cache` 和 `--sglang-radix-eviction-policy` 不是 Relax 定义的参数。它们是 SGLang `ServerArgs` 通过 `--sglang-` 前缀自动暴露出来的（见 `relax/backends/sglang/arguments.py`），因此只有当你安装的 SGLang 提供这两个参数时它们才存在。SGLang 0.5.15.post1 中两者均存在。
 :::
 
 ### 失败行为
 
-close 只是一个 KV 释放优化。失败和超时会被记录并吞掉，绝不阻塞逻辑终态；受影响的 session 退回 LRU eviction。可以关注这些 warning：
-
-```
-close_session skipped: cannot list SGLang workers: ...
-close_session skipped: no SGLang worker urls available.
-close_session: 3/8 call(s) failed; affected sessions fall back to LRU eviction.
-```
+Close 只是 KV 释放优化。失败不会阻塞逻辑终态；受影响的 session 继续由 SGLang 配置的 priority-aware radix-cache eviction 处理（同 priority 内按 LRU）。可以通过 `agentic_kv/session/close_failure` 观察 close fanout 失败。
 
 ### 配置项
 
 | Flag | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `--agentic-session-lifecycle` | flag | `False` | 开启该特性 |
-| `--agentic-session-close-timeout-ms` | int | `500` | close 扇出的单次调用超时；`0` 表示不设上限 |
-| `--agentic-session-close-max-retries` | int | `2` | 单次调用的重试次数，仅针对瞬时 HTTP 错误；必须 `>= 1` |
 
 ## Program-Aware Admission
 
 ### 做了什么
 
-在每个 request 边界上——`InflightRequest` 已构建并入队之后、**尚未**获取 SGLang permit 也尚未调用 `generate()` 之前——admission 返回三种决策之一：
+在每个 request 边界上——获取 SGLang permit 和调用 `generate()` 之前——admission 使用一条全局 FIFO 队列与 token ledger：
 
 | 动作 | 行为 |
 |---|---|
-| **Bypass** | 保持原有路径不变，不持有 lease |
-| **Admit** | 持有一个集群级 execution-token lease，request 结束时释放 |
-| **Defer** | 把该 request 挂在 shard 侧，不占用 permit；由 resume pump 稍后重启 |
+| **Bypass** | Protected work、信号 degraded 或超过最大等待时间时，不持有 lease 并继续执行 |
+| **Admit** | 持有一个集群级 execution-token lease，backend attempt 结束时释放 |
+| **Wait** | 按 FIFO 顺序等待，并且不占用 fleet request permit |
 
 无论怎样配置，两条不变式始终成立：
 
@@ -87,63 +79,58 @@ close_session: 3/8 call(s) failed; affected sessions fall back to LRU eviction.
 ### 架构
 
 ```
-┌──────────────────────┐   reserve / release   ┌────────────────────────────────┐
-│  AgenticSessionShard │ ────────────────────► │  AdmissionBudgetCoordinator    │
+┌──────────────────────┐   acquire / release   ┌────────────────────────────────┐
+│  AgenticSessionShard │ ────────────────────► │  AdmissionCoordinator          │
 │  (16 Ray actors)     │ ◄──────────────────── │  single Ray actor, one writer  │
-│                      │        grant          │  wraps the BudgetState ledger  │
+│                      │        lease          │  global FIFO + BudgetState     │
 └──────────┬───────────┘                       └───────────────┬────────────────┘
            │                                                   │ poll /metrics
-           │ generate() only when not deferred                 │ every reconcile tick
-           ▼                                                   ▼
-┌──────────────────────┐                       ┌────────────────────────────────┐
-│     sgl-router       │ ────────────────────► │        SGLang engines          │
-└──────────────────────┘                       └────────────────────────────────┘
+           │ fleet permit → generate                           ▼
+           ▼                                   ┌────────────────────────────────┐
+┌──────────────────────┐                       │        SGLang engines          │
+│     sgl-router       │ ────────────────────► └────────────────────────────────┘
+└──────────────────────┘
 ```
 
 | 组件 | 职责 | 实现位置 |
 |---|---|---|
-| **决策逻辑** | 纯粹的 Bypass/Admit/Defer 策略与 token ledger，不含 Ray 和 I/O | `relax/agentic/session/admission.py` |
-| **Coordinator** | 单写者 Ray actor、`/metrics` 轮询、lease TTL 回收 | `relax/agentic/session/admission_coordinator.py` |
-| **Shard 集成** | 特征采集、defer gate、resume pump、每 shard 计数器 | `relax/agentic/session/service.py` |
+| **决策逻辑** | 纯粹的 Admit/Bypass 策略与 token ledger，不含 Ray 和 I/O | `relax/agentic/session/admission.py` |
+| **Coordinator** | 单写者 Ray actor、全局 FIFO、`/metrics` 轮询、lease TTL 回收 | `relax/agentic/session/admission_coordinator.py` |
+| **Shard 集成** | 在 fleet permit 前以 cancellation-safe 方式获取 lease | `relax/agentic/session/service.py` |
 
-ledger 刻意与 Ray 解耦，使得策略和预算记账可以在 CPU 上做确定性单测（`tests/test_agentic_rollout.py`）。所有与时间相关的状态都通过注入的 monotonic `now` 传入。
+`BudgetState` 与 Ray 解耦，容量、pressure、lease、TTL 和 usage accounting 都通过注入的 monotonic `now` 进行确定性的 CPU 测试。全局 FIFO、aging、cancellation 和 metrics polling 位于 Ray-backed `AdmissionCoordinator`；测试直接使用其底层类，无需启动 Ray（`tests/test_agentic_rollout.py`）。
 
 ### Reservation 的计算
 
-一次 reservation = **精确的 prompt token 数 + 有界的 decode 估计**。decode 估计取三者中最紧的：sampling `max_new_tokens`、`--agentic-admission-expected-decode-cap`、`--rollout-max-response-len`，因此永远不会无界。
+一次 reservation = **processor 展开的 training prefix + 剩余 completion budget**。纯文本的 training prefix 与 backend prefix 长度自然相同。多模态容量记账使用 processor 展开的 training length，SGLang payload 继续使用 backend tokenizer IDs 与 media data。`--agentic-admission-expected-decode-cap` 可以收紧 completion 部分，不会改变实际 generation limit。
 
 ### 决策顺序
 
-prelude 先执行，不消耗任何 RPC：
+Admission 按以下顺序执行：
 
-1. 特性未开启 → **Bypass**
-2. 没有 session id → **Bypass**（`missing_identity`）
-3. scope 不允许 → **Bypass**（`capability_unavailable`）
-4. protected 工作 → **Bypass**（`fairness_reserve`）——protected 工作永不被饿死
-5. session 已被标记为压力状态 → **Defer**（`pressure_guard`）
+1. 特性未开启或 scope 未选中 → 不经过 admission，保持现有路径
+2. Protected work → **Bypass**（`protected`）
+3. Capacity snapshot 缺失或过期 → **Bypass**（`degraded`）
+4. 存在更早的 waiter，或者达到 capacity 或 pressure limit → 在全局 FIFO 中 **Wait**
+5. 达到最大等待时间 → **Bypass**（`aged`）
+6. FIFO 为空且容量充足 → **Admit** 并持有 lease
 
-否则 shard 会咨询 coordinator，由它决定授予还是拒绝：
+以下两种 ledger 状态会让 request 排队：
 
 | 拒绝原因 | ledger 判定条件 | 调用方行为 |
 |---|---|---|
-| `degraded` | 没有快照，或最近一次快照超过 3 个 reconcile 间隔 | **Bypass**（fail open） |
-| `pressure_guard` | 最坏情况 engine `token_usage` ≥ 压力阈值，且请求未 aged | **Defer** |
-| `capacity_exhausted` | `reserved + tokens` 超过上限；非 aged 请求的上限不含 emergency reserve | **Defer** |
+| `pressure_guard` | 最坏情况 engine `token_usage` 达到 pressure threshold | **Wait** |
+| `capacity_exhausted` | `reserved + tokens` 超过 admission ceiling | **Wait** |
 
 ceiling = `健康 engine 的 max_total_num_tokens 之和 × headroom`。
 
 ### Lease
 
-Lease 按 `(epoch, dispatch_id, decision_id)` 幂等，因此重试的 reserve 会返回同一个 lease，而不会重复扣减预算。TTL 负责回收因 shard 死亡而搁浅的 lease。当健康 worker 集合或 serving weight version 发生变化时，coordinator 会 bump epoch 并丢弃所有旧 epoch 的 lease。
+Lease 按 request ticket 幂等，因此重试 acquire 不会重复扣减预算。Cancellation 会原子地移除 waiter，或释放竞态中已经授予的 lease。TTL 负责回收因 shard 死亡而搁浅的 lease，worker 集合变化时 ledger epoch 会递增。
 
 ### 防饥饿
 
-被 defer 的 session 由每 shard 的 pump 按最早优先顺序恢复，tick 间隔为 `--agentic-admission-reconcile-interval-s`：
-
-- 在最大等待时间以内，只有当 coordinator 报告其队头 request 有足够空间时才恢复。
-- 如果 ledger 处于 degraded，被 defer 的 session 立即恢复——重新 admit 时会走 bypass。
-- 超过 `--agentic-admission-max-wait-s` 后，session 会被**强制恢复**（aged）。aged 请求跳过 pressure guard 并可动用 emergency reserve；且一个 aged 请求如果仍会被 defer，则改为 bypass，从而保证一定能推进。
-- 每个 shard 每个 tick 的强制恢复次数由 `--agentic-admission-forced-resume-cap` 限制。
+Request 在唯一的 Coordinator 队列中按最早优先顺序等待。Lease release 与周期性 metric reconciliation 会推进该队列。Ledger degraded 时，队列中的 request 会 bypass。超过 `--agentic-admission-max-wait-s` 后，最早的 request 也会 bypass，保证 admission 不会无限期阻塞进度。
 
 ### 前置条件
 
@@ -159,14 +146,9 @@ coordinator 通过 SGLang router 发现 engine（`/workers`，失败则回退 `/
 |---|---|---|---|---|
 | `--agentic-program-admission` | flag | `False` | — | 开启该特性 |
 | `--agentic-admission-headroom` | float | `0.90` | `(0, 1]` | 可用作 ceiling 的 KV 总容量比例 |
-| `--agentic-admission-pressure-threshold` | float | `0.92` | `(0, 1]` | 单 worker `token_usage` 达到该值时非 aged 请求 defer |
+| `--agentic-admission-pressure-threshold` | float | `0.92` | `(0, 1]` | 单 worker `token_usage` 达到该值时新 request 等待 |
 | `--agentic-admission-expected-decode-cap` | int | `--rollout-max-response-len` | `> 0` | 单次 reservation 的 decode token 上界 |
-| `--agentic-admission-max-wait-s` | float | `30.0` | `>= 0` | 强制恢复前的最长 defer 时间 |
-| `--agentic-admission-reconcile-interval-s` | float | `2.0` | `> 0` | coordinator reconcile 与 resume pump 的 tick 间隔 |
-| `--agentic-admission-lease-ttl-s` | float | `600.0` | `> 0` | lease TTL，用于回收死亡 shard 的 lease |
-| `--agentic-admission-reserve-timeout-ms` | int | `100` | `> 0` | reserve RPC 超时；超时则该请求 bypass |
-| `--agentic-admission-emergency-reserve-frac` | float | `0.05` | `[0, 1)` | 为 aged 请求预留的 ceiling 比例 |
-| `--agentic-admission-forced-resume-cap` | int | `8` | `>= 1` | 每 shard 每 tick 的最大强制恢复数 |
+| `--agentic-admission-max-wait-s` | float | `30.0` | `>= 0` | Aging bypass 前的最大 FIFO wait |
 | `--agentic-admission-scope` | str | `train` | `train` \| `all` | 只作用于 train，还是 train + eval |
 
 上述数值约束仅在设置了 `--agentic-program-admission` 时才会校验。
@@ -201,33 +183,31 @@ AGENTIC_ARGS=(
 | 指标 | 含义 |
 |---|---|
 | `agentic_kv/session/lifecycle_enabled` | 开启 session lifecycle 时为 `1.0`，否则不上报 |
-| `agentic_kv/admission/admit` / `defer` / `bypass` | 每 step 的决策计数（至少有一次决策时才上报） |
-| `agentic_kv/admission/defer_rate` | `defer / (admit + defer + bypass)` |
-| `agentic_kv/admission/degraded_rate` | 因信号 degraded 而 fail-open 的决策占比 |
-| `agentic_kv/admission/forced_resume` | 本 step 被强制恢复的 aged session 数 |
-| `agentic_kv/admission/reserve_error` | 抛异常并 fail-open 到 bypass 的 reserve RPC 数 |
-| `agentic_kv/admission/defer_wait_ms_mean` | 在 gate 后平均停留时间 |
-| `agentic_kv/admission/state_ready` / `state_in_flight` / `state_acting` / `state_deferred` | 实时 session 状态分布 |
-| `agentic_kv/budget/ceiling` / `agentic_kv/budget/reserved` | 集群 execution-token 上限与当前预约量 |
-| `agentic_kv/budget/reserved_utilization` | `reserved / ceiling` |
-| `agentic_kv/budget/kv_token_usage_mean` / `agentic_kv/budget/kv_token_usage_max` | 窗口内 engine KV usage 的均值与峰值 |
-| `agentic_kv/budget/epoch` | coordinator epoch，worker 集合或 weight version 变化时递增 |
-| `agentic_kv/budget/degraded` | ledger 没有新鲜快照时为 `1.0` |
+| `agentic_kv/session/close` / `close_failure` | Session close 尝试与失败次数 |
+| `agentic_kv/admission/admit` / `bypass` | 每 step 的 admission outcome；没有对应 outcome 时不上报 |
+| `agentic_kv/admission/wait` / `waiting` / `cancelled` | 入队、当前等待与已取消的 request 数 |
+| `agentic_kv/admission/bypass_protected` / `bypass_degraded` / `bypass_aged` | Fail-open bypass 原因 |
+| `agentic_kv/admission/wait_seconds_mean` | 排队后获得 lease 的 request 平均等待时间 |
+| `agentic_kv/budget/ceiling` / `reserved` / `available_tokens` | Admission ceiling 与 token ledger 状态 |
+| `agentic_kv/budget/reserved_utilization` | Reserved token 数占 admission ceiling 的比例 |
+| `agentic_kv/budget/lease_count` / `lease_expired` | 当前 lease 与 TTL 回收的 lease 数 |
+| `agentic_kv/budget/kv_token_usage_mean` / `kv_token_usage_max` | 窗口内 engine KV token usage 的均值与峰值 |
+| `agentic_kv/budget/epoch` / `degraded` | Worker-set generation 与 capacity snapshot 健康状态 |
 
 ::: warning
-`agentic_kv/budget/kv_token_usage_*` 采样自一个每 step 排空一次的滑动窗口，因为在打日志那一刻做瞬时读取时 rollout 已经排空，会低估真实峰值。engine 侧的释放收益——pool 大小、强制 eviction、释放的 token 数——不在此表中，需要从 engine 自身的 Prometheus `/metrics` 读取。
+`agentic_kv/budget/kv_token_usage_*` 采样自一个每 step 排空一次的滑动窗口，因为在打日志那一刻做瞬时读取时 rollout 已经排空，会低估真实峰值。Engine 侧的释放收益——pool 大小、强制 eviction、释放的 token 数——不在此表中，需要从 engine 自身的 Prometheus `/metrics` 读取。
 :::
 
 ## 故障排除
 
 | 现象 | 可能原因 | 检查项 |
 |---|---|---|
-| 全部走 bypass，`agentic_kv/admission/defer` 始终为 0 | ledger degraded | `agentic_kv/budget/degraded == 1.0`。router 地址未配置或不可达，或 `/metrics` 抓取失败。日志中查找 `Admission coordinator reconcile failed`。 |
-| `agentic_kv/admission/defer_rate` 高但 `agentic_kv/budget/reserved_utilization` 低 | 是 pressure guard 在触发，而非容量不足 | engine `token_usage` 已达到阈值。调高 `--agentic-admission-pressure-threshold`，或降低并发。 |
-| `defer_rate` 高且 `reserved_utilization` 接近 1.0 | 确实是容量受限 | 调高 `--agentic-admission-headroom`，或减少并发 session 数。 |
-| `agentic_kv/admission/forced_resume` 每 step 持续上升 | session 经常撞上 aging 截止时间 | 预算相对于负载过紧，gate 退化成了单纯的延迟。放宽 headroom 或降低并发。 |
+| 全部走 bypass，`agentic_kv/admission/bypass_degraded` 持续增加 | ledger degraded | 检查 `agentic_kv/budget/degraded == 1.0`。router 地址未配置或不可达，或 worker `/metrics` 抓取失败。 |
+| `agentic_kv/admission/waiting` 长期较高 | Capacity 或 pressure bound | 检查 reservation size、concurrency、headroom 与 engine KV usage。 |
+| `agentic_kv/admission/bypass_aged` 持续增加 | Request 经常达到 aging deadline | 放宽 headroom、降低并发，或降低 expected decode cap。 |
+| `agentic_kv/budget/reserved_utilization` 长期接近 `1.0` | 确实是容量受限 | 调高 headroom 或减少并发 session。 |
 | 开了 session lifecycle 但 KV 不下降 | server 侧 cache 未开启 | 确认 engine 启动时带了 `--sglang-enable-session-radix-cache`。 |
-| 出现 `close_session skipped: ...` warning | worker 发现失败 | router 不可达。相关 session 退回 LRU eviction，生成结果不受影响。 |
+| `agentic_kv/session/close_failure` 增加 | Worker discovery 或 close fanout 失败 | 检查 router discovery 与直接 `/close_session` 连通性。 |
 
 ## 下一步
 

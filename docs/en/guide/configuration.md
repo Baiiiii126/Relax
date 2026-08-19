@@ -566,7 +566,6 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 |-----------|------|---------|-------------|
 | `--log-passrate` | flag | False | Enable pass@n pass rate logging |
 | `--log-multi-turn` | flag | False | Enable multi-turn Rollout information logging |
-| `--log-correct-samples` | flag | False | Log correct samples |
 | `--log-reward-category` | str | None | Log reward category statistics. Specify key in reward dict |
 
 ### Notifications

@@ -23,7 +23,7 @@ def _model_source(uri: str, *, enabled: bool = True):
     return s3_model_loader.ModelSource(uri, "http://s3.example")
 
 
-def test_bootstrap_processor_pool_resolves_s3_path(monkeypatch):
+def test_load_agentic_compiler_resources_resolves_s3_path(monkeypatch):
     captured = {}
 
     def fake_update(obj, **kwargs):
@@ -36,23 +36,33 @@ def test_bootstrap_processor_pool_resolves_s3_path(monkeypatch):
         return "POOL"
 
     monkeypatch.setattr(runtime, "prepare_model_maybe_update_args", fake_update)
+    tokenizer = MagicMock(return_value="TOKENIZER")
+    processor = MagicMock(return_value="PROCESSOR")
+    monkeypatch.setattr("relax.utils.data.processing_utils.load_tokenizer", tokenizer)
+    monkeypatch.setattr("relax.utils.data.processing_utils.load_processor", processor)
+    monkeypatch.setattr(
+        "relax.utils.data.processing_utils.configure_encode_executor", MagicMock(return_value="EXECUTOR")
+    )
     monkeypatch.setattr("relax.utils.data.processor_pool.ProcessorPool", fake_pool)
 
     args = SimpleNamespace(
         mm_processor_pool_size=2,
+        encode_max_workers=4,
         hf_checkpoint="s3://bkt/model/",
         model_source=_model_source("s3://bkt/model/"),
     )
-    result = runtime._bootstrap_processor_pool(args)
+    resources = runtime.load_agentic_compiler_resources(args)
 
-    assert result == "POOL"
+    assert resources.processor_pool == "POOL"
     assert captured["resolve_args"] is args
     assert captured["resolve_kwargs"] == {"completeness": "metadata"}
+    tokenizer.assert_called_once_with("/dev/shm/resolved_model", trust_remote_code=True)
+    processor.assert_called_once_with("/dev/shm/resolved_model", trust_remote_code=True)
     assert captured["pool_kwargs"]["model_path"] == "/dev/shm/resolved_model"
     assert args.hf_checkpoint == "/dev/shm/resolved_model"
 
 
-def test_bootstrap_processor_pool_noop_when_S3_disabled(monkeypatch):
+def test_load_agentic_compiler_resources_noop_when_S3_disabled(monkeypatch):
     captured = {}
 
     def fake_update(obj, **kwargs):
@@ -64,27 +74,28 @@ def test_bootstrap_processor_pool_noop_when_S3_disabled(monkeypatch):
         return "POOL"
 
     monkeypatch.setattr(runtime, "prepare_model_maybe_update_args", fake_update)
+    tokenizer = MagicMock(return_value="TOKENIZER")
+    processor = MagicMock(return_value="PROCESSOR")
+    monkeypatch.setattr("relax.utils.data.processing_utils.load_tokenizer", tokenizer)
+    monkeypatch.setattr("relax.utils.data.processing_utils.load_processor", processor)
+    monkeypatch.setattr(
+        "relax.utils.data.processing_utils.configure_encode_executor", MagicMock(return_value="EXECUTOR")
+    )
     monkeypatch.setattr("relax.utils.data.processor_pool.ProcessorPool", fake_pool)
 
     args = SimpleNamespace(
         mm_processor_pool_size=1,
+        encode_max_workers=4,
         hf_checkpoint="s3://bkt/model/",
         model_source=None,
     )
-    runtime._bootstrap_processor_pool(args)
+    runtime.load_agentic_compiler_resources(args)
 
     assert captured["resolve_args"] is args
     assert captured["resolve_kwargs"] == {"completeness": "metadata"}
+    tokenizer.assert_called_once_with("s3://bkt/model/", trust_remote_code=True)
+    processor.assert_called_once_with("s3://bkt/model/", trust_remote_code=True)
     assert captured["pool_kwargs"]["model_path"] == "s3://bkt/model/"
-
-
-def test_bootstrap_processor_pool_skips_when_pool_disabled():
-    args = SimpleNamespace(
-        mm_processor_pool_size=0,
-        hf_checkpoint="s3://x/",
-        model_source=_model_source("s3://x/"),
-    )
-    assert runtime._bootstrap_processor_pool(args) is None
 
 
 class _FakeDataset:

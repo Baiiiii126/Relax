@@ -41,7 +41,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
 from relax.utils.metrics.metric_utils import (
     compute_pass_rate,
-    compute_rollout_explicit_reward_metrics,
+    compute_rollout_reward_metrics,
     compute_rollout_step,
     compute_statistics,
     dict_add_prefix,
@@ -1046,7 +1046,9 @@ class RolloutManager(ReloadableMixin):
             evaluation=False,
         )
         if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
-            self._dynamic_global_batch_size = len(output.samples) * self.args.n_samples_per_prompt
+            self._dynamic_global_batch_size = len(
+                {sample.index for sample_group in output.samples for sample in sample_group}
+            )
 
     async def eval(self, rollout_id):
         self.health_monitoring_resume()
@@ -3980,16 +3982,30 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
         return
 
     log_dict = {**(rollout_extra_metrics or {})}
-    log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
-    log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
-    logger.info(f"perf {rollout_id}: {log_dict}")
+    if samples:
+        log_dict |= dict_add_prefix(
+            compute_metrics_from_samples(args, samples, rollout_id=rollout_id),
+            "rollout/",
+        )
+        log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
+    rollout_log_dict = {key: value for key, value in log_dict.items() if not key.startswith(("perf/", "perf_detail/"))}
+    perf_log_dict = {key: value for key, value in log_dict.items() if key.startswith(("perf/", "perf_detail/"))}
+    logger.info(f"rollout {rollout_id}: {rollout_log_dict}")
+    logger.info(f"perf {rollout_id}: {perf_log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
     tracking_utils.flush_metrics(args, step)
 
 
-def compute_metrics_from_samples(args, samples):
+def compute_metrics_from_samples(args, samples, *, rollout_id: int | None = None):
+    rewarded_samples = [sample for sample in samples if sample.reward is not None]
+    reward_cat_key = args.log_reward_category
+    reward_category_samples = (
+        [sample for sample in rewarded_samples if isinstance(sample.reward, dict) and reward_cat_key in sample.reward]
+        if reward_cat_key is not None
+        else rewarded_samples
+    )
     response_lengths = [sample.effective_response_length for sample in samples]
     multimodal_stats = [get_sample_multimodal_stats(sample) for sample in samples]
 
@@ -3999,17 +4015,23 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_min_mean_max_stats(
         [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"
     )
-    log_dict |= compute_rollout_explicit_reward_metrics(args, samples)
-    log_dict |= _compute_zero_std_metrics(args, samples)
+    log_dict |= compute_rollout_reward_metrics(args, rewarded_samples)
+    log_dict |= _compute_zero_std_metrics(args, rewarded_samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
-    log_dict |= _compute_reward_cat_metrics(args, samples)
-    log_dict |= compute_mopd_metrics(args, samples)
+    log_dict |= _compute_reward_cat_metrics(args, reward_category_samples)
+    log_dict |= compute_mopd_metrics(args, rewarded_samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     log_dict["num_turn/mean"] = np.mean([s.metadata.get("rollout_turns", 1) for s in samples]).item()
     log_dict["num_turn/max"] = np.max([s.metadata.get("rollout_turns", 1) for s in samples]).item()
     log_dict["num_turn/min"] = np.min([s.metadata.get("rollout_turns", 1) for s in samples]).item()
+    if rollout_id is not None and args.partial_rollout and not args.fully_async:
+        staleness_gaps = [rollout_id - sample.metadata.get("start_rollout_id", rollout_id) for sample in samples]
+        log_dict["staleness/avg"] = np.mean(staleness_gaps).item()
+        log_dict["staleness/max"] = np.max(staleness_gaps).item()
+        log_dict["staleness/min"] = np.min(staleness_gaps).item()
+        log_dict["global_batch_size"] = len({sample.index for sample in samples})
     return log_dict
 
 
