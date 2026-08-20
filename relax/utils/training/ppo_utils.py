@@ -4,6 +4,7 @@
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
 import contextlib
+import math
 from argparse import Namespace
 from pathlib import Path
 
@@ -357,6 +358,74 @@ def compute_policy_loss(
         pg_losses = clip_pg_losses1
 
     return pg_losses, clipfrac
+
+
+# ── M2PO: Second-Moment Trust Policy Optimization ──────────────────────────
+# Adapted from https://github.com/Infini-AI-Lab/M2PO (Apache 2.0)
+# Paper: "Prosperity before Collapse" (NeurIPS 2025), https://arxiv.org/abs/2510.01161
+
+
+def _solve_tau_from_sorted_delta2(sorted_delta2: torch.Tensor, target_sum: float) -> tuple[float, float]:
+    n = sorted_delta2.numel()
+    total = float(sorted_delta2.sum().item())
+    if target_sum >= total - 1e-12:
+        return 100000.0, total / n
+    if target_sum <= 1e-12:
+        return 0.0, 0.0
+    csum = torch.cumsum(sorted_delta2, dim=0)
+    for k in range(n):
+        left_sum = float(csum[k].item())
+        rest = n - k - 1
+        m2 = sorted_delta2[k].item() - 1e-12
+        if m2 * rest + left_sum >= target_sum - 1e-12:
+            if k == 0:
+                return 0.0, float(csum[-1].item()) / n
+            M2_after = (sorted_delta2[k - 1].item() * (rest + 1) + float(csum[k - 1].item())) / n
+            return max(sorted_delta2[k - 1].item() - 1e-12, 0.0) ** 0.5, M2_after
+    return 100000.0, total / n
+
+
+def _get_trust_region_delta_sq(ppo_kl: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+    ratio = (-ppo_kl).exp()
+    pos_harmful = (advantages > 1e-12) & (ratio > 1.0 + 1e-12)
+    neg_harmful = (advantages < -1e-12) & (ratio < 1.0 - 1e-12)
+    return ppo_kl[pos_harmful | neg_harmful].pow(2)
+
+
+def kpo_clip_harmful_tokens(
+    ppo_kl: torch.Tensor, advantages: torch.Tensor, kl2_budget: float
+) -> tuple[float, float, float, float]:
+    tr_delta_sq = _get_trust_region_delta_sq(ppo_kl, advantages)
+    n = tr_delta_sq.numel()
+    if n == 0:
+        return 0.0, 100000.0, 0.0, 0.0
+    M2_now = float(tr_delta_sq.sum().detach().item() / n)
+    if M2_now <= kl2_budget + 1e-12:
+        return 0.0, 100000.0, M2_now, M2_now
+    sorted_delta2, _ = torch.sort(tr_delta_sq)
+    tau, M2_after = _solve_tau_from_sorted_delta2(sorted_delta2, kl2_budget * float(n))
+    return math.exp(-tau), math.exp(tau), M2_now, M2_after
+
+
+def compute_m2po_loss(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    kl2_budget: float,
+    miniclip_low: float = 0.3,
+    miniclip_high: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, float, float, float, float]:
+    clip_low, clip_high, M2_now, M2_after = kpo_clip_harmful_tokens(ppo_kl, advantages, kl2_budget)
+    eps_low = max(1.0 - clip_low, miniclip_low)
+    eps_high = max(clip_high - 1.0, miniclip_high)
+    ratio = (-ppo_kl).exp()
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * ratio.clamp(1.0 - eps_low, 1.0 + eps_high)
+    pg_loss = torch.maximum(pg_losses1, pg_losses2)
+    clipfrac = (pg_losses2 > pg_losses1).float()
+    return pg_loss, clipfrac, M2_now, M2_after, eps_low, eps_high
+
+
+# ───────────────────────────────────────────────────────────────────────────
 
 
 def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):
