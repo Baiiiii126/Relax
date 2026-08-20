@@ -1811,6 +1811,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "m2po",
                 ],
                 default="grpo",
                 help=(
@@ -1829,6 +1830,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=1.05,
                 help="Temperature for negative advantages in SAPO (default: 1.05)",
+            )
+            parser.add_argument(
+                "--m2po-kl2-budget",
+                type=float,
+                default=0.01,
+                help="M2PO second-moment budget per harmful token (KL2_budget in paper; paper uses 0.04, default: 0.01)",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-low",
+                type=float,
+                default=0.3,
+                help="M2PO minimum lower clip epsilon floor (paper default: 0.3)",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-high",
+                type=float,
+                default=0.5,
+                help="M2PO minimum upper clip epsilon floor (paper default: 0.5)",
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
