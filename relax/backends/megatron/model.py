@@ -1720,18 +1720,27 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
 
         path.mkdir(parents=True, exist_ok=True)
 
-        # A base HF model can define MTP layers that a model trained without MTP
-        # never emits; those tensors share safetensors shards with real LM tensors
-        # (lm_head, final norm, last layers), and with strict=True the bridge
-        # refuses to write those shards and silently truncates the export. Decide
-        # strictness from the *reference* model (args.hf_checkpoint): for standard
-        # RL/SFT jobs args.mtp_num_layers is None, so keying off the training model
-        # (as before) never triggered and left the export truncated.
-        from relax.utils.hf_export import reconcile_hf_export_index, reference_expects_mtp
+        # strict=True fails whenever the reference declares weights this model structurally
+        # never emits: Bridge refuses every shard holding such a key, losing the real
+        # tensors that shared it (measured on gemma-4-26B text-mode SFT: 58 of 657
+        # language tensors written). Relax for exactly those cases -- an MTP base trained
+        # without MTP, or a VL base trained text-only, where only the VL providers declare
+        # vision_config. Keep strict=True everywhere else: it is the only export-time
+        # guard against a mapping bug silently truncating the checkpoint.
+        from relax.utils.hf_export import (
+            reconcile_hf_export_index,
+            reference_expects_mtp,
+            reference_expects_vision,
+        )
 
         model_has_mtp = bool(getattr(args, "mtp_num_layers", 0))
         allow_missing_mtp_keys = reference_expects_mtp(args.hf_checkpoint) and not model_has_mtp
-        strict = not allow_missing_mtp_keys
+        # Short-circuits: a reference without vision weights can never be missing them.
+        allow_missing_vision_keys = reference_expects_vision(args.hf_checkpoint) and not hasattr(
+            get_model_config(model[0]), "vision_config"
+        )
+
+        strict = not (allow_missing_mtp_keys or allow_missing_vision_keys)
 
         save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
         fp8_writer = None
@@ -1742,10 +1751,9 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
                 args.save_hf_fp8_quant_mode,
                 args.save_hf_fp8_block_size,
             )
-            # StreamingFP8Writer runs its own strict check against the source
-            # safetensors index and doesn't understand the "MTP is expected but
-            # missing" case; drop strict so Bridge yields whatever it has.
-            strict = strict and not allow_missing_mtp_keys
+            # StreamingFP8Writer strict-checks against the source index and cannot express
+            # an absent group. Redundant above, kept so the constraint survives edits.
+            strict = strict and not (allow_missing_mtp_keys or allow_missing_vision_keys)
 
         try:
             with patch_megatron_model(model):
@@ -1758,21 +1766,20 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
             if restore_save_generator is not None:
                 restore_save_generator()
 
-        # When MTP keys are tolerated as missing (strict=False above), Megatron-Bridge's
-        # non-distributed save still lists those mtp.* keys in model.safetensors.index.json
-        # while omitting them from the shards ("ghost" keys), and the base MTP weights are
-        # absent. Reconcile: rebuild the index from the tensors actually written and
-        # supplement MTP from the base HF model, so the checkpoint loads cleanly (incl.
-        # EAGLE speculative decoding). The bridge writes on WORLD rank 0, so run the
-        # reconcile there too (the output lives on shared storage). The FP8 path uses a
-        # separate streaming writer with its own index and is skipped here (mirrors
-        # scripts/tools/convert_torch_dist_to_hf_bridge.py).
+        # A non-strict save can leave "ghost" index entries: keys Bridge listed but wrote
+        # to no shard (seen for mtp.*, not for vision -- but this is a no-op when there is
+        # nothing to fix, so gate on both relaxations). Rebuilds the index from what was
+        # written and supplements MTP from the base so the checkpoint stays deployable;
+        # vision is left out, a text-only export stays text-only. Bridge writes on WORLD
+        # rank 0, so reconcile there. FP8 has its own streaming index and is skipped.
         is_export_writer = (
             not torch.distributed.is_initialized()
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         )
-        if allow_missing_mtp_keys and is_export_writer and not save_fp8:
-            reconcile_hf_export_index(str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=True)
+        if (allow_missing_mtp_keys or allow_missing_vision_keys) and is_export_writer and not save_fp8:
+            reconcile_hf_export_index(
+                str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=allow_missing_mtp_keys
+            )
 
         if save_fp8 and is_export_writer and fp8_writer is not None:
             _apply_fp8_quantization_config(
