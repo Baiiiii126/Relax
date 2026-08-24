@@ -1,13 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Export a Relax sequence-classification checkpoint for SGLang serving.
+"""Export a Relax sequence-classification checkpoint for HF serving.
 
 The training model replaces Megatron's vocabulary output layer with a
 replicated ``hidden_size -> num_labels`` head.  Megatron-Bridge still names
-that tensor ``lm_head.weight`` during HF export, so this tool reconstructs the
-training model (including LoRA wrappers), lets Bridge merge and reshard the
-checkpoint, then rewrites the task head to the SGLang/HF ``score.weight``
-convention.
+that tensor ``lm_head.weight`` during HF export when the original model has an
+untied output layer.  Tied-embedding models make Bridge omit ``output_layer``
+entirely, so this tool captures the trained task head from the reconstructed
+model before Bridge export.  Bridge still merges LoRA and reshards the base
+weights; the captured task head is then written as HF ``score.weight``.
 """
 
 from __future__ import annotations
@@ -159,9 +160,10 @@ def export_with_bridge(
     output_dir: Path,
     checkpoint_args: argparse.Namespace,
     show_progress: bool,
-) -> None:
+) -> torch.Tensor:
     from megatron.bridge import AutoBridge
     from megatron.bridge.models.conversion.param_mapping import AutoMapping
+    from megatron.bridge.training.model_load_save import temporary_distributed_context
 
     bridge = AutoBridge.from_hf_pretrained(str(origin_hf_dir), trust_remote_code=True)
     provider = bridge.to_megatron_provider(load_weights=False)
@@ -173,14 +175,40 @@ def export_with_bridge(
     provider.register_pre_wrap_hook(lambda model: _install_classification_and_lora(model, checkpoint_args))
     AutoMapping.register_module_type("LinearForLastLayer", "replicated")
 
-    with _bridge_export_overrides(provider):
-        bridge.export_ckpt(
-            str(iteration_dir),
+    with _bridge_export_overrides(provider), temporary_distributed_context(backend="gloo"):
+        megatron_model = bridge.load_megatron_model(str(iteration_dir), wrap_with_ddp=False)
+        task_head = _task_head_from_model(megatron_model, checkpoint_args.num_labels)
+        bridge.save_hf_pretrained(
+            megatron_model,
             str(output_dir),
             show_progress=show_progress,
             strict=False,
             source_path=str(origin_hf_dir),
         )
+    return task_head
+
+
+def _task_head_from_model(model: list[torch.nn.Module], num_labels: int) -> torch.Tensor:
+    from relax.utils.training.ppo_utils import LinearForLastLayer, _find_output_layer_owner
+
+    task_heads = []
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        head = owner.output_layer
+        if not isinstance(head, LinearForLastLayer):
+            raise TypeError(f"Expected LinearForLastLayer task head, got {type(head).__name__}")
+        task_heads.append(head)
+
+    if len(task_heads) != 1:
+        raise ValueError(f"Expected exactly one sequence-classification task head, found {len(task_heads)}")
+    weight = task_heads[0].weight
+    if weight.ndim != 2 or weight.shape[0] != num_labels:
+        raise ValueError(
+            f"Sequence-classification task head has shape {tuple(weight.shape)}, expected [{num_labels}, hidden_size]"
+        )
+    return weight.detach().to(device="cpu").contiguous().clone()
 
 
 def reconcile_export_index(output_dir: Path) -> dict[str, list[str]]:
@@ -222,44 +250,79 @@ def _load_index(output_dir: Path) -> tuple[Path | None, dict[str, str]]:
         return None, {name: safetensor_paths[0].name for name in handle.keys()}
 
 
-def _task_head_key(weight_map: dict[str, str]) -> str:
+def _task_head_key(weight_map: dict[str, str]) -> str | None:
     exact = [key for key in weight_map if key == "lm_head.weight"]
     if exact:
         return exact[0]
     suffix = [key for key in weight_map if key.endswith(".lm_head.weight")]
-    if len(suffix) != 1:
+    if len(suffix) > 1:
         raise ValueError(f"Expected exactly one exported lm_head.weight, found {suffix}")
-    return suffix[0]
+    return suffix[0] if suffix else None
 
 
-def rewrite_task_head(output_dir: Path, num_labels: int) -> tuple[int, int]:
+def rewrite_task_head(
+    output_dir: Path,
+    num_labels: int,
+    task_head: torch.Tensor | None = None,
+) -> tuple[int, int]:
     index_path, weight_map = _load_index(output_dir)
     source_key = _task_head_key(weight_map)
-    shard_path = output_dir / weight_map[source_key]
-    with safe_open(shard_path, framework="pt", device="cpu") as handle:
-        metadata = handle.metadata()
-    tensors = safetensors_torch.load_file(str(shard_path), device="cpu")
-    if source_key not in tensors:
-        raise KeyError(f"Index maps {source_key!r} to {shard_path}, but the tensor is absent")
+    if source_key is None and task_head is None:
+        raise ValueError("Export has no lm_head.weight and no captured task head was provided")
+    if "score.weight" in weight_map:
+        raise ValueError("Export already contains score.weight; refusing an ambiguous rewrite")
 
-    score = tensors.pop(source_key)
+    score = task_head
+    source_size = 0
+    shard_path = None
+    metadata = None
+    tensors = None
+    if source_key is not None:
+        shard_path = output_dir / weight_map[source_key]
+        with safe_open(shard_path, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+        tensors = safetensors_torch.load_file(str(shard_path), device="cpu")
+        if source_key not in tensors:
+            raise KeyError(f"Index maps {source_key!r} to {shard_path}, but the tensor is absent")
+        exported_head = tensors.pop(source_key)
+        source_size = exported_head.numel() * exported_head.element_size()
+        if score is None:
+            score = exported_head
+
+    assert score is not None
     if score.ndim != 2 or score.shape[0] != num_labels:
         raise ValueError(
             f"Exported classification head has shape {tuple(score.shape)}, expected [{num_labels}, hidden_size]"
         )
-    if "score.weight" in tensors or "score.weight" in weight_map:
-        raise ValueError("Export already contains score.weight; refusing an ambiguous rewrite")
-    tensors["score.weight"] = score
-    safetensors_torch.save_file(
-        {name: tensor.contiguous() for name, tensor in tensors.items()},
-        str(shard_path),
-        metadata=metadata or {"format": "pt"},
-    )
+
+    if shard_path is None and index_path is not None:
+        shard_path = output_dir / "sequence-classification-head.safetensors"
+        if shard_path.exists():
+            raise FileExistsError(f"Refusing to overwrite existing task-head shard: {shard_path}")
+        safetensors_torch.save_file({"score.weight": score}, str(shard_path), metadata={"format": "pt"})
+    else:
+        if shard_path is None:
+            shard_path = output_dir / next(iter(weight_map.values()))
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                metadata = handle.metadata()
+            tensors = safetensors_torch.load_file(str(shard_path), device="cpu")
+        assert tensors is not None
+        tensors["score.weight"] = score
+        safetensors_torch.save_file(
+            {name: tensor.contiguous() for name, tensor in tensors.items()},
+            str(shard_path),
+            metadata=metadata or {"format": "pt"},
+        )
 
     if index_path is not None:
         payload = json.loads(index_path.read_text(encoding="utf-8"))
-        payload["weight_map"].pop(source_key)
+        if source_key is not None:
+            payload["weight_map"].pop(source_key)
         payload["weight_map"]["score.weight"] = shard_path.name
+        total_size = payload.get("metadata", {}).get("total_size")
+        if isinstance(total_size, int):
+            score_size = score.numel() * score.element_size()
+            payload["metadata"]["total_size"] = total_size - source_size + score_size
         index_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     return tuple(score.shape)
@@ -273,6 +336,18 @@ def _is_moe_config(config: dict[str, Any]) -> bool:
         *(config.get("architectures") or []),
     )
     return any("moe" in str(value).lower() for value in values)
+
+
+def _classification_architecture(config: dict[str, Any]) -> str:
+    model_type = str(config.get("model_type", "")).lower()
+    architectures = [str(value).lower() for value in config.get("architectures") or []]
+    if model_type == "qwen3_vl" or any("qwen3vl" in value for value in architectures):
+        return "Qwen3VLForSequenceClassification"
+    if model_type == "qwen2_5_vl" or any("qwen2_5_vl" in value for value in architectures):
+        return "Qwen2_5_VLForSequenceClassification"
+    if model_type == "qwen3" or any(value.startswith("qwen3for") for value in architectures):
+        return "Qwen3ForSequenceClassification"
+    return "Qwen3_5MoeForSequenceClassification" if _is_moe_config(config) else "Qwen3_5ForSequenceClassification"
 
 
 def update_classification_config(
@@ -294,20 +369,30 @@ def update_classification_config(
     if len(set(label_names)) != len(label_names):
         raise ValueError("--label-names entries must be unique")
 
-    architecture = (
-        "Qwen3_5MoeForSequenceClassification" if _is_moe_config(config) else "Qwen3_5ForSequenceClassification"
-    )
+    id2label = {str(index): label for index, label in enumerate(label_names)}
+    label2id = {label: index for index, label in enumerate(label_names)}
+    architecture = _classification_architecture(config)
     config.update(
         {
             "architectures": [architecture],
             "num_labels": num_labels,
             "problem_type": problem_type,
-            "id2label": {str(index): label for index, label in enumerate(label_names)},
-            "label2id": {label: index for index, label in enumerate(label_names)},
+            "id2label": id2label,
+            "label2id": label2id,
             "pooling_type": "LAST",
             "normalize": False,
         }
     )
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        text_config.update(
+            {
+                "num_labels": num_labels,
+                "problem_type": problem_type,
+                "id2label": id2label,
+                "label2id": label2id,
+            }
+        )
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return architecture
 
@@ -383,7 +468,7 @@ def main() -> None:
     print(f"[seq-cls-export] origin HF:  {origin_hf_dir}")
     print(f"[seq-cls-export] output:     {output_dir}")
     try:
-        export_with_bridge(
+        task_head = export_with_bridge(
             iteration_dir=iteration_dir,
             origin_hf_dir=origin_hf_dir,
             output_dir=output_dir,
@@ -391,7 +476,7 @@ def main() -> None:
             show_progress=not args.no_progress,
         )
         reconcile_export_index(output_dir)
-        head_shape = rewrite_task_head(output_dir, checkpoint_args.num_labels)
+        head_shape = rewrite_task_head(output_dir, checkpoint_args.num_labels, task_head=task_head)
         architecture = update_classification_config(
             output_dir,
             num_labels=checkpoint_args.num_labels,

@@ -29,6 +29,7 @@ PORT="${PORT:-30000}"
 
 export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export SGLANG_EXTERNAL_MODEL_PACKAGE="examples.seq_cls_sft.models.sglang"
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE="examples.seq_cls_sft.models.sglang"
 
 exec python "${SCRIPT_DIR}/launch_sglang_text_classification.py" \
     --model-path "${CLASSIFICATION_MODEL_DIR}" \

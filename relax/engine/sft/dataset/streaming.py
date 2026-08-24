@@ -384,9 +384,6 @@ class SFTStreamingDataset:
                 raise ValueError("SFTStreamingDataset seq_cls mode requires a sentinel token id")
             if self.capacity is not None and self.capacity < 2:
                 raise ValueError("SFTStreamingDataset seq_cls capacity must be >= 2")
-            if self.multimodal_keys is not None:
-                raise ValueError("SFTStreamingDataset seq_cls mode currently supports text-only samples")
-
         valid_strategies = {"skip", "keep", "truncate_left", "truncate_right", "custom"}
         if oversize_strategy not in valid_strategies:
             raise ValueError(f"oversize_strategy must be one of {sorted(valid_strategies)}, got {oversize_strategy!r}")
@@ -764,12 +761,15 @@ class SFTStreamingDataset:
             loss_mask = rendered.short_mask
         else:
             tokens = _to_long_tensor(prompt_ids)
-            loss_mask = _expand_loss_mask_via_alignment(
-                short_ids=rendered.short_ids,
-                short_mask=rendered.short_mask,
-                expanded_ids=tokens,
-                pad_token_ids=self._pad_token_ids,
-            )
+            if self.task_type == "seq_cls":
+                loss_mask = torch.zeros_like(tokens)
+            else:
+                loss_mask = _expand_loss_mask_via_alignment(
+                    short_ids=rendered.short_ids,
+                    short_mask=rendered.short_mask,
+                    expanded_ids=tokens,
+                    pad_token_ids=self._pad_token_ids,
+                )
         if self.task_type == "seq_cls":
             if tokens.numel() == 0:
                 raise ValueError(
@@ -785,7 +785,7 @@ class SFTStreamingDataset:
                 tokens=tokens,
                 loss_mask=torch.zeros_like(tokens),
                 idx=rendered.idx,
-                has_multimodal=False,
+                has_multimodal=mm_inputs is not None,
                 capacity_override=prompt_capacity,
             )
             if result is None:
