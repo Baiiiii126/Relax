@@ -74,6 +74,31 @@ def test_rewrite_task_head_updates_shard_index_and_config(tmp_path):
     assert config["normalize"] is False
 
 
+def test_rewrite_task_head_adds_captured_head_when_tied_export_omits_lm_head(tmp_path):
+    shard_name = "model-00001-of-00001.safetensors"
+    save_file({"model.language_model.norm.weight": torch.ones(4)}, str(tmp_path / shard_name))
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 16},
+                "weight_map": {"model.language_model.norm.weight": shard_name},
+            }
+        ),
+        encoding="utf-8",
+    )
+    score = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+    assert rewrite_task_head(tmp_path, num_labels=3, task_head=score) == (3, 4)
+    validate_export(tmp_path, num_labels=3)
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index["weight_map"]["score.weight"] == "sequence-classification-head.safetensors"
+    assert index["metadata"]["total_size"] == 64
+    exported_head = load_file(str(tmp_path / "sequence-classification-head.safetensors"), device="cpu")
+    assert torch.equal(exported_head["score.weight"], score)
+
+
 def test_reconcile_export_index_drops_absent_mtp_ghosts(tmp_path):
     shard_name = "model-00001-of-00001.safetensors"
     save_file({"model.language_model.norm.weight": torch.ones(4)}, str(tmp_path / shard_name))
@@ -117,6 +142,32 @@ def test_update_classification_config_detects_moe_and_validates_labels(tmp_path)
             problem_type="multi_label_classification",
             label_names=["only-one"],
         )
+
+
+def test_update_classification_config_supports_qwen3_vl(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_vl",
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+                "text_config": {"model_type": "qwen3_vl_text"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    architecture = update_classification_config(
+        tmp_path,
+        num_labels=3,
+        problem_type="single_label_classification",
+        label_names=["a", "b", "c"],
+    )
+
+    config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert architecture == "Qwen3VLForSequenceClassification"
+    assert config["architectures"] == [architecture]
+    assert config["text_config"]["id2label"] == config["id2label"]
+    assert config["text_config"]["label2id"] == config["label2id"]
 
 
 def test_validate_path_separation_rejects_checkpoint_and_origin_overlap(tmp_path):

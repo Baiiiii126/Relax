@@ -5,7 +5,7 @@
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -260,6 +260,66 @@ def test_streaming_dataset_builds_single_label_classification_sample(tmp_path: P
     assert sample.classification_label.item() == 2
     assert batch["response_lengths"] == [1]
     assert batch["classification_labels"] == [2]
+    ds.stop()
+
+
+def test_streaming_dataset_builds_multimodal_classification_sample(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Classify this image."},
+                            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+                        ],
+                    }
+                ],
+                "images": [],
+                "label": 2,
+            }
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=MagicMock(),
+        capacity=None,
+        prompt_key="messages",
+        label_key="label",
+        multimodal_keys={"image": "images"},
+        seed=42,
+        prefetch_max_cached=0,
+        task_type="seq_cls",
+        num_labels=3,
+        problem_type="single_label_classification",
+        classification_sentinel_token_id=99,
+        require_response=False,
+    )
+    mm_inputs = {
+        "pixel_values": torch.zeros(1, 3, 2, 2),
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+    }
+
+    with (
+        patch("relax.engine.sft.dataset.streaming.render_to_text", return_value="rendered multimodal prompt"),
+        patch(
+            "relax.engine.sft.dataset.streaming.preprocess_multimodal",
+            return_value=([10, 11, 12], mm_inputs),
+        ),
+    ):
+        sample = ds.get_batch_in_order(0, 1)[0]
+    batch = pack_samples_for_tq([sample], force_multimodal_field=True)
+
+    assert sample.tokens.tolist() == [10, 11, 12, 99]
+    assert sample.loss_mask.tolist() == [1]
+    assert sample.classification_label.item() == 2
+    assert sample.multimodal_train_inputs is mm_inputs
+    assert batch["classification_labels"] == [2]
+    assert batch["multimodal_train_inputs"] == [mm_inputs]
     ds.stop()
 
 

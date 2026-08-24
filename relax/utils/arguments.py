@@ -3543,8 +3543,6 @@ def slime_validate_args(args):
             raise ValueError("--task-type seq_cls requires --num-labels >= 2.")
         if not 0.0 <= args.classification_threshold <= 1.0:
             raise ValueError("--classification-threshold must be in [0, 1].")
-        if args.multimodal_keys is not None:
-            raise ValueError("--task-type seq_cls currently supports text-only data; remove --multimodal-keys.")
         incompatible = {
             "--fully-async": bool(args.fully_async),
             "--hybrid": bool(args.hybrid),
