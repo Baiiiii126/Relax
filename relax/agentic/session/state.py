@@ -117,7 +117,7 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
                 raise ValueError(f"messages[{index}].content must not be empty")
             content = ""
         elif isinstance(content, str):
-            if not content.strip() and not assistant_allows_empty_content:
+            if not content and not assistant_allows_empty_content:
                 raise ValueError(f"messages[{index}].content must not be empty")
         elif isinstance(content, list):
             if not content:
@@ -125,7 +125,7 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
             for item_index, item in enumerate(content):
                 if not isinstance(item, dict):
                     raise TypeError(f"messages[{index}].content[{item_index}] must be a dict, got {type(item)}")
-                if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"].strip():
+                if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"]:
                     raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
         else:
             raise TypeError(f"messages[{index}].content must be a list, string, or None, got {type(content)}")
