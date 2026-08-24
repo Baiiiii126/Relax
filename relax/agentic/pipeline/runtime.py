@@ -784,7 +784,6 @@ class _SessionShardBinding:
     revision_changed: asyncio.Event = field(default_factory=asyncio.Event)
     observer_task: Optional["asyncio.Task[None]"] = None
     state_change_ref: Optional[Any] = None
-    next_session_number: int = 0
 
 
 @dataclass(eq=False)
@@ -837,7 +836,6 @@ class RuntimeDomain:
         self._shards = shards
         self.concurrency = concurrency
         self._admission_coordinator = admission_coordinator
-        self._session_namespace = uuid.uuid4().hex if getattr(args, "agentic_session_lifecycle", False) else None
         self._resident_group_permits = asyncio.Semaphore(concurrency)
         self._progress_callback: Callable[[], None] = lambda: None
         self._state_changed = asyncio.Event()
@@ -903,19 +901,7 @@ class RuntimeDomain:
             self._start_shard_observers()
             group_id = group_input.group_id
             shard = self._shards[zlib.crc32(group_id.encode("utf-8")) % len(self._shards)]
-            namespace = "" if self.rollout_mode == "train" else "eval-"
-            first_session_number = shard.next_session_number
-            shard.next_session_number += len(group_input.samples)
-            if self._session_namespace is None:
-                session_ids = tuple(
-                    f"{shard.actor_name}.session-{namespace}{session_number:04d}"
-                    for session_number in range(first_session_number, shard.next_session_number)
-                )
-            else:
-                session_ids = tuple(
-                    f"{shard.actor_name}.session-{namespace}{self._session_namespace}-{session_number:04d}"
-                    for session_number in range(first_session_number, shard.next_session_number)
-                )
+            session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
             loop = asyncio.get_running_loop()
             session_specs = await loop.run_in_executor(
                 None,
@@ -993,7 +979,10 @@ class RuntimeDomain:
         try:
             await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id)
         except BaseException:
-            await self.drop_group(stream)
+            await finish_before_cancellation(
+                self.drop_group(stream),
+                f"lease-group-cleanup:{stream.group_id}",
+            )
             raise
 
     async def resume_generation(self, rollout_id: int) -> None:
