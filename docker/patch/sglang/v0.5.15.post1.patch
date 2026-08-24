@@ -1099,7 +1099,7 @@ index 53b376705a..6732f90d42 100644
          self: TokenizerManager,
          obj: CheckWeightsReqInput,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 74688606f9..f4331b64b4 100644
+index 7468860..a2a1d85 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -2408,25 +2408,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -1135,6 +1135,22 @@ index 74688606f9..f4331b64b4 100644
  
          if state.finished:
              # Get detailed cache breakdown if available
+@@ -3105,7 +3103,14 @@ def _get_processor_wrapper(server_args):
+ 
+ 
+ def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+-    is_cross_node = server_args.dist_init_addr
++    # NOTE(relax-fix): keying "cross node" off dist_init_addr false-positives for
++    # single-node multi-GPU TP, which MUST also set dist_init_addr to bootstrap the
++    # TP process group (see relax/backends/sglang/sglang_engine.py). The false
++    # positive forces the CPU "default" transport, which makes wrap_shm_features()
++    # a no-op, so multimodal pixel tensors (multi-GB for 5-image doc pages) get
++    # pickled + gloo-broadcast per request (observed 2.2-6.5 GB, 18-33s per
++    # recv_requests). Key off nnodes, which is what actually means multi-node.
++    is_cross_node = server_args.nnodes > 1
+ 
+     if is_cross_node:
+         # Fallback to default CPU transport for multi-node
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
 index 3db49daf82..01719db87e 100644
 --- a/python/sglang/srt/managers/tp_worker.py
