@@ -665,6 +665,13 @@ async def _eval_groups(
         )
 
 
+def _agentic_eval_runtime_concurrency(args: Namespace, eval_group_size: int) -> int:
+    """Translate logical Eval Group concurrency into Runtime permits."""
+
+    eval_group_concurrency = agentic_eval_concurrency_from_args(args, eval_group_size)
+    return eval_group_concurrency if args.group_rm else eval_group_concurrency * eval_group_size
+
+
 def _run_on_resident_async_loop(coro):
     """Synchronously submit work to the RolloutManager-local resident loop.
 
@@ -889,8 +896,8 @@ async def eval_rollout(args, rollout_id: int) -> RolloutFnEvalOutput:
         grouped_samples: dict[int, list[Sample]] = {}
         for sample in samples:
             grouped_samples.setdefault(cast(int, sample.group_index), []).append(sample)
-        eval_group_size = dataset_cfg.n_samples_per_eval_prompt if args.group_rm else 1
-        eval_concurrency = agentic_eval_concurrency_from_args(args, eval_group_size)
+        eval_group_size = dataset_cfg.n_samples_per_eval_prompt
+        eval_concurrency = _agentic_eval_runtime_concurrency(args, eval_group_size)
         runtime_domain = await RuntimeDomain.connect(args, "eval", eval_concurrency)
         try:
             scored_groups = await _eval_groups(

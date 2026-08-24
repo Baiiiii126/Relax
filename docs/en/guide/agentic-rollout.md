@@ -1,10 +1,21 @@
 # Agentic Rollout
 
-Agentic rollout connects an external agent application to Relax training. Relax starts the agent as a managed process
-and provides a non-streaming Chat Completions endpoint. The agent keeps its normal model-and-tool loop. Relax records
-committed conversations and turns selected contexts into training samples.
+Agentic rollout connects an existing agent app (harness) to Relax training. For each Session, Relax starts and
+supervises an agent process that runs the existing harness. Relax records committed conversations and turns selected
+contexts into training samples.
 
-::: tip Choose a reading path
+**This feature is especially useful when you already have a working agent that uses an OpenAI-compatible Chat
+Completions API, whether it runs standalone or through a centralized execution platform.**
+
+::: tip Recommended workflow
+For agent app (harness) assessment, integration, launch checks, and experiments, we recommend using the repository's
+`agentic-rollout` skill under `skills/agentic-rollout/`. It checks the current checkout and guides context topology,
+parsers, export and credit, timeouts, concurrency, and runtime evidence by stage. Experiments still require explicit
+user authorization, and this guide remains the contract reference for Chat Completions request and response formats,
+APIs, and export.
+
+For manual reading:
+
 - To start from an existing agent, read [Prepare Your Agent](#prepare-your-agent), then
   [Connect Your Agent](#connect-your-agent).
 - For multi-agent training, exporting several contexts, or defining per-context credit, read
@@ -14,12 +25,12 @@ committed conversations and turns selected contexts into training samples.
   [Understand How Agentic Rollout Works](#understand-how-agentic-rollout-works).
 :::
 
-![Agent app integration](/agentic/agent_app.svg)
+![Agent integration](/agentic/agent_app.svg)
 
 ## Core Capabilities
 
-1. **Agentic RL with existing agent apps**
-   Connect an existing agent to Relax by changing its model endpoint.
+1. **Agentic RL with existing agents**
+   Connect an existing agent app (harness) to Relax by changing its model endpoint.
 
 2. **Agent process warmup**
    Start agent processes early to hide application, tool, and environment initialization time.
@@ -33,18 +44,28 @@ Run the agent outside Relax first. Use its normal task input and model endpoint.
 
 - accept one real task through its normal input interface;
 - call a non-streaming Chat Completions endpoint;
-- finish its complete model-and-tool loop, including multiple turns when needed;
+- complete a full harness run, including multiple turns when needed;
 - write a final result;
 - exit without an error.
 
-Keep the task input, model endpoint, API credential, and result output configurable. The agent loop should remain the
-same after integration. Relax supplies new input, endpoint, and output boundaries around that loop.
+Keep the task input, model endpoint, API credential, and result output configurable. The harness should behave the same
+after integration. Relax supplies new input, endpoint, and output boundaries around it.
+
+For each Session, Relax starts a process as the agent's entry point. This process can run the agent directly, start
+child processes, or submit the task to another machine or a centralized platform. Where the agent runs does not matter,
+as long as its requests reach `RELAX_BASE_URL`. The process stays running until the task finishes, then exits.
+
+::: warning Remote centralized agent platforms
+If your agent submits work to a centralized remote platform instead of running directly on the local machine, and
+that platform limits agent concurrency, you must read [Configure Runtime Behavior](#configure-runtime-behavior) before launch.
+:::
 
 ## Connect Your Agent
 
 ### Dataset and Session Input
 
-Relax writes each task to the file named by `RELAX_INPUT_JSON`. The file contains `messages` and optional `metadata`:
+Relax writes each task to the file named by `RELAX_INPUT_JSON`. The file can contain `messages`, `metadata`, or both.
+This example provides ready-to-use messages:
 
 ```json
 {
@@ -61,12 +82,12 @@ Relax writes each task to the file named by `RELAX_INPUT_JSON`. The file contain
 #### Text and Message Input
 
 The standard dataset path maps `--input-key` to `messages`. A string becomes one user message. A message list keeps its
-OpenAI message shape. The value may also be empty when the application reads the task from metadata.
+OpenAI message shape.
 
 #### Metadata-Only Tasks
 
-`--metadata-key` maps a dataset object to `metadata`. An application can keep the full task in metadata and use an empty
-value for `--input-key`.
+`--metadata-key` maps a dataset object to `metadata`. A harness can read the task from metadata and construct the
+messages when it runs.
 
 #### Multimodal Input
 
@@ -125,8 +146,9 @@ observations can also contain `image_url` items. See
 
 ### Minimal Agent Application
 
-This example makes one model call and exports the final conversation. A real agent can keep its existing tool loop and
-make more calls with the same client.
+This example receives ready-to-use messages, makes one model call, and exports the final conversation. A metadata-driven
+harness can construct `messages` after reading `metadata`. A real agent can keep its existing tool loop and make more
+calls with the same client.
 
 ```python
 import asyncio
@@ -165,6 +187,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+The `timeout=9999` above is the wall-clock timeout for one Chat Completions request sent to `RELAX_BASE_URL`. A single
+request may be held during prelaunch, partial-rollout abort and resume, or fully-async execution, so configure this
+client timeout to cover the longest such wait.
+
 Keep the complete assistant message returned by `model_dump()`. Reasoning content and tool calls can then be used by
 later turns and by SessionForest matching.
 
@@ -178,6 +204,7 @@ The training configuration supplies `temperature` and `top_p`. Request values fo
 | `tools` | Tool definitions used by that branch |
 | `chat_template_kwargs` | Template arguments used by that branch |
 | `max_completion_tokens` | Maximum generated tokens for this turn |
+| `max_tokens` | Legacy alias for `max_completion_tokens`; the newer field takes precedence when both are set |
 | `stop` | Stop string or list for this turn |
 | `seed` | Sampling seed for this turn |
 | `logprobs` | Include generated-token logprobs in the response |
@@ -185,7 +212,13 @@ The training configuration supplies `temperature` and `top_p`. Request values fo
 ::: warning Chat Completions compatibility
 The endpoint is non-streaming. Omit `stream` or set it to `false`. Omit `n` or set it to `1`. `top_logprobs` and the
 legacy `functions` and `function_call` fields are unsupported. Use `max_completion_tokens` for the turn limit.
-`max_tokens`, `tool_choice`, and unspecified request fields are not consumed.
+`max_tokens` is accepted as a legacy alias. `tool_choice` and unspecified request fields are not consumed.
+
+Use `user`, `assistant`, `tool`, or `system` roles. User, system, and tool messages require nonempty content; represent a
+tool result of `None` or `""` with a stable nonempty value. Assistant messages may omit text content when tool calls or
+reasoning are present. If the harness emits `developer`, configure it to use `system` or review that semantic conversion
+before integration. Relax manages `add_generation_prompt`, `tokenize`, and `tools`; do not set them in request
+`chat_template_kwargs`.
 :::
 
 Pass `tools` and `chat_template_kwargs` on every request that uses them. Configure `--agentic-reasoning-parser` and
@@ -232,8 +265,7 @@ Add these options to a working Relax training command:
 ```bash
 --use-agentic-rollout \
 --agent-cwd /path/to/agent_repo \
---agent-command "bash run_agent_app.sh" \
---agent-timeout 9999
+--agent-command "bash run_agent_app.sh"
 ```
 
 Use a recipe under `examples/` for model, data, parallelism, and algorithm settings.
@@ -254,7 +286,7 @@ conversation as one training context is ready to train.
 | Contexts exported by each session | Required training credit |
 | --- | --- |
 | One context | Write `reward`, or omit it and configure `--custom-rm-path` |
-| More than one context | Configure `--agentic-custom-advantage-path`; do not use `--custom-rm-path` |
+| More than one context | Configure `--agentic-custom-advantage-path`; custom RM is generally discouraged and requires deliberate Group RM review |
 
 ### Export the Final Conversation
 
@@ -269,7 +301,8 @@ For a single final training context, omit `RELAX_OUTPUT_JSON`, leave it empty, o
 }
 ```
 
-Implicit export fails when a session has more than one committed leaf. Use explicit export in that case.
+Use implicit export only for an audited strictly linear history. Any nonlinear history requires explicit export, even
+when it currently has one exportable leaf.
 
 ### Explicitly Export One or More Contexts
 
@@ -412,8 +445,9 @@ The word KL can refer to three different downstream operations:
 - an independent reference-policy KL loss enabled by `--use-kl-loss`.
 
 ::: warning Reward configuration with custom advantage
-Do not set `--custom-rm-path` together with `--agentic-custom-advantage-path`. Store every signal used by the function in
-export metadata.
+Generally avoid `--custom-rm-path` with `--agentic-custom-advantage-path`. Without `--group-rm`, the ordinary custom RM
+path is skipped. A deliberately reviewed Group RM may still write reward for metrics or filtering while custom advantage
+provides training credit. Store every signal used by the advantage function in export metadata.
 :::
 
 ### Metrics and Passrate
@@ -423,16 +457,18 @@ export metadata.
 - Top-level numeric fields in output metadata use `<field>/mean|median|max|min`, without a `rollout/` prefix.
 - Complete metadata remains available in rollout dumps.
 
-When one session exports several contexts, attach the session outcome as top-level `reward` to one context, usually
-`main`. This lets passrate count the outcome once. Other contexts can carry the outcome in metadata when the custom
-advantage function needs it. In multi-context training, `reward` is used for outcome reporting; custom advantage provides
-the training credit.
+With `--log-passrate`, multi-context Sessions use explicit export and attach reward to exactly one representative
+context, usually `main`. Set the selected primary reward value to `1` for success or `0` otherwise; for a reward object,
+`--reward-key` selects that value. Leave reward unset on sibling contexts. Other contexts can carry the outcome in
+metadata when the custom advantage function needs it. A Group RM that writes reward to every exported row requires a
+custom logger that restores logical-Session grouping. In multi-context training, reward reports the outcome while
+custom advantage provides training credit.
 
 ### Multi-Context Dynamic Batching
 
 A recipe that may export more than one context from a session **must** configure
-`--agentic-custom-advantage-path` and **must** enable dynamic batching. `--custom-rm-path` is not supported for this
-case.
+`--agentic-custom-advantage-path` and **must** enable dynamic batching. Custom RM is generally discouraged; use it only
+as a deliberately reviewed Group RM for reporting or filtering.
 
 ```bash
 --use-dynamic-batch-size
@@ -441,21 +477,57 @@ case.
 
 ## Configure Runtime Behavior
 
+::: danger Required external-agent capacity
+When agents run on a centralized remote platform with a hard concurrency limit, calculate the train limit and each Eval
+dataset's limit:
+
+```text
+T = agentic_concurrency * n_samples_per_prompt
+G_d = dataset d's n_samples_per_eval_prompt
+C_d = explicit agentic_eval_concurrency or ceil(T / G_d)
+E_d = C_d * G_d
+E_peak = max(E_d across Eval datasets)
+```
+
+Eval datasets run serially, so their combined peak is `E_peak`, not the sum of all `E_d` values.
+
+When `--agentic-prelaunch`, `--partial-rollout`, or `--fully-async` is enabled, select **Yes** in the
+**Train sessions remain resident during Eval** column. Prelaunch shares the training resident capacity, so the train limit
+stays `T`; it makes `T` overlap with `E_peak`.
+
+Then use the matching row for an executor shared by train and Eval:
+
+| Eval enabled | Train sessions remain resident during Eval | Required slots |
+| --- | --- | --- |
+| No | — | `external_slots >= T` |
+| Yes | No | `external_slots >= max(T, E_peak)` |
+| Yes | Yes | `external_slots >= T + E_peak` |
+
+Fewer slots can deadlock Group startup at the all-session first-request barrier. Check this table before starting a run.
+:::
+
 | Goal | Option | Behavior |
 | --- | --- | --- |
 | Limit resident training Groups | `--agentic-concurrency` | Shared capacity for Prepare and Runtime |
-| Set resident Eval Groups | `--agentic-eval-concurrency` | Eval capacity derived from training capacity when unset |
+| Set resident Eval Groups | `--agentic-eval-concurrency` | Logical Eval prompt-Group capacity derived from training capacity when unset |
 | Start agents early | `--agentic-prelaunch` | Starts processes while resident capacity is free |
 | Reuse unfinished samples | `--partial-rollout` | Aborts and resumes backend attempts across steps |
 | Run asynchronous rollout and training | `--fully-async` | Keeps unfinished sessions while partitions advance |
 | Limit partial aborts | `--partial-rollout-max-aborted-count` | Protects a repeatedly aborted attempt |
-| Limit active session time | `--agent-timeout` | Terminates a session when its active-time budget expires |
+| Stop an agent that runs too long | `--agent-timeout` | Terminates the agent process when its Runtime active-time budget expires |
+
+`--agent-timeout` starts after a Session enters Runtime. It stops an agent that remains active for too long, for example
+because its loop or a tool call is stuck. A prelaunched Session waiting for Runtime does not consume this budget. The
+budget also pauses when partial rollout or fully async pauses a Session between steps.
 
 `--agentic-concurrency` defaults to `--over-sampling-batch-size`, which defaults to `--rollout-batch-size`.
-`--agentic-eval-concurrency` is derived from the training session capacity and evaluation group size when unset.
+`--agentic-eval-concurrency` is derived separately for each Eval dataset from `T` and that dataset's Group size when
+unset. Both options count logical prompt Groups. Dataset `d` owns `E_d` sessions with either ordinary RM or Group RM;
+ordinary RM uses singleton Runtime Groups internally without changing that total. Eval datasets run serially, so with
+dedicated train and Eval executors, provision `T` and `E_peak` separately.
 
-Partial rollout and fully async are alternative execution modes. Both can keep unfinished managed sessions across
-rollout steps. Keep the long Chat Completions timeout shown in the minimal application.
+Partial rollout and fully async are mutually exclusive execution modes. Both can keep unfinished Sessions across
+rollout steps; choose one. Keep the long Chat Completions timeout shown in the minimal application.
 
 Start retrievers, environment servers, and other cross-session services outside the per-session agent command.
 
@@ -464,9 +536,9 @@ Session KV lifecycle and program-aware admission are optional controls for long-
 
 ## Understand How Agentic Rollout Works
 
-### Managed Session Lifecycle
+### Session Lifecycle
 
-One dataset sample creates one managed session. The session owns one agent process, one SessionForest, its rollout mode,
+One dataset sample creates one Session. The Session owns one agent process, one SessionForest, its rollout mode,
 and its active-time budget. The process can make sequential or concurrent Chat Completions requests. When the process
 exits, Relax selects the requested Forest states, computes training credit, and sends the samples to training.
 
@@ -565,7 +637,7 @@ agent can send its first request early. Relax holds that request until the Group
 
 #### Cross-Step Retention
 
-Partial rollout and fully async can both keep a managed session across rollout steps. The diagram below shows the partial
+Partial rollout and fully async can both keep a Session across rollout steps. The diagram below shows the partial
 rollout path: SGLang returns a partial token prefix after an abort, Relax parks the request, and a later backend attempt
 continues the same HTTP request.
 

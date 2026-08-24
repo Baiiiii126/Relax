@@ -1,10 +1,19 @@
 # Agentic Rollout
 
-Agentic rollout 将外部 agent application 接入 Relax 训练。Relax 把 agent 作为受管 process 启动，并提供非流式
-Chat Completions endpoint。Agent 继续使用原有的 model-and-tool loop。Relax 记录已提交的 conversation，并把选中
-的 context 转换为训练 sample。
+Agentic rollout 将已有 agent app (harness) 接入 Relax 训练。Relax 为每个 Session 启动并管理一个 agent process，
+由该 process 运行原有 harness。Relax 记录已提交的 conversation，并把选中的 context 转换为训练 sample。
 
-::: tip 选择阅读路径
+**当您已经有一个使用 OpenAI-compatible Chat Completions API 的可运行 agent 时，这项功能尤其合适；agent
+既可以 standalone 运行，也可以由集中式平台统一执行。**
+
+::: tip 推荐工作流
+评估和接入 agent app (harness)、检查启动配置或开展实验时，建议使用仓库 `skills/agentic-rollout/` 下的
+`agentic-rollout` skill。该 skill 会检查当前 checkout，并按阶段检查 context topology、parser、export 与 credit、
+timeout、并发容量和 runtime 证据。实验仍需用户明确授权；本文继续说明 Chat Completions 请求与响应格式、API 和
+export 契约。
+
+手动阅读时：
+
 - 从已有 agent 开始：先读[准备 Agent](#准备-agent)，再读[用户接入](#用户接入)。
 - Multi-agent training、导出多个 context 或定义 per-context credit：
   [选择训练 Context 与 Credit](#选择训练-context-与-credit)。
@@ -12,18 +21,18 @@ Chat Completions endpoint。Agent 继续使用原有的 model-and-tool loop。Re
 - 理解 SessionForest 与调度原理：[理解 Agentic Rollout 原理](#理解-agentic-rollout-原理)。
 :::
 
-![Agent app integration](/agentic/agent_app.svg)
+![Agent integration](/agentic/agent_app.svg)
 
 ## 核心能力
 
-1. **用已有 agent app 做 Agentic RL**
-   通过 OpenAI-compatible Chat Completions API endpoint 接入已有 agent app，并连接到 Relax 训练。
+1. **用已有 agent 做 Agentic RL**
+   通过 OpenAI-compatible Chat Completions API endpoint 接入已有 agent app (harness)，并连接到 Relax 训练。
 
 2. **Agent process warmup**
    在 rollout 执行前提前启动 agent process，隐藏进程启动、tool setup 和环境初始化耗时。
 
 3. **Request-level partial rollout**
-   在 Relax 内部中断和恢复 active model request，同时让 agent app 继续使用普通 chat-completion 流程。
+   在 Relax 内部中断和恢复 active model request，同时让 agent 继续使用普通 chat-completion 流程。
 
 ## 准备 Agent
 
@@ -31,18 +40,28 @@ Chat Completions endpoint。Agent 继续使用原有的 model-and-tool loop。Re
 
 - 通过原有输入接口接收一个真实任务；
 - 调用非流式 Chat Completions endpoint；
-- 完成完整的 model-and-tool loop，需要时包含多个 turn；
+- 完成一次完整的 harness 运行，需要时包含多个 turn；
 - 写出最终结果；
 - 正常退出，不产生错误。
 
-Task input、model endpoint、API credential 和 result output 都应支持配置。接入后继续使用同一套 agent loop；
-Relax 在 agent loop 外提供新的 input、endpoint 和 output boundary。
+Task input、model endpoint、API credential 和 result output 都应支持配置。接入后 harness 的行为保持不变；
+Relax 在其外围提供新的 input、endpoint 和 output boundary。
+
+Relax 为每个 Session 启动一个进程作为 agent 的入口。这个进程可以直接运行 agent、启动子进程，或把任务提交到
+其他机器或集中式平台。Agent 在哪里运行没有影响，只要请求能到达 `RELAX_BASE_URL`。这个进程持续运行到任务
+结束，然后退出。
+
+::: warning 远程集中式 Agent 平台
+如果您的 agent 并非在本地直接运行，而是提交到远程平台集中运行，并且远程平台带有 agent 并发限制，则启动前
+必须阅读[配置 Runtime 行为](#配置-runtime-行为)。
+:::
 
 ## 用户接入
 
 ### Dataset 与 Session Input
 
-Relax 把每个任务写入 `RELAX_INPUT_JSON` 指向的文件。文件包含 `messages` 和可选的 `metadata`：
+Relax 把每个任务写入 `RELAX_INPUT_JSON` 指向的文件。文件可以包含 `messages`、`metadata`，或同时包含两者。
+下面的例子直接提供可用的 messages：
 
 ```json
 {
@@ -59,12 +78,11 @@ Relax 把每个任务写入 `RELAX_INPUT_JSON` 指向的文件。文件包含 `m
 #### Text 与 Message Input
 
 标准 dataset 路径把 `--input-key` 映射到 `messages`。String 会转换成一条 user message；message list 保持 OpenAI
-message 结构。Application 从 metadata 读取任务时，input value 可以为空。
+message 结构。
 
 #### Metadata-Only Task
 
-`--metadata-key` 把 dataset object 映射到 `metadata`。Application 可以把完整任务保存在 metadata，并为
-`--input-key` 提供空值。
+`--metadata-key` 把 dataset object 映射到 `metadata`。Harness 可以在运行时读取 metadata，并现场组装 messages。
 
 #### Multimodal Input
 
@@ -122,8 +140,8 @@ Agentic rollout 会在 agent process 读取前，自动把该输入转换成 Ope
 
 ### 最小 Agent Application
 
-下面的 application 只调用一次 model，并导出最终 conversation。实际 agent 可以保留原有 tool loop，并用同一个
-client 发起更多请求。
+下面的 application 接收可直接使用的 messages，调用一次 model，并导出最终 conversation。基于 metadata 的
+harness 可以先读取 metadata，再组装 `messages`。实际 agent 可以保留原有 tool loop，并用同一个 client 发起更多请求。
 
 ```python
 import asyncio
@@ -162,6 +180,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+上面的 `timeout=9999` 是 agent 向 `RELAX_BASE_URL` 发起单次 Chat Completions request 的 wall-clock timeout。
+Prelaunch、partial rollout 的 abort/resume 或 fully async 执行可能会 hold 住同一个 request，因此 client timeout
+需要覆盖最长的等待时间。
+
 使用 `model_dump()` 保存完整 assistant message。Reasoning content 与 tool call 才能参与后续 turn 和 SessionForest
 matching。
 
@@ -175,14 +197,20 @@ matching。
 | `tools` | 该 branch 使用的 tool definitions |
 | `chat_template_kwargs` | 该 branch 使用的 template arguments |
 | `max_completion_tokens` | 当前 turn 的最大 generated token 数 |
+| `max_tokens` | `max_completion_tokens` 的旧版别名；同时设置时优先使用新字段 |
 | `stop` | 当前 turn 的 stop string 或 list |
 | `seed` | 当前 turn 的 sampling seed |
 | `logprobs` | 在 response 中返回 generated-token logprobs |
 
 ::: warning Chat Completions 兼容范围
 Endpoint 使用非流式响应。省略 `stream` 或设为 `false`；省略 `n` 或设为 `1`。不支持 `top_logprobs`、旧版
-`functions` 和 `function_call`。使用 `max_completion_tokens` 设置当前 turn 上限。`max_tokens`、`tool_choice`
-和未列出的 request field 不会被消费。
+`functions` 和 `function_call`。使用 `max_completion_tokens` 设置当前 turn 上限；`max_tokens` 可作为旧版别名。
+`tool_choice` 和未列出的 request field 不会被消费。
+
+Message role 使用 `user`、`assistant`、`tool` 或 `system`。User、system 与 tool message 需要非空 content；tool
+返回 `None` 或 `""` 时，使用稳定的非空表示。Assistant 包含 tool call 或 reasoning 时可以省略文本 content。Harness
+发送 `developer` 时，应配置为 `system`，或者在接入前确认该语义转换。`add_generation_prompt`、`tokenize` 与
+`tools` 由 Relax 管理，不要在 request `chat_template_kwargs` 中设置。
 :::
 
 使用了 `tools` 或 `chat_template_kwargs` 的 request 必须持续传入这些字段。模型和 chat template 需要时，配置
@@ -229,8 +257,7 @@ Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `e
 ```bash
 --use-agentic-rollout \
 --agent-cwd /path/to/agent_repo \
---agent-command "bash run_agent_app.sh" \
---agent-timeout 9999
+--agent-command "bash run_agent_app.sh"
 ```
 
 Model、dataset、parallelism 和 algorithm 配置可参考 `examples/` 下的完整 recipe。
@@ -251,7 +278,7 @@ Progress bar 使用 `scored` 表示已完成的 session。把最终 conversation
 | 每个 session 导出的 Context 数量 | 必需的训练 Credit |
 | --- | --- |
 | 一个 context | 写入 `reward`，或省略并配置 `--custom-rm-path` |
-| 多个 context | 配置 `--agentic-custom-advantage-path`，不使用 `--custom-rm-path` |
+| 多个 context | 配置 `--agentic-custom-advantage-path`；一般不鼓励 custom RM，使用前需要明确审查 Group RM |
 
 ### 导出最终 Conversation
 
@@ -266,7 +293,7 @@ Progress bar 使用 `scored` 表示已完成的 session。把最终 conversation
 }
 ```
 
-一个 session 存在多个 committed leaf 时，隐式导出会失败，此时应使用显式导出。
+隐式导出仅用于经过审查的严格线性历史。任何非线性历史都必须显式导出，即使当前只有一个 exportable leaf。
 
 ### 显式导出一个或多个 Context
 
@@ -407,8 +434,9 @@ KL 在后续训练中可能表示三种不同操作：
 - 通过 `--use-kl-loss` 启用的独立 reference-policy KL loss。
 
 ::: warning Custom advantage 的 Reward 配置
-不要同时配置 `--custom-rm-path` 与 `--agentic-custom-advantage-path`。函数使用的每项信号都应写入 export
-metadata。
+一般不建议同时使用 `--custom-rm-path` 与 `--agentic-custom-advantage-path`。未启用 `--group-rm` 时，ordinary
+custom RM path 会被跳过。经过明确审查的 Group RM 仍可为指标或过滤写入 reward，训练 credit 由 custom
+advantage 提供。Advantage 函数使用的每项信号都应写入 export metadata。
 :::
 
 ### Metrics 与 Passrate
@@ -418,14 +446,16 @@ metadata。
 - Output metadata 的顶层 numeric field 使用 `<field>/mean|median|max|min`，不带 `rollout/` 前缀。
 - Rollout dump 保留完整 metadata。
 
-一个 session 导出多个 context 时，通常由一个 context 携带顶层 `reward`，例如 `main`，使 passrate 对该 session
-outcome 计数一次。Custom advantage 需要同一 outcome 时，其他 context 可以在 metadata 中保存该值。Multi-context
-training 中，`reward` 用于上报 outcome，训练 credit 由 custom advantage 提供。
+启用 `--log-passrate` 时，multi-context Session 使用显式导出，并且只有一个代表 context 携带 reward，通常是
+`main`。选中的 primary reward value 成功时设为 `1`，其他情况设为 `0`；reward object 通过 `--reward-key` 选择该
+值。Sibling context 不设置 reward。Custom advantage 需要同一 outcome 时，其他 context 可以在 metadata 中保存
+该值。Group RM 如果为每个 exported row 写入 reward，则需要 custom logger 恢复 logical Session 分组。
+Multi-context training 中，reward 用于上报 outcome，训练 credit 由 custom advantage 提供。
 
 ### 多 Context Dynamic Batching
 
 任何可能从一个 session 导出多个 context 的 recipe 都**必须**配置 `--agentic-custom-advantage-path`，并且
-**必须**启用 dynamic batching。该场景不支持 `--custom-rm-path`。
+**必须**启用 dynamic batching。一般不鼓励 custom RM；仅在经过明确审查后，将 Group RM 用于上报或过滤。
 
 ```bash
 --use-dynamic-batch-size
@@ -434,21 +464,56 @@ training 中，`reward` 用于上报 outcome，训练 credit 由 custom advantag
 
 ## 配置 Runtime 行为
 
+::: danger 必须满足的 external agent 容量
+Agent 在带有硬并发限制的远程集中式平台运行时，先计算 train 上限和每个 Eval dataset 的上限：
+
+```text
+T = agentic_concurrency * n_samples_per_prompt
+G_d = dataset d 的 n_samples_per_eval_prompt
+C_d = 显式配置的 agentic_eval_concurrency，未配置时为 ceil(T / G_d)
+E_d = C_d * G_d
+E_peak = 所有 Eval dataset 的 E_d 最大值
+```
+
+多个 Eval dataset 串行执行，因此组合峰值是 `E_peak`，无需把所有 `E_d` 相加。
+
+启用 `--agentic-prelaunch`、`--partial-rollout` 或 `--fully-async` 时，表格中的
+**Eval 期间是否保留 train sessions** 应选择“是”。Prelaunch 与当前 step 共享 training resident capacity，
+因此 train 上限仍是 `T`；它会让 `T` 与 `E_peak` 同时存在。
+
+Train 与 Eval 共用一个 executor 时，再选择对应场景：
+
+| 是否启用 Eval | Eval 期间是否保留 train sessions | 所需 slots |
+| --- | --- | --- |
+| 否 | — | `external_slots >= T` |
+| 是 | 否 | `external_slots >= max(T, E_peak)` |
+| 是 | 是 | `external_slots >= T + E_peak` |
+
+Slots 不足时，Group 启动可能卡在 all-session first-request barrier。启动任务前必须检查该表格。
+:::
+
 | 目标 | 参数 | 行为 |
 | --- | --- | --- |
 | 限制 resident training Group | `--agentic-concurrency` | Prepare 与 Runtime 共享的 capacity |
-| 设置 resident Eval Group | `--agentic-eval-concurrency` | 未配置时根据 training capacity 推导 |
+| 设置 resident Eval Group | `--agentic-eval-concurrency` | 逻辑 Eval prompt Group capacity，未配置时根据 training capacity 推导 |
 | 提前启动 agent | `--agentic-prelaunch` | Resident capacity 空闲时启动 process |
 | 复用未完成 sample | `--partial-rollout` | 跨 step abort 并恢复 backend attempt |
 | 异步执行 rollout 与 training | `--fully-async` | Partition 前进时保留未完成 session |
 | 限制 partial abort 次数 | `--partial-rollout-max-aborted-count` | 保护多次被 abort 的 attempt |
-| 限制 active session 时间 | `--agent-timeout` | Active-time budget 用尽后终止 session |
+| 终止运行过久的 agent | `--agent-timeout` | Runtime active-time budget 用尽后终止 agent process |
+
+`--agent-timeout` 在 Session 进入 Runtime 后开始计时。Agent 的 loop、tool call 等持续运行过久时，Relax 会终止
+该进程。Prelaunch Session 等待 Runtime 时不会消耗这段时间；partial rollout 或 fully async 让普通 Session 跨
+step 暂停时，计时也会暂停。
 
 `--agentic-concurrency` 默认使用 `--over-sampling-batch-size`，后者默认使用 `--rollout-batch-size`。
-`--agentic-eval-concurrency` 未配置时，根据 training session capacity 和 evaluation group size 推导。
+`--agentic-eval-concurrency` 未配置时，分别根据 `T` 和每个 Eval dataset 的 Group size 推导。两个参数都以逻辑
+prompt Group 为单位。无论使用 ordinary RM 还是 Group RM，dataset `d` 都持有 `E_d` 个 Sessions；ordinary RM
+内部使用 singleton Runtime Group，但不会改变该总数。多个 Eval dataset 串行执行，因此 Train 与 Eval 使用独立
+executor 时，分别为 `T` 和 `E_peak` 配置容量。
 
-Partial rollout 与 fully async 是两种执行模式。两者都可以跨 rollout step 保留未完成的 managed session。继续使用
-最小 application 中的长 Chat Completions timeout。
+Partial rollout 与 fully async 是互斥的执行模式。两者都可以跨 rollout step 保留未完成的 Session；请选择其中
+一种。继续使用最小 application 中的长 Chat Completions timeout。
 
 Retriever、environment server 等 cross-session service 应在 per-session agent command 外启动。
 
@@ -457,9 +522,9 @@ Session KV lifecycle 与 program-aware admission 是长时间 Agentic workload �
 
 ## 理解 Agentic Rollout 原理
 
-### Managed Session Lifecycle
+### Session Lifecycle
 
-一个 dataset sample 创建一个 managed session。Session 拥有一个 agent process、一个 SessionForest、rollout mode
+一个 dataset sample 创建一个 Session。Session 拥有一个 agent process、一个 SessionForest、rollout mode
 和 active-time budget。Process 可以顺序或并发调用 Chat Completions。Process 退出后，Relax 选择指定 Forest
 state、计算训练 credit，并把 sample 发送到训练侧。
 
@@ -558,7 +623,7 @@ Prelaunch 改变 agent process 的启动时间，不改变 request 进入 Runtim
 
 #### 跨 Step 留存
 
-Partial rollout 与 fully async 都可以跨 rollout step 保留 managed session。下图展示 partial rollout 路径：SGLang
+Partial rollout 与 fully async 都可以跨 rollout step 保留 Session。下图展示 partial rollout 路径：SGLang
 在 abort 后返回 partial token prefix，Relax 暂停 request，后续 backend attempt 继续同一个 HTTP request。
 
 ![Request-level partial rollout](/agentic/partial_rollout.svg)

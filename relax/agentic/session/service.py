@@ -476,13 +476,11 @@ def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
     if "function_call" in payload and payload["function_call"] not in (None, "none"):
         fail("function_call is not supported", param="function_call")
 
-    max_completion_tokens = payload.get("max_completion_tokens")
-    if max_completion_tokens is not None and (
-        not isinstance(max_completion_tokens, int)
-        or isinstance(max_completion_tokens, bool)
-        or max_completion_tokens <= 0
-    ):
-        fail("max_completion_tokens must be a positive integer", param="max_completion_tokens")
+    for field_name in ("max_completion_tokens", "max_tokens"):
+        value = payload.get(field_name)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
+            fail(f"{field_name} must be a positive integer", param=field_name)
+    max_completion_tokens = payload.get("max_completion_tokens") or payload.get("max_tokens")
 
     stop = payload.get("stop")
     if (
@@ -634,6 +632,7 @@ class _SessionRecord:
     resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
+    protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
 
     @property
@@ -890,8 +889,10 @@ class AgenticSessionShard:
         """Gate train generation and park requests actually aborted."""
 
         self._train_generation_open = False
-        await self._set_runtime_timeouts_active(False)
-        await self._interrupt_running_requests()
+        try:
+            await self._interrupt_running_requests()
+        finally:
+            await self._set_runtime_timeouts_active(False)
         self._notify_state_change()
         return self._state_revision
 
@@ -955,12 +956,21 @@ class AgenticSessionShard:
                     async with session.lock:
                         if session.phase is SessionPhase.ACTIVE:
                             session.rollout_id = rollout_id
+                            if session.protection_pending_until_resume:
+                                session.protection_pending_until_resume = False
+                                session.protected_until_finalize = True
+                                for ir in session.live_irs:
+                                    ir.kind = RequestKind.PROTECTED
 
+        runtime_groups = tuple(
+            group
+            for group in self._groups.values()
+            if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME
+        )
+        await asyncio.gather(*(self._set_group_timeout_active(group, True) for group in runtime_groups))
         self._train_generation_open = True
-        for group in tuple(self._groups.values()):
-            if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME:
-                await self._set_group_timeout_active(group, True)
-                await self._open_group(group)
+        for group in runtime_groups:
+            await self._open_group(group)
         self._notify_state_change()
         return self._state_revision
 
@@ -1725,13 +1735,11 @@ class AgenticSessionShard:
                 ir.kind = cast(SessionForest, session.forest).resolve_request_kind(
                     abort_count=ir.abort_count,
                     resumed=True,
-                    protected_abort_count_threshold=protected_abort_count_threshold,
                 )
                 ir.pending_status = "aborted"
                 if protected_abort_count_threshold is not None and ir.abort_count >= protected_abort_count_threshold:
-                    session.protected_until_finalize = True
-                    for live_ir in session.live_irs:
-                        live_ir.kind = RequestKind.PROTECTED
+                    # Activate protection at the next rollout boundary, after this interrupted step has closed.
+                    session.protection_pending_until_resume = True
                 session.queued_irs.append(ir)
                 self._dispatch_queued_irs_locked(session)
                 self._notify_state_change(group)
