@@ -2,9 +2,13 @@
 
 import dataclasses
 import ipaddress
+import json
 import multiprocessing
 import os
 import signal
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from typing import Optional
@@ -28,6 +32,7 @@ except ImportError:
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
+from relax.utils import scale_utils
 from relax.utils.async_utils import run
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
@@ -40,6 +45,7 @@ from relax.utils.s3_model_loader import (
     maybe_resolve_s3_model_to_shm,
     resolve_s3_model_metadata_to_shm,
 )
+from relax.utils.scale_utils import PrecheckProbeCategory
 
 
 logger = get_logger(__name__)
@@ -1137,6 +1143,259 @@ class SGLangEngine(RayActor):
                 "group_name": group_name,
             },
         )
+
+    def get_scale_weight_sync_transport_fingerprint(self) -> dict:
+        """The engine's NCCL transport env — a cheap fingerprint (no NCCL, no
+        subprocess) for the Stage-1 seed-vs-new compatibility gate before the
+        real probe."""
+        return {
+            "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
+            "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
+            "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
+            "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
+        }
+
+    def run_scale_weight_sync_precheck(
+        self,
+        master_address: str,
+        ports: str,
+        group_rank: int,
+        run_token: str,
+        tp_size: int,
+        timeout_secs: float,
+    ) -> dict:
+        """Run an independent NCCL probe without touching ModelRunner groups.
+
+        The probe reuses this actor's node, GPU mapping, Python environment,
+        and NCCL environment. It launches local subprocesses only; no new Ray
+        actor or GPU allocation is created. Transport variables are inherited
+        verbatim, so socket-only mode is accepted only when both engine actors
+        already received the same job-start environment.
+        """
+        if self.node_rank != 0:
+            return {"success": False, "category": PrecheckProbeCategory.UNSUPPORTED_NODE_RANK.value, "results": []}
+        local_gpu_count = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
+        if tp_size != local_gpu_count:
+            return {
+                "success": False,
+                "category": PrecheckProbeCategory.UNSUPPORTED_TOPOLOGY.value,
+                "message": f"precheck requires one local process per TP rank: {tp_size=} {local_gpu_count=}",
+                "results": [],
+            }
+
+        port_list = ports.split(",")
+        if len(port_list) != tp_size:
+            return {
+                "success": False,
+                "category": PrecheckProbeCategory.INVALID_PORTS.value,
+                "message": f"expected {tp_size} ports, got {len(port_list)}",
+                "results": [],
+            }
+
+        env = os.environ.copy()
+        visible_env = device_utils.get_visible_devices_env_var()
+        inherited_visible = [item.strip() for item in env.get(visible_env, "").split(",") if item.strip()]
+        physical_gpu_ids = [self.base_gpu_id + local_rank for local_rank in range(tp_size)]
+        if inherited_visible:
+            physical_tokens = [str(gpu_id) for gpu_id in physical_gpu_ids]
+            if all(token in inherited_visible for token in physical_tokens):
+                selected_visible = physical_tokens
+                parent_device_ids = [inherited_visible.index(token) for token in physical_tokens]
+            elif all(0 <= gpu_id < len(inherited_visible) for gpu_id in physical_gpu_ids):
+                selected_visible = [inherited_visible[gpu_id] for gpu_id in physical_gpu_ids]
+                parent_device_ids = physical_gpu_ids
+            else:
+                return {
+                    "success": False,
+                    "category": PrecheckProbeCategory.GPU_MAPPING_MISMATCH.value,
+                    "message": f"cannot map {physical_gpu_ids=} under {visible_env}={inherited_visible}",
+                    "results": [],
+                }
+        else:
+            selected_visible = [str(gpu_id) for gpu_id in physical_gpu_ids]
+            parent_device_ids = physical_gpu_ids
+        # Ray intentionally does not isolate this actor's CVD. Restrict each
+        # probe process tree to exactly the GPUs already assigned to the engine.
+        env[visible_env] = ",".join(selected_visible)
+        # Diagnostic verbosity is local to the probe subprocess and does not
+        # alter the seed ModelRunner environment or transport selection.
+        env["NCCL_DEBUG"] = "INFO"
+        env["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
+        env.pop("NCCL_DEBUG_FILE", None)
+
+        # Each probe creates a CUDA context next to the live ModelRunner. Check
+        # every assigned device before launching any child so low headroom
+        # fails closed without partially starting a probe. SGLang reserves
+        # ~85-90% VRAM via mem-fraction-static, so a healthy engine often has
+        # <2 GiB free even though a probe only needs a CUDA context + tiny NCCL
+        # buffers (~few hundred MB); default to a realistic 512 MiB floor.
+        min_free_bytes = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES
+        memory_results = []
+        try:
+            import torch
+
+            for local_rank, (physical_gpu_id, parent_device_id) in enumerate(zip(physical_gpu_ids, parent_device_ids)):
+                free_bytes, total_bytes = torch.cuda.mem_get_info(parent_device_id)
+                memory_results.append(
+                    {
+                        "local_rank": local_rank,
+                        "physical_gpu_id": physical_gpu_id,
+                        "parent_device_id": parent_device_id,
+                        "free_bytes": free_bytes,
+                        "total_bytes": total_bytes,
+                        "required_free_bytes": min_free_bytes,
+                    }
+                )
+        except Exception as exc:
+            return {
+                "success": False,
+                "category": PrecheckProbeCategory.MEMORY_CHECK_FAILED.value,
+                "message": f"failed to query GPU memory: {type(exc).__name__}: {exc}",
+                "memory": memory_results,
+                "results": [],
+            }
+        if any(item["free_bytes"] < min_free_bytes for item in memory_results):
+            return {
+                "success": False,
+                "category": PrecheckProbeCategory.INSUFFICIENT_GPU_MEMORY.value,
+                "memory": memory_results,
+                "results": [],
+            }
+
+        processes = []
+        log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
+        started_at = time.monotonic()
+        for local_rank, port in enumerate(port_list):
+            command = [
+                sys.executable,
+                "-m",
+                "relax.backends.sglang._scale_weight_sync_precheck",
+                "--master-address",
+                master_address,
+                "--master-port",
+                port,
+                "--rank",
+                str(group_rank),
+                "--device-id",
+                str(local_rank),
+                "--timeout-secs",
+                str(timeout_secs),
+                "--run-token",
+                f"{run_token}-{local_rank}",
+            ]
+            try:
+                log_path = os.path.join(log_directory.name, f"rank-{local_rank}.log")
+                log_file = open(log_path, "w", encoding="utf-8")
+                process = subprocess.Popen(
+                    command,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    start_new_session=True,
+                )
+                processes.append((local_rank, process, log_file, log_path))
+            except Exception as exc:
+                if "log_file" in locals() and not log_file.closed:
+                    log_file.close()
+                for _, process, process_log, _ in processes:
+                    scale_utils._terminate_probe_process(process)
+                    process_log.close()
+                log_directory.cleanup()
+                return {
+                    "success": False,
+                    "category": PrecheckProbeCategory.LAUNCH_TRANSIENT.value,
+                    "message": f"failed to launch rank {local_rank}: {type(exc).__name__}: {exc}",
+                    "results": [],
+                }
+
+        deadline = started_at + timeout_secs
+        # Wrap the entire post-launch body so an unexpected exception (e.g.
+        # ``open`` failing during result collection) cannot leak running child
+        # processes (CUDA context + NCCL group on the LIVE gpu) or the tempdir.
+        # The finally is idempotent: terminating an already-dead process is a
+        # no-op (poll() guards it) and closing a closed file is harmless.
+        try:
+            while any(process.poll() is None for _, process, _, _ in processes) and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+            timed_out = {local_rank for local_rank, process, _, _ in processes if process.poll() is None}
+            for local_rank, process, _, _ in processes:
+                if local_rank in timed_out:
+                    scale_utils._terminate_probe_process(process)
+
+            results = []
+            for local_rank, process, log_file, log_path in processes:
+                # A probe wedged in an uninterruptible (D) state can survive SIGKILL,
+                # so bound the join instead of blocking this actor thread forever.
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        f"NCCL precheck rank {local_rank} (pid {process.pid}) unresponsive after "
+                        "SIGKILL; abandoning join to avoid blocking the actor"
+                    )
+                log_file.close()
+                with open(log_path, encoding="utf-8", errors="replace") as probe_log:
+                    combined_output = probe_log.read()
+                parsed = None
+                for line in reversed(combined_output.splitlines()):
+                    try:
+                        parsed = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                # Category is derived from structured signals only: the manager
+                # deadline, the subprocess exit code, and its JSON — never by
+                # scanning the NCCL log text.
+                if local_rank in timed_out:
+                    category, success = PrecheckProbeCategory.TIMEOUT.value, False
+                elif process.returncode == 0 and bool(parsed and parsed.get("success")):
+                    category, success = None, True
+                elif parsed is None:
+                    # No structured output → the subprocess never really ran.
+                    category, success = PrecheckProbeCategory.LAUNCH_TRANSIENT.value, False
+                else:
+                    # Ran but NCCL init/collective raised; carry the raw exception.
+                    category, success = PrecheckProbeCategory.PROBE_FAILED.value, False
+                parsed = parsed or {}
+                results.append(
+                    {
+                        "local_rank": local_rank,
+                        "success": success,
+                        "category": category,
+                        "returncode": process.returncode,
+                        "error_type": parsed.get("error_type"),
+                        "error": parsed.get("error"),
+                        "result": parsed or None,
+                        "log_tail": combined_output[-4000:],  # surfaced in the coordinator's failure log
+                    }
+                )
+
+            failed = [result for result in results if not result["success"]]
+            return {
+                "success": not failed,
+                "category": failed[0]["category"] if failed else None,
+                "error_type": failed[0].get("error_type") if failed else None,
+                "error": failed[0].get("error") if failed else None,
+                "run_token": run_token,
+                "memory": memory_results,
+                "fingerprint": {
+                    "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
+                    "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
+                    "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
+                    "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
+                    "visible_devices": selected_visible,
+                },
+                "results": results,
+            }
+        finally:
+            for _, process, log_file, _ in processes:
+                scale_utils._terminate_probe_process(process)
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+            log_directory.cleanup()
 
     def pause_generation(self, timeout: float | None = None):
         response = requests.post(

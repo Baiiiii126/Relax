@@ -36,6 +36,7 @@ from relax.backends.megatron.weight_conversion import convert_to_hf
 from relax.backends.megatron.weight_update.common import all_gather_param, named_params_and_buffers
 from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _adapter_base_prefix, _base_param_prefix
 from relax.backends.megatron.weight_update.lora_adapter_sync import LoraAdapterSync
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
@@ -215,7 +216,7 @@ class DeviceDirectBackend(CommBackend):
         """
         logger.info(f"Creating {len(rollout_topology)} RolloutEngine actors...")
         for rank, node_info in rollout_topology.items():
-            actor = RolloutEngine.remote(int(rank), node_info)
+            actor = RolloutEngine.options(**with_control_plane_affinity(self.args)).remote(int(rank), node_info)
             self.rollout_engines[int(rank)] = actor
             logger.info(f"Created RolloutEngine actor for rank {rank}")
 

@@ -1042,6 +1042,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=["rollback_all", "keep_partial"],
                 help="Policy for handling partial success during scale-out. 'rollback_all' reverts all engines on any failure. 'keep_partial' keeps successfully scaled engines.",
             )
+            parser.add_argument(
+                "--scale-weight-sync-precheck",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Run an independent NCCL precheck before scale-out weight sync; fail-closed on "
+                "incompatible transport. Disable with --no-scale-weight-sync-precheck.",
+            )
             # Elastic rollout scale-in arguments
             parser.add_argument(
                 "--scale-in-drain-timeout",

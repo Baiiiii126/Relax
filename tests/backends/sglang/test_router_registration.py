@@ -65,10 +65,18 @@ def sglang_engine_module(monkeypatch):
     megatron_peft_utils.is_lora_enabled = lambda _args: False
     monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
 
-    sys.modules.pop("relax.backends.sglang.sglang_engine", None)
+    # Force a fresh import so the module binds to the stubbed dependencies above,
+    # but restore the original module object on teardown. Leaving the key popped
+    # corrupts sys.modules for any later test that patches this module: their
+    # patch() re-imports a *new* module object distinct from the one already
+    # bound in other test files' top-level imports, so the patch silently misses.
+    original_module = sys.modules.pop("relax.backends.sglang.sglang_engine", None)
     module = importlib.import_module("relax.backends.sglang.sglang_engine")
     yield module
-    sys.modules.pop("relax.backends.sglang.sglang_engine", None)
+    if original_module is not None:
+        sys.modules["relax.backends.sglang.sglang_engine"] = original_module
+    else:
+        sys.modules.pop("relax.backends.sglang.sglang_engine", None)
 
 
 class _Response:

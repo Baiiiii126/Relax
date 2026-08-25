@@ -21,6 +21,7 @@ from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
     shutdown_agentic_chat_api_services,
 )
+from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
@@ -47,6 +48,11 @@ from relax.utils.s3_model_loader import (
 )
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
+
+
+def create_data_source_actor(config: Namespace, data_source_cls: Any) -> Any:
+    actor_cls = ray.remote(num_cpus=1)(data_source_cls)
+    return actor_cls.options(**with_control_plane_affinity(config)).remote(config)
 
 
 def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
@@ -146,7 +152,8 @@ class Controller:
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
-        self._health_manager = HealthManager(check_interval=1.0)
+        require_control_plane_resource(config)
+        self._health_manager = HealthManager(check_interval=1.0, config=config)
         self._restarting = False  # Flag to indicate a restart is in progress
         self._restart_done_event = threading.Event()  # Signals main thread that global restart Phase 1+2 is done
         self._restart_error = None  # Stores any error from the global restart thread
@@ -165,7 +172,9 @@ class Controller:
 
         # Initialize data management system
         self._initialize_data_system()
-        self.dcs, self.config.coordinator_url = create_dcs_deployment()
+        self.dcs, self.config.coordinator_url = create_dcs_deployment(
+            ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
+        )
 
         self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
         if self._metrics_service_enabled:
@@ -313,7 +322,9 @@ class Controller:
         """
         from relax.utils.metrics.service import MetricsService
 
-        deployment = MetricsService.bind(
+        deployment = MetricsService.options(
+            ray_actor_options=with_control_plane_affinity(self.config, {"num_cpus": 1})
+        ).bind(
             healthy=self._health_manager.status,
             pg=None,
             config=self.config,
@@ -331,7 +342,9 @@ class Controller:
         """
         from relax.utils.autoscaler.autoscaler_service import AutoscalerService
 
-        deployment = AutoscalerService.bind(
+        deployment = AutoscalerService.options(
+            ray_actor_options=with_control_plane_affinity(self.config, {"num_cpus": 1})
+        ).bind(
             healthy=self._health_manager.status,
             pg=None,
             autoscaler_config=self._autoscaler_config,
@@ -693,7 +706,7 @@ class Controller:
                 continue
             if str(role) == "rollout":
                 data_source_cls = load_function(self.config.data_source_path)
-                data_source = ray.remote(num_cpus=1)(data_source_cls).remote(self.config)
+                data_source = create_data_source_actor(self.config, data_source_cls)
             else:
                 data_source = None
             # Optional roles (e.g. reference) may be absent from resource config

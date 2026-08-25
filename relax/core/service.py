@@ -12,6 +12,7 @@ from ray import serve
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.placement_group import InfoActor, sort_key
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
@@ -93,12 +94,16 @@ class Service:
         Args:
             pgs: Placement group tuple or None.
         """
+        ray_actor_options = with_control_plane_affinity(
+            self.config,
+            {"runtime_env": self.runtime_env},
+        )
         if self.data_source is not None:
-            self.service = self.cls.options(ray_actor_options={"runtime_env": self.runtime_env}).bind(
+            self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
             )
         else:
-            self.service = self.cls.options(ray_actor_options={"runtime_env": self.runtime_env}).bind(
+            self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
                 self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
             )
         logger.info(f"[{self.role}] Deploying service...")
