@@ -175,6 +175,48 @@ def test_service_forwards_enable_affinity_true():
     mock_cpg.assert_called_once_with(num_gpus=2, node_group_affinity=True)
 
 
+@pytest.mark.parametrize("has_data_source", [False, True])
+def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path, has_data_source):
+    config_path = tmp_path / "autoscaler.yaml"
+    config_path.write_text("enabled: true\n")
+    deployment_cls = MagicMock()
+    deployment = deployment_cls.options.return_value
+    service = object.__new__(Service)
+    service.cls = deployment_cls
+    service.config = Namespace(autoscaler_config=str(config_path), enable_affinity=True)
+    service.runtime_env = {"env_vars": {"A": "B"}}
+    service.healthy = MagicMock()
+    service.num_gpus = 0
+    service.role = "rollout" if has_data_source else "actor"
+    service.data_source = MagicMock() if has_data_source else None
+
+    with patch("relax.core.service.serve.run", return_value=MagicMock()):
+        service._deploy(None)
+
+    assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == {
+        "runtime_env": {"env_vars": {"A": "B"}},
+        "resources": {"stable_cpu": 1},
+    }
+    deployment.bind.assert_called_once()
+
+
+def test_service_deploy_is_unconstrained_without_autoscaler():
+    deployment_cls = MagicMock()
+    service = object.__new__(Service)
+    service.cls = deployment_cls
+    service.config = Namespace(autoscaler_config=None, enable_affinity=True)
+    service.runtime_env = None
+    service.healthy = MagicMock()
+    service.num_gpus = 0
+    service.role = "actor"
+    service.data_source = None
+
+    with patch("relax.core.service.serve.run", return_value=MagicMock()):
+        service._deploy(None)
+
+    assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == {"runtime_env": None}
+
+
 def test_service_deferred_deploy_keeps_placement_group_ownership():
     pgs = ("service-owned-pg", [0], [0])
     with (
