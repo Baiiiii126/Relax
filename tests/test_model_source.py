@@ -42,6 +42,144 @@ def test_model_source_aliases_normalize_local_paths_and_ignore_empty_values():
     assert "." not in m.model_source_path_aliases(args, args.model_source.uri)
 
 
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "s3://bucket/model/../model",
+        "tidalcache://Qwen/model/../model",
+        "https://models.example.com/model/../model",
+        "file:///models/model/../model",
+    ],
+)
+def test_normalize_model_path_preserves_hierarchical_uris(uri):
+    assert m.is_model_uri(uri)
+    assert m.normalize_model_path(uri) == uri
+
+
+def test_normalize_model_path_normalizes_absolute_and_relative_local_paths():
+    assert m.normalize_model_path("/models/parent/../model") == "/models/model"
+    assert m.normalize_model_path("models/parent/../model") == "models/model"
+
+
+def test_uri_shape_detection_does_not_parse_malformed_authority():
+    malformed_uri = "tidalcache://[invalid-authority"
+
+    assert m.is_model_uri(malformed_uri)
+    assert m.normalize_model_path(malformed_uri) == malformed_uri
+
+
+def test_validate_ref_load_defers_same_model_source_uri(monkeypatch):
+    from relax.utils import arguments
+
+    logical_uri = "tidalcache://Qwen/Qwen3.5-35B-A3B"
+    args = SimpleNamespace(
+        ref_load=logical_uri,
+        model_source=m.ModelSource("s3://bucket/models/qwen35/"),
+        _model_source_original_hf_checkpoint=logical_uri,
+    )
+    monkeypatch.setattr(
+        arguments.os.path, "exists", lambda _path: pytest.fail("must not validate source alias locally")
+    )
+
+    arguments._validate_ref_load(args)
+
+
+def test_validate_ref_load_rejects_distinct_model_uri():
+    from relax.utils import arguments
+
+    args = SimpleNamespace(
+        ref_load="tidalcache://Qwen/reference-model",
+        model_source=m.ModelSource("s3://bucket/models/policy/"),
+        _model_source_original_hf_checkpoint="tidalcache://Qwen/policy-model",
+    )
+
+    with pytest.raises(ValueError, match="does not match the configured model source"):
+        arguments._validate_ref_load(args)
+
+
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize("with_model_source", [False, True])
+def test_validate_ref_load_keeps_local_reference_behavior(tmp_path, monkeypatch, relative, with_model_source):
+    from relax.utils import arguments
+
+    reference = tmp_path / "bf16-reference"
+    reference.mkdir()
+    (reference / "latest_checkpointed_iteration.txt").write_text("1")
+    if relative:
+        monkeypatch.chdir(tmp_path)
+        ref_load = reference.name
+    else:
+        ref_load = str(reference)
+    args = SimpleNamespace(ref_load=ref_load)
+    if with_model_source:
+        args.model_source = m.ModelSource("s3://bucket/models/int4-policy/")
+        args._model_source_original_hf_checkpoint = "tidalcache://Qwen/int4-policy"
+
+    arguments._validate_ref_load(args)
+
+
+def test_validate_ref_load_without_model_source_still_requires_local_path(tmp_path):
+    from relax.utils import arguments
+
+    args = SimpleNamespace(ref_load=str(tmp_path / "missing-reference"))
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        arguments._validate_ref_load(args)
+
+
+def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch):
+    from relax.backends.megatron import arguments as megatron_arguments
+    from relax.utils import arguments
+
+    logical_uri = "tidalcache://Qwen/Qwen3.5-35B-A3B"
+    source = m.ModelSource("s3://bucket/models/qwen35/", provider_name="tidalcache")
+    parsed = SimpleNamespace(
+        hf_checkpoint=logical_uri,
+        ref_load=logical_uri,
+        start_rollout_id=None,
+        critic_train_only=False,
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=1,
+    )
+    pre = SimpleNamespace(
+        debug_train_only=True,
+        debug_rollout_only=True,
+        load_debug_rollout_data=None,
+        skip_hf_validate=False,
+    )
+    provider_argv = None
+    validated = False
+
+    def provider(argv):
+        nonlocal provider_argv
+        provider_argv = argv
+        return source
+
+    def validate(parsed_args):
+        nonlocal validated
+        assert parsed_args.model_source == source
+        assert parsed_args._model_source_original_hf_checkpoint == logical_uri
+        assert parsed_args.hf_checkpoint == source.uri
+        arguments._validate_ref_load(parsed_args)
+        validated = True
+
+    m.register_model_source_provider("tidalcache", provider)
+    monkeypatch.setattr(arguments.sys, "argv", ["train.py", "--hf-checkpoint", logical_uri, "--ref-load", logical_uri])
+    monkeypatch.setattr(arguments, "_pre_parse_cli_model_source", lambda: None)
+    monkeypatch.setattr(arguments, "_pre_parse_mode", lambda: pre)
+    monkeypatch.setattr(arguments, "get_slime_extra_args_provider", lambda _custom: None)
+    monkeypatch.setattr(arguments, "slime_validate_args", validate)
+    monkeypatch.setattr(megatron_arguments, "_megatron_parse_args", lambda **_kwargs: parsed)
+    monkeypatch.setattr(megatron_arguments, "_derive_cluster_args_from_resource", lambda _args: None)
+    monkeypatch.setattr(megatron_arguments, "_set_default_megatron_args", lambda args: args)
+
+    result = arguments.parse_args()
+
+    assert result is parsed
+    assert provider_argv == tuple(arguments.sys.argv)
+    assert validated
+
+
 def test_parse_args_passes_provider_source_without_rewriting_argv(monkeypatch):
     from relax.utils import arguments
 

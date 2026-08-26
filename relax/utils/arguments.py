@@ -15,6 +15,7 @@ from relax.backends.sglang.arguments import validate_args as sglang_validate_arg
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
     is_managed_opd_teacher_enabled,
@@ -3205,6 +3206,25 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     return True
 
 
+def _validate_ref_load(args: argparse.Namespace) -> None:
+    """Validate a local reference checkpoint or defer a source alias."""
+    if is_model_source_alias(args, args.ref_load):
+        return
+    if is_model_uri(args.ref_load):
+        raise ValueError(
+            f"ref_load URI {args.ref_load!r} does not match the configured model source; "
+            "only a ref_load alias of hf_checkpoint or a local path is supported."
+        )
+    if not os.path.exists(args.ref_load):
+        raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+
+    if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
+        logger.info(
+            f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
+            "please make sure it is a valid megatron checkpoint directory."
+        )
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -3312,14 +3332,7 @@ def slime_validate_args(args):
         )
 
     if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
-        if not os.path.exists(args.ref_load):
-            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
-
-        if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
-            logger.info(
-                f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
-                "please make sure it is a valid megatron checkpoint directory."
-            )
+        _validate_ref_load(args)
 
     validate_opd_args(args, is_sft=is_sft, log=logger)
 

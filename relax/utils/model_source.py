@@ -2,6 +2,7 @@
 """Model-source descriptors and optional provider registration."""
 
 import os
+import re
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -48,11 +49,17 @@ ModelSourceProvider = Callable[[Sequence[str]], ModelSource | None]
 
 _PROVIDERS: dict[str, ModelSourceProvider] = {}
 _FROZEN = False
+_MODEL_URI_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def is_model_uri(path: str) -> bool:
+    """Return whether a model path has a hierarchical URI-shaped prefix."""
+    return _MODEL_URI_PREFIX.match(path) is not None
 
 
 def normalize_model_path(path: str) -> str:
-    """Normalize local path spelling without resolving node-local symlinks."""
-    return path if path.lower().startswith("s3://") else os.path.normpath(path)
+    """Normalize local path spelling without rewriting model URIs."""
+    return path if is_model_uri(path) else os.path.normpath(path)
 
 
 def model_source_path_aliases(args: Namespace, source_uri: str) -> set[str]:
