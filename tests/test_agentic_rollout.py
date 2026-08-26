@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from argparse import Namespace
 from collections import deque
@@ -170,6 +171,59 @@ def _forest_with_initial_obs(
         rollout_token_delta=list(rollout_token_delta),
     )
     return forest, initial_obs
+
+
+def test_session_parent_match_canonicalizes_python_typescript_tool_arguments() -> None:
+    def tool_call_message(arguments: str) -> dict[str, Any]:
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "run", "arguments": arguments},
+                }
+            ],
+        }
+
+    system_message = {"role": "system", "content": "Use tools."}
+    user_message = {"role": "user", "content": "Run the tool"}
+    python_arguments = json.dumps({"c": "d", "a": "b"})
+    typescript_arguments = '{"a":"b","c":"d"}'
+
+    forest, observation = _forest_with_initial_obs(
+        session_id="python-typescript-tool-arguments",
+        messages=[system_message, user_message],
+        train_token_delta=[1, 2],
+        rollout_token_delta=[1, 2],
+    )
+    response = forest.append_resp(
+        parent_state_hash=observation.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=check_messages([tool_call_message(python_arguments)]),
+        token_delta=[3],
+        logprob_delta=[-0.1],
+    )
+    tool_result = {"role": "tool", "tool_call_id": "call-1", "content": "done"}
+    replayed_messages = check_messages(
+        [system_message, user_message, tool_call_message(typescript_arguments), tool_result]
+    )
+
+    parent, unmatched = AgenticSessionShard._match_parent_state(
+        forest=forest,
+        messages=replayed_messages,
+        tools=[],
+        chat_template_kwargs={},
+    )
+
+    assert python_arguments == '{"c": "d", "a": "b"}'
+    assert forest.full_messages(response.state_hash)[-1]["tool_calls"][0]["function"]["arguments"] == (
+        typescript_arguments
+    )
+    assert parent is response
+    assert unmatched == [tool_result]
 
 
 def _group_export(group_id: str, *, row_count: int = 2) -> GroupExport:
