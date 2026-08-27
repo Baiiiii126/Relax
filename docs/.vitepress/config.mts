@@ -319,6 +319,7 @@ export default defineConfig({
                 { text: 'On-Policy Distillation', link: '/en/examples/on-policy-distillation' },
                 { text: 'Generative Reward Model', link: '/en/examples/generative-reward-model' },
                 { text: 'Low-Precision Training', link: '/en/examples/low-precision-training' },
+                { text: 'Elastic Rollout', link: '/en/examples/elastic-rollout' },
                 { text: 'Algorithms', link: '/en/examples/algorithms' }
               ]
             }
@@ -433,6 +434,7 @@ export default defineConfig({
                 { text: '在线策略蒸馏', link: '/zh/examples/on-policy-distillation' },
                 { text: '生成式奖励模型', link: '/zh/examples/generative-reward-model' },
                 { text: '低精度训练', link: '/zh/examples/low-precision-training' },
+                { text: '弹性 Rollout', link: '/zh/examples/elastic-rollout' },
                 { text: '算法参考', link: '/zh/examples/algorithms' }
               ]
             }

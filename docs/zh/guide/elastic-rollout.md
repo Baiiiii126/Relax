@@ -23,6 +23,9 @@
 弹性扩缩容仅在全异步模式下可用。在全异步模式中，Rollout 独占 GPU 资源并作为独立服务运行，天然适合弹性扩缩。关于全异步模式的更多信息，请参阅 [全异步训练流水线](./fully-async-training.md)。
 :::
 
+如需可直接运行的 Qwen3-4B 配置，以及基于 Autoscaler 的扩缩容和外部优雅抢占
+要求，请参阅[弹性 Rollout recipe](../examples/elastic-rollout.md)。
+
 ______________________________________________________________________
 
 ## 设计特色
@@ -701,8 +704,15 @@ ray job submit -- python3 relax/entrypoints/train.py \
 #### 基线节点组亲和性
 
 启用 autoscaler 配置后，Relax 会将 actor、critic、reference、rollout-seed 和 colocate 的基线 placement group
-固定到 `stable` worker group，弹性 rollout 引擎不受此约束。集群必须发布 `stable_gpu` 和 `stable_cpu` Ray
-自定义资源；资源不可用时 Relax 会快速失败。可通过 `--no-enable-affinity` 关闭该约束。
+固定到初始节点组，弹性 rollout 引擎不受此约束。节点组前缀由 `RELAX_INITIAL_NODE_GROUP` 设置，默认为
+`stable`；集群必须发布对应的 `<prefix>_gpu` 和 `<prefix>_cpu` Ray 自定义资源。例如设置
+`RELAX_INITIAL_NODE_GROUP=baseline` 时，需要提供 `baseline_gpu` 和 `baseline_cpu`。任一标记资源不可用时
+Relax 会快速失败；没有标记资源的集群可通过 `--no-enable-affinity` 关闭该约束。
+
+该 affinity 的作用是把固定训练基线放到平台定义的稳定、不可抢占 worker group。为弹性 Rollout Engine
+创建的 Placement Group 不申请节点组标记资源，因此可以使用任意满足条件的容量，也可能被调度到可抢占
+worker。这个环境变量只负责选择固定基线所在的节点组，并不会让该节点组自动具备不可抢占性；节点组的
+可用性、稳定性和抢占策略需要由 Ray 集群、Kubernetes 配置或外部资源平台保障。
 
 #### 配置文件格式
 
