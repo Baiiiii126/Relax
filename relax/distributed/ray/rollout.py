@@ -4462,7 +4462,10 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             continue
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            log_dict |= dict_add_prefix(
+                compute_metrics_from_samples(args, samples, include_rloo_diagnostics=False),
+                f"eval/{key}/",
+            )
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
@@ -4513,7 +4516,13 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     tracking_utils.flush_metrics(args, step)
 
 
-def compute_metrics_from_samples(args, samples, *, rollout_id: int | None = None):
+def compute_metrics_from_samples(
+    args,
+    samples,
+    *,
+    rollout_id: int | None = None,
+    include_rloo_diagnostics: bool = True,
+):
     rewarded_samples = [sample for sample in samples if sample.reward is not None]
     reward_cat_key = args.log_reward_category
     reward_category_samples = (
@@ -4530,7 +4539,11 @@ def compute_metrics_from_samples(args, samples, *, rollout_id: int | None = None
     log_dict |= _compute_min_mean_max_stats(
         [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"
     )
-    log_dict |= compute_rollout_reward_metrics(args, rewarded_samples)
+    log_dict |= compute_rollout_reward_metrics(
+        args,
+        rewarded_samples,
+        include_rloo_diagnostics=include_rloo_diagnostics,
+    )
     log_dict |= _compute_zero_std_metrics(args, rewarded_samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)

@@ -15,6 +15,7 @@ from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
 from relax.utils.types import Sample
 
 
@@ -94,8 +95,9 @@ def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:
 
 def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[Sample]]):
     """Convert inference generated samples to training data."""
-    rewards = post_process_rewards(args, samples)
+    raw_rewards, rewards = post_process_rewards(args, samples)
 
+    assert len(raw_rewards) == len(samples)
     assert len(rewards) == len(samples)
 
     sample_indices = [sample.index for sample in samples]
@@ -105,6 +107,10 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         # some reward model, e.g. remote rm, may return multiple rewards,
         # we could use key to select the reward.
         "rewards": rewards,
+        "raw_reward": raw_rewards,
+        # Semantic group index (prompt group for GRPO reward normalization); needed
+        # by the per-rollout replay capture to recompute reward.post_process.
+        "group_index": [sample.group_index if sample.group_index is not None else 0 for sample in samples],
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": sample_indices,
     }
@@ -172,21 +178,26 @@ def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int]]:
 
 
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
-    """Post-process and return rewards consumed by training.
+    """Return raw rewards and post-processed rewards consumed by training.
 
     Returns:
-        List[float]
+        Tuple[List[float], List[float]]
     """
     if args.custom_reward_post_process_path is not None:
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
-        return custom_reward_post_process_func(args, samples)
-
-    if getattr(args, "agentic_custom_advantage_path", None) is not None:
-        return [sample.custom_advantage for sample in samples]
+        processed_rewards = custom_reward_post_process_func(args, samples)
+        if isinstance(processed_rewards, tuple) and len(processed_rewards) == 2:
+            return processed_rewards
+        raw_rewards = [sample.get_reward_value(args) for sample in samples]
+        return raw_rewards, processed_rewards
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
+
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        return raw_rewards, [sample.custom_advantage for sample in samples]
+
     if (
-        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
+        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
         and args.rewards_normalization
     ):
         # group norm
@@ -206,14 +217,27 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
                     f"Reward group {group_index} has {len(positions)} samples, expected {args.n_samples_per_prompt}."
                 )
             group_rewards = rewards[positions]
-            group_rewards = group_rewards - group_rewards.mean()
-            if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
-                group_rewards = group_rewards / (group_rewards.std() + 1e-6)
+            if args.advantage_estimator == "rloo":
+                finite_mask = torch.isfinite(group_rewards)
+                if not finite_mask.all():
+                    invalid_group_positions = (~finite_mask).nonzero(as_tuple=False).flatten().tolist()
+                    invalid_sample_positions = [positions[position] for position in invalid_group_positions]
+                    invalid_values = group_rewards[~finite_mask].tolist()
+                    raise ValueError(
+                        f"RLOO group_index={group_index} contains non-finite reward(s) at "
+                        f"group position(s) {invalid_group_positions}, sample position(s) "
+                        f"{invalid_sample_positions}: {invalid_values}."
+                    )
+                group_rewards = compute_rloo_leave_one_out_rewards(group_rewards)
+            else:
+                group_rewards = group_rewards - group_rewards.mean()
+                if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
+                    group_rewards = group_rewards / (group_rewards.std() + 1e-6)
             normalized_rewards[positions] = group_rewards
 
-        return normalized_rewards.tolist()
+        return raw_rewards, normalized_rewards.tolist()
 
-    return raw_rewards
+    return raw_rewards, raw_rewards
 
 
 def dict_to_tensordict(
@@ -453,7 +477,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         original_num_rows = len(data)
         if (
             args.custom_reward_post_process_path is None
-            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
+            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
             and args.rewards_normalization
         ):
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))

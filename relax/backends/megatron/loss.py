@@ -18,6 +18,7 @@ from relax.utils.opd.opd_utils import (
     resolve_opd_gather_topk_token_ids,
     validate_opd_topk_gather,
 )
+from relax.utils.replay import capture_hooks
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -26,6 +27,7 @@ from relax.utils.training.ppo_utils import (
     compute_m2po_loss,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_rloo_loss,
     compute_sapo_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
@@ -583,7 +585,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "m2po"]:
+    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "m2po", "rloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         advantages = returns.copy()
@@ -989,6 +991,11 @@ def policy_loss_function(
         pg_loss, pg_clipfrac, _m2_now, _m2_after, _eps_low, _eps_high = compute_m2po_loss(
             ppo_kl, advantages, args.m2po_kl2_budget, args.m2po_miniclip_low, args.m2po_miniclip_high
         )
+    elif args.advantage_estimator == "rloo":
+        pg_loss, pg_clipfrac = compute_rloo_loss(
+            log_probs=log_probs,
+            advantages=advantages,
+        )
     else:
         pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
@@ -1133,6 +1140,20 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+
+    # Trajectory-replay capture: record the loss.policy stage. No-op unless
+    # capture is enabled and this step is selected (single global read).
+    capture_hooks.capture_policy_loss(
+        old_log_probs=old_log_probs,
+        log_probs=log_probs,
+        entropy=entropy,
+        advantages=advantages,
+        loss_masks=batch["loss_masks"],
+        response_lengths=response_lengths,
+        total_lengths=total_lengths,
+        reported_loss=reported_loss,
+        micro_batch_index=batch.get("replay_micro_batch_index"),
+    )
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
