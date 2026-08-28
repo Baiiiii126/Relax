@@ -187,6 +187,8 @@ Both features report once per rollout step, alongside the existing `rollout/` an
 | `agentic_kv/admission/admit` / `bypass` | Per-step admission outcomes; absent when no matching outcome occurred |
 | `agentic_kv/admission/wait` / `waiting` / `cancelled` | Enqueued, currently waiting, and cancelled requests |
 | `agentic_kv/admission/bypass_protected` / `bypass_degraded` / `bypass_aged` | Fail-open bypass reasons |
+| `agentic_kv/admission/defer_rate` | `wait / (admit + wait + bypass)`; the proportion of requests placed in the FIFO wait queue by admission control |
+| `agentic_kv/admission/degraded_rate` | `bypass_degraded / (admit + wait + bypass)`; the proportion of requests allowed to proceed directly when capacity signals are unavailable or stale |
 | `agentic_kv/admission/wait_seconds_mean` | Mean queue time for requests granted after waiting |
 | `agentic_kv/budget/ceiling` / `reserved` / `available_tokens` | Admission ceiling and token ledger state |
 | `agentic_kv/budget/reserved_utilization` | Reserved tokens divided by the admission ceiling |

@@ -187,6 +187,8 @@ AGENTIC_ARGS=(
 | `agentic_kv/admission/admit` / `bypass` | 每 step 的 admission outcome；没有对应 outcome 时不上报 |
 | `agentic_kv/admission/wait` / `waiting` / `cancelled` | 入队、当前等待与已取消的 request 数 |
 | `agentic_kv/admission/bypass_protected` / `bypass_degraded` / `bypass_aged` | Fail-open bypass 原因 |
+| `agentic_kv/admission/defer_rate` | `wait / (admit + wait + bypass)`；请求因准入控制而进入 FIFO 等待队列的比例 |
+| `agentic_kv/admission/degraded_rate` | `bypass_degraded / (admit + wait + bypass)`；容量信号不可用或过期时，准入控制直接放行请求的比例 |
 | `agentic_kv/admission/wait_seconds_mean` | 排队后获得 lease 的 request 平均等待时间 |
 | `agentic_kv/budget/ceiling` / `reserved` / `available_tokens` | Admission ceiling 与 token ledger 状态 |
 | `agentic_kv/budget/reserved_utilization` | Reserved token 数占 admission ceiling 的比例 |

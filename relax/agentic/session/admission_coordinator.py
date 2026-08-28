@@ -170,6 +170,16 @@ class AdmissionCoordinator:
         wait_seconds_sum = counters.pop("wait_seconds_sum", 0.0)
         lease_expired = counters.pop("lease_expired", 0)
         metrics = {f"admission/{key}": value for key, value in counters.items()}
+        # Preserve the legacy decision-event rates after DEFER became a FIFO
+        # wait. These are rates over admission decisions, not unique tickets:
+        # one ticket may contribute a wait decision and a later admit/bypass.
+        admit = counters.get("admit", 0.0)
+        defer = counters.get("wait", 0.0)
+        bypass = counters.get("bypass", 0.0)
+        decision_total = admit + defer + bypass
+        if decision_total > 0:
+            metrics["admission/defer_rate"] = defer / decision_total
+            metrics["admission/degraded_rate"] = counters.get("bypass_degraded", 0.0) / decision_total
         metrics["admission/waiting"] = float(len(self._waiters))
         if wait_granted:
             metrics["admission/wait_seconds_mean"] = wait_seconds_sum / wait_granted
