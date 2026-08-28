@@ -20,6 +20,9 @@ export DATA_DIR="${DATA_DIR:-/workspace}"
 export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
 export PROJECT_NAME="${PROJECT_NAME:=Qwen3.5-9B-multimodal-openr1mm}"
 
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export RL_MODEL_TYPE="Qwen35_9B_multimodal"
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then

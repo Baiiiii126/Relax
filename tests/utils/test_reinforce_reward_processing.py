@@ -43,13 +43,14 @@ def _args(**overrides):
 def test_baseline_subtracts_inclusive_group_mean_without_group_std(post_process_rewards):
     samples = [_Sample(1.0, 1), _Sample(2.0, 0), _Sample(3.0, 1), _Sample(6.0, 0)]
 
-    centered = post_process_rewards(_args(), samples)
+    raw, centered = post_process_rewards(_args(), samples)
 
+    assert raw == [1.0, 2.0, 3.0, 6.0]
     assert centered == [-1.0, -2.0, 1.0, 2.0]
 
 
 def test_baseline_all_zero_group_is_finite_zero(post_process_rewards):
-    centered = post_process_rewards(_args(), [_Sample(0.0, 0), _Sample(0.0, 0)])
+    _, centered = post_process_rewards(_args(), [_Sample(0.0, 0), _Sample(0.0, 0)])
 
     assert centered == [0.0, 0.0]
 

@@ -66,6 +66,7 @@ from relax.utils.opd.opd_utils import (
     has_managed_opd_teacher_manager,
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
+from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -423,6 +424,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.prof.on_init_end()
         self.data_iterator = None
+
+        if role == "actor":
+            capture_hooks.maybe_enable_for_actor()
 
         if dist.get_rank() == 0:
             logger.info(
@@ -978,7 +982,12 @@ class MegatronTrainRayActor(TrainRayActor):
                     raise RuntimeError("Actor training with critic requires 'values' in rollout data.")
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
-                compute_advantages_and_returns(self.args, rollout_data)
+                capture_hooks.begin_rollout_for(self.args, rollout_id)
+                try:
+                    compute_advantages_and_returns(self.args, rollout_data)
+                    capture_hooks.capture_rollout_advantage(rollout_data=rollout_data, args=self.args)
+                finally:
+                    capture_hooks.end_rollout_for()
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
@@ -1392,6 +1401,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     "rewards",
                     "sample_indices",
                     "sample_index_mask_sums",
+                    "raw_reward",
+                    "group_index",
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.multimodal_keys is not None:
@@ -1571,6 +1582,8 @@ class MegatronTrainRayActor(TrainRayActor):
             "rewards",
             "sample_indices",
             "sample_index_mask_sums",
+            "raw_reward",
+            "group_index",
         ]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
