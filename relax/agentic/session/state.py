@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -43,6 +44,65 @@ _EMPTY_PREFIX_CACHE_DELTA = {
 }
 
 
+def _canonical_json_value(value: Any, *, field: str) -> Any:
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError(f"{field} JSON object keys must be strings")
+        return {key: _canonical_json_value(item, field=field) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_canonical_json_value(item, field=field) for item in value]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field} numbers must be finite")
+        # JavaScript JSON.stringify drops the decimal part of safe integral numbers.
+        # Match that representation so cross-language replays keep one state identity.
+        if value.is_integer() and abs(value) <= 2**53 - 1:
+            return int(value)
+        return value
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    raise TypeError(f"{field} must contain JSON-compatible values, got {type(value)}")
+
+
+def _canonical_tool_arguments(arguments: Any, *, field: str) -> str:
+    if isinstance(arguments, str):
+
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in parsed:
+                    raise ValueError(f"{field} contains duplicate key: {key}")
+                parsed[key] = value
+            return parsed
+
+        def reject_non_finite(value: str) -> None:
+            raise ValueError(f"{field} contains non-finite number: {value}")
+
+        try:
+            arguments = json.loads(
+                arguments,
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_non_finite,
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field} must be valid JSON") from exc
+    if not isinstance(arguments, dict):
+        raise TypeError(f"{field} must be a JSON object or a JSON string encoding an object, got {type(arguments)}")
+    canonical_arguments = _canonical_json_value(arguments, field=field)
+    canonical = json.dumps(
+        canonical_arguments,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+    try:
+        canonical.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field} must be valid UTF-8") from exc
+    return canonical
+
+
 def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> list[dict[str, Any]]:
     tool_calls = message.get("tool_calls")
     if tool_calls is None:
@@ -69,13 +129,11 @@ def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> lis
                 f"messages[{message_index}].tool_calls[{call_index}].function.name must be a string, "
                 f"got {type(function_name)}"
             )
+        arguments_field = f"messages[{message_index}].tool_calls[{call_index}].function.arguments"
         arguments = function.get("arguments")
-        if arguments is not None and not isinstance(arguments, str):
-            raise TypeError(
-                f"messages[{message_index}].tool_calls[{call_index}].function.arguments must be a string, "
-                f"got {type(arguments)}"
-            )
-        normalized.append(copy.deepcopy(tool_call))
+        normalized_tool_call = copy.deepcopy(tool_call)
+        normalized_tool_call["function"]["arguments"] = _canonical_tool_arguments(arguments, field=arguments_field)
+        normalized.append(normalized_tool_call)
     return normalized
 
 

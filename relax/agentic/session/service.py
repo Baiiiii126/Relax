@@ -208,14 +208,12 @@ def _decode_response_payload(
     token_ids: list[int],
     tools: list[dict[str, Any]],
     parent_state_hash: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
+) -> tuple[list[dict[str, Any]], bool]:
     if not token_ids:
-        response_message = {"role": "assistant", "content": ""}
-        return [], response_message, False
+        raise RuntimeError("Generation backend returned a terminal response without output tokens")
     text = str(tokenizer.decode(token_ids, skip_special_tokens=False))
     if not text:
-        response_message = {"role": "assistant", "content": ""}
-        return [], response_message, False
+        raise RuntimeError("Tokenizer decoded non-empty output tokens to empty text")
     reasoning_text: Optional[str] = None
     reasoning_parser_name = args.agentic_reasoning_parser
     if reasoning_parser_name:
@@ -261,12 +259,15 @@ def _decode_response_payload(
                 }
             )
 
+    if not text and reasoning_text is None and not tool_calls:
+        raise RuntimeError("Response parsers produced an empty assistant message")
+
     message: dict[str, Any] = {"role": "assistant", "content": text}
     if reasoning_text:
         message["reasoning_content"] = reasoning_text
     if tool_calls:
         message["tool_calls"] = tool_calls
-    return [message], message, bool(tool_calls)
+    return check_messages([message]), bool(tool_calls)
 
 
 def _decode_routed_experts(
@@ -1048,8 +1049,8 @@ class AgenticSessionShard:
         *,
         session_id: str,
         messages: list[dict[str, Any]],
-        tools: Optional[list[dict[str, Any]]],
-        chat_template_kwargs: Optional[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        chat_template_kwargs: dict[str, Any],
         max_completion_tokens: Optional[int],
         stop: Optional[list[str] | str],
         seed: Optional[int],
@@ -1230,8 +1231,8 @@ class AgenticSessionShard:
         *,
         session: _SessionRecord,
         messages: list[dict[str, Any]],
-        tools: Optional[list[dict[str, Any]]],
-        chat_template_kwargs: Optional[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        chat_template_kwargs: dict[str, Any],
         max_completion_tokens: Optional[int],
         stop: Optional[list[str] | str],
         seed: Optional[int],
@@ -1243,12 +1244,10 @@ class AgenticSessionShard:
         chat_request_arrive_at = time.time()
         wall_started_at = time.monotonic()
         group = session.group
-        messages = check_messages(messages)
-        tools = normalize_tools(tools)
         chat_template_kwargs = normalize_template_kwargs(
             {
                 **self._generation_backend.compiler.apply_chat_template_kwargs,
-                **normalize_template_kwargs(chat_template_kwargs),
+                **chat_template_kwargs,
             }
         )
         async with session.lock:
@@ -1798,7 +1797,7 @@ class AgenticSessionShard:
             }
         )
         forest = cast(SessionForest, session.forest)
-        response_messages, response_message, has_tool_calls = _decode_response_payload(
+        response_messages, has_tool_calls = _decode_response_payload(
             args=self.args,
             tokenizer=self._generation_backend.tokenizer,
             token_ids=ir.pending_token_delta,
@@ -1826,7 +1825,7 @@ class AgenticSessionShard:
         completion_tokens = len(ir.pending_token_delta)
         payload = {
             "request_id": ir.request_id,
-            "message": response_message,
+            "message": response_messages[0],
             "logprobs": (
                 _openai_token_logprobs_payload(
                     tokenizer=self._generation_backend.tokenizer,
@@ -1981,12 +1980,12 @@ class AgenticSessionShard:
                 unit_metadata = copy.deepcopy(metadata)
                 _merge_export_metadata(unit_metadata, output_record["metadata"])
                 state_hash = _messages_tools_template_state_hash(
-                    check_messages(output_record["messages"]),
-                    normalize_tools(output_record.get("tools")),
+                    output_record["messages"],
+                    output_record.get("tools", []),
                     normalize_template_kwargs(
                         {
                             **self._generation_backend.compiler.apply_chat_template_kwargs,
-                            **normalize_template_kwargs(output_record.get("chat_template_kwargs")),
+                            **output_record.get("chat_template_kwargs", {}),
                         }
                     ),
                 )
