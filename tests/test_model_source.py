@@ -46,7 +46,7 @@ def test_model_source_aliases_normalize_local_paths_and_ignore_empty_values():
     "uri",
     [
         "s3://bucket/model/../model",
-        "tidalcache://Qwen/model/../model",
+        "somesource://models/model/../model",
         "https://models.example.com/model/../model",
         "file:///models/model/../model",
     ],
@@ -62,7 +62,7 @@ def test_normalize_model_path_normalizes_absolute_and_relative_local_paths():
 
 
 def test_uri_shape_detection_does_not_parse_malformed_authority():
-    malformed_uri = "tidalcache://[invalid-authority"
+    malformed_uri = "somesource://[invalid-authority"
 
     assert m.is_model_uri(malformed_uri)
     assert m.normalize_model_path(malformed_uri) == malformed_uri
@@ -71,7 +71,7 @@ def test_uri_shape_detection_does_not_parse_malformed_authority():
 def test_validate_ref_load_defers_same_model_source_uri(monkeypatch):
     from relax.utils import arguments
 
-    logical_uri = "tidalcache://Qwen/Qwen3.5-35B-A3B"
+    logical_uri = "somesource://models/policy"
     args = SimpleNamespace(
         ref_load=logical_uri,
         model_source=m.ModelSource("s3://bucket/models/qwen35/"),
@@ -88,9 +88,9 @@ def test_validate_ref_load_rejects_distinct_model_uri():
     from relax.utils import arguments
 
     args = SimpleNamespace(
-        ref_load="tidalcache://Qwen/reference-model",
+        ref_load="somesource://models/reference",
         model_source=m.ModelSource("s3://bucket/models/policy/"),
-        _model_source_original_hf_checkpoint="tidalcache://Qwen/policy-model",
+        _model_source_original_hf_checkpoint="somesource://models/policy",
     )
 
     with pytest.raises(ValueError, match="does not match the configured model source"):
@@ -113,7 +113,7 @@ def test_validate_ref_load_keeps_local_reference_behavior(tmp_path, monkeypatch,
     args = SimpleNamespace(ref_load=ref_load)
     if with_model_source:
         args.model_source = m.ModelSource("s3://bucket/models/int4-policy/")
-        args._model_source_original_hf_checkpoint = "tidalcache://Qwen/int4-policy"
+        args._model_source_original_hf_checkpoint = "somesource://models/int4-policy"
 
     arguments._validate_ref_load(args)
 
@@ -131,8 +131,8 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch)
     from relax.backends.megatron import arguments as megatron_arguments
     from relax.utils import arguments
 
-    logical_uri = "tidalcache://Qwen/Qwen3.5-35B-A3B"
-    source = m.ModelSource("s3://bucket/models/qwen35/", provider_name="tidalcache")
+    logical_uri = "somesource://models/policy"
+    source = m.ModelSource("s3://bucket/models/policy/", provider_name="test")
     parsed = SimpleNamespace(
         hf_checkpoint=logical_uri,
         ref_load=logical_uri,
@@ -163,7 +163,7 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch)
         arguments._validate_ref_load(parsed_args)
         validated = True
 
-    m.register_model_source_provider("tidalcache", provider)
+    m.register_model_source_provider("test", provider)
     monkeypatch.setattr(arguments.sys, "argv", ["train.py", "--hf-checkpoint", logical_uri, "--ref-load", logical_uri])
     monkeypatch.setattr(arguments, "_pre_parse_cli_model_source", lambda: None)
     monkeypatch.setattr(arguments, "_pre_parse_mode", lambda: pre)
