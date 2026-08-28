@@ -23,6 +23,10 @@
 Elastic scaling is only available in Fully Async mode. In this mode, Rollout occupies dedicated GPU resources and runs as an independent service, making it naturally suited for elastic scaling. For more information about Fully Async mode, see [Fully Async Training Pipeline](./fully-async-training.md).
 :::
 
+For a runnable Qwen3-4B setup with Autoscaler-based scaling and external
+graceful-eviction requirements, see the
+[Elastic Rollout recipe](../examples/elastic-rollout.md).
+
 ______________________________________________________________________
 
 ## Design Highlights
@@ -723,9 +727,17 @@ ray job submit -- python3 relax/entrypoints/train.py \
 #### Baseline Node-Group Affinity
 
 When the autoscaler configuration is enabled, Relax pins baseline actor, critic, reference, rollout-seed, and
-colocated placement groups to the `stable` worker group. Elastic rollout engines remain unpinned. The cluster must
-publish `stable_gpu` and `stable_cpu` Ray custom resources; Relax fails fast if they are unavailable. Use
-`--no-enable-affinity` to disable this constraint.
+colocated placement groups to the initial node group. Elastic rollout engines remain unpinned. The node-group prefix
+comes from `RELAX_INITIAL_NODE_GROUP` and defaults to `stable`; the cluster must publish matching `<prefix>_gpu` and
+`<prefix>_cpu` Ray custom resources. For example, `RELAX_INITIAL_NODE_GROUP=baseline` requires `baseline_gpu` and
+`baseline_cpu`. Relax fails fast if either marker is unavailable. Use `--no-enable-affinity` to disable this
+constraint on clusters without marker resources.
+
+The purpose of this affinity is to keep the fixed training baseline on a worker group that the platform treats as
+stable and non-preemptible. Placement groups created for elastic Rollout engines do not request the node-group
+markers, so they can use any eligible capacity and may be scheduled on preemptible workers. The environment variable
+only selects the baseline group; it does not make that group non-preemptible. The Ray cluster, Kubernetes setup, or
+external resource platform must enforce the group's availability and preemption policy.
 
 #### Configuration File Format
 
