@@ -302,6 +302,7 @@ def get_model_provider_func(
             "rotary_base",
             "moe_router_pre_softmax",
             "moe_router_enable_expert_bias",
+            "moe_router_bias_update_rate",
             "moe_permute_fusion",
             "moe_grouped_gemm",
             "moe_shared_expert_intermediate_size",
