@@ -32,6 +32,9 @@ EXP_NAME="qwen35-35B-A3B-r2egym-minisweagent-gpu8-${TIMESTAMP}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:=16}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:=8}"
+ENABLE_AGENTIC_SESSION_LIFECYCLE="${ENABLE_AGENTIC_SESSION_LIFECYCLE:-0}"
+ENABLE_AGENTIC_PROGRAM_ADMISSION="${ENABLE_AGENTIC_PROGRAM_ADMISSION:-0}"
+
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
 AGENT_SERVER_URL="http://127.0.0.1:8765"
 AGENT_SERVER_WORK_DIR="${EXP_ROOT}/agent_server"
@@ -154,6 +157,15 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.75
    --sglang-load-format dummy
 )
+if [[ -n "${SGLANG_MAX_TOTAL_TOKENS:-}" ]]; then
+   SGLANG_ARGS+=(--sglang-max-total-tokens "${SGLANG_MAX_TOTAL_TOKENS}")
+fi
+if [[ "${ENABLE_AGENTIC_SESSION_LIFECYCLE}" != "0" ]]; then
+   SGLANG_ARGS+=(
+      --sglang-enable-session-radix-cache
+      --sglang-radix-eviction-policy priority
+   )
+fi
 
 LOG_ARGS=(
    --use-clearml
@@ -203,7 +215,7 @@ RAY_RESOURCE_ARGS=(
    # --use-health-check
 )
 
-# agentic rollout: agent exec + parsers + session lifecycle + program admission ──────────────────────
+# agentic rollout: agent exec + parsers ──────────────────────────────────────────────────────────────
 AGENTIC_ARGS=(
    --use-agentic-rollout
    --agent-command "bash ${SCRIPT_DIR}/agent_client.sh"
@@ -212,13 +224,17 @@ AGENTIC_ARGS=(
    --agent-env "AGENT_SERVER_URL=${AGENT_SERVER_URL}" "AGENT_CLIENT_TRACE_DIR=${AGENT_SERVER_WORK_DIR}/client_events"
    --agentic-tool-call-parser qwen3_coder
    --agentic-reasoning-parser qwen3
-   # --sglang-enable-session-radix-cache
-   # --sglang-radix-eviction-policy priority
-   # --agentic-session-lifecycle
-   # --agentic-program-admission
-   # --agentic-admission-headroom 0.90
-   # --agentic-admission-pressure-threshold 0.92
 )
+if [[ "${ENABLE_AGENTIC_SESSION_LIFECYCLE}" != "0" ]]; then
+   AGENTIC_ARGS+=(--agentic-session-lifecycle)
+fi
+if [[ "${ENABLE_AGENTIC_PROGRAM_ADMISSION}" != "0" ]]; then
+   AGENTIC_ARGS+=(
+      --agentic-program-admission
+      --agentic-admission-headroom 0.90
+      --agentic-admission-pressure-threshold 0.92
+   )
+fi
 
    # "${PARTIAL_ROLLOUT_ARGS[@]}" \
 mkdir -p logs
