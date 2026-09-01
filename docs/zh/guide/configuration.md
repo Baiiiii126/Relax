@@ -208,7 +208,7 @@
 | `--use-dynamic-batch-size` | flag | False | 启用动态批处理。根据样本长度动态打包，使每个 micro-batch 的总 Token 数接近 `--max-tokens-per-gpu` 限制 |
 | `--max-tokens-per-gpu` | int | None | 每个 GPU 的最大 Token 数。启用动态批处理时必须设置。使用 CP 时应设为约 `max_response_len / cp_size` |
 | `--log-probs-max-tokens-per-gpu` | int | None | 计算 log probs 时每个 GPU 的最大 Token 数。None 时等于 `max-tokens-per-gpu` |
-| `--balance-data` | flag | False | 使用 `karmarkar_karp` 算法在数据并行 rank 间平衡 Token 数量。仅在 colocate 模式下可用，不支持 `--fully-async`。注意同一 Prompt 的不同响应可能被分到不同训练步 |
+| `--balance-data` | flag | False | 在静态/序列长度均衡路径上使用 `karmarkar_karp` 在数据并行 rank 间平衡 Token 数量。全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会通过 `StreamingTokenBudgetSampler` 自动做 DP token 均衡；该 flag 可传入但不会额外改变行为。注意同一 Prompt 的不同响应可能被分到不同训练步 |
 
 ---
 
@@ -527,6 +527,21 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 |------|------|--------|--------|------|
 | `--scale-out-timeout` | float | 300.0 | - | 所有扩容操作（引擎启动、连接、健康检查、权重同步等）的超时时间（秒） |
 | `--scale-out-partial-success-policy` | str | rollback_all | `rollback_all`, `keep_partial` | 扩容部分成功时的策略。`rollback_all` 回滚所有引擎；`keep_partial` 保留成功的引擎 |
+| `--scale-weight-sync-precheck` | bool | True | - | 扩容权重同步前跑独立 NCCL 预检查，不兼容 transport 直接 fail-closed。默认开；用 `--no-scale-weight-sync-precheck` 关闭（关闭即放弃 fail-closed 保护）。详见 [弹性 Rollout · 权重同步预检查](./elastic-rollout.md#权重同步预检查precheck) |
+
+### Precheck 环境变量
+
+下列环境变量用于调参与排障，均可不设（走默认）。运行时由 `relax/utils/env.py` 读取。
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES` | int | 536870912（512 MiB） | Stage 2 探针允许的最低空闲显存字节；低于该值返回 `INSUFFICIENT_GPU_MEMORY` 并 fail-closed。SGLang 预留 85–90% 显存，调低需谨慎（探针可能 OOM） |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE` | int | 18000 | Stage 2 探针子进程 rendezvous 端口段下限 |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX` | int | 20000 | Stage 2 探针子进程 rendezvous 端口段上限。**集群网络策略需放行 `[PORT_BASE, PORT_MAX]` 这段**，否则探针建连失败 → `PROBE_FAILED` |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS` | int | 2 | Stage 2 探针最大尝试次数 |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEMS` | int | 3 | 扩容失败原因在 TUI / 稳定日志里展示的最大条数 |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN` | int | 120 | 单条失败原因截断长度 |
+| `RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN` | int | 512 | 失败原因总截断长度（防止原始错误信息过长） |
 
 ### Scale-In 操作参数
 
@@ -566,7 +581,6 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 |------|------|--------|------|
 | `--log-passrate` | flag | False | 启用 pass@n 通过率日志 |
 | `--log-multi-turn` | flag | False | 启用多轮 Rollout 信息日志 |
-| `--log-correct-samples` | flag | False | 记录正确样本 |
 | `--log-reward-category` | str | None | 记录 reward 分类统计。指定 reward dict 中的 key |
 
 ### 通知

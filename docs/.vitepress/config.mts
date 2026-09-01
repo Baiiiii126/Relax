@@ -244,7 +244,10 @@ export default defineConfig({
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
+                { text: 'MTP Training', link: '/en/guide/mtp-rl-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
+                { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
+                { text: 'REINFORCE++ Report', link: '/en/guide/reinforce-plus-plus-training-report' },
                 { text: 'Model Checkpoint Conversion', link: '/en/guide/model-conversion' },
                 { text: 'Configuration', link: '/en/guide/configuration' }
               ]
@@ -263,6 +266,7 @@ export default defineConfig({
               items: [
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
                 { text: 'Agentic Rollout', link: '/en/guide/agentic-rollout' },
+                { text: 'Agentic KV Scheduling', link: '/en/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
                 { text: 'Dynamic Context Parallelism', link: '/en/guide/dynamic-context-parallel' },
@@ -276,6 +280,7 @@ export default defineConfig({
               text: 'Best Practices',
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
+                { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
                 { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
               ]
@@ -285,6 +290,7 @@ export default defineConfig({
               items: [
                 { text: 'How to Contribute', link: '/en/guide/how-to-contribute' },
                 { text: 'Debugging Guide', link: '/en/guide/debugging' },
+                { text: 'Trajectory Replay', link: '/en/guide/trajectory-replay' },
                 { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' }
               ]
             }
@@ -314,6 +320,7 @@ export default defineConfig({
                 { text: 'On-Policy Distillation', link: '/en/examples/on-policy-distillation' },
                 { text: 'Generative Reward Model', link: '/en/examples/generative-reward-model' },
                 { text: 'Low-Precision Training', link: '/en/examples/low-precision-training' },
+                { text: 'Elastic Rollout', link: '/en/examples/elastic-rollout' },
                 { text: 'Algorithms', link: '/en/examples/algorithms' }
               ]
             }
@@ -353,7 +360,10 @@ export default defineConfig({
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
+                { text: 'MTP 训练', link: '/zh/guide/mtp-rl-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
+                { text: 'REINFORCE++', link: '/zh/guide/reinforce-plus-plus' },
+                { text: 'REINFORCE++ 训练与数值验证报告', link: '/zh/guide/reinforce-plus-plus-training-report' },
                 { text: '模型 Checkpoint 转换', link: '/zh/guide/model-conversion' },
                 { text: '配置说明', link: '/zh/guide/configuration' }
               ]
@@ -372,6 +382,7 @@ export default defineConfig({
               items: [
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
                 { text: 'Agentic Rollout', link: '/zh/guide/agentic-rollout' },
+                { text: 'Agentic KV 调度', link: '/zh/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
                 { text: 'Dynamic Context Parallelism', link: '/zh/guide/dynamic-context-parallel' },
@@ -385,6 +396,7 @@ export default defineConfig({
               text: '最佳实践',
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
+                { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
                 { text: '外部模型接入', link: '/zh/guide/external-model-integration' }
               ]
@@ -394,6 +406,7 @@ export default defineConfig({
               items: [
                 { text: '如何贡献', link: '/zh/guide/how-to-contribute' },
                 { text: '调试指南', link: '/zh/guide/debugging' },
+                { text: '轨迹重放', link: '/zh/guide/trajectory-replay' },
                 { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' }
               ]
             }
@@ -423,6 +436,7 @@ export default defineConfig({
                 { text: '在线策略蒸馏', link: '/zh/examples/on-policy-distillation' },
                 { text: '生成式奖励模型', link: '/zh/examples/generative-reward-model' },
                 { text: '低精度训练', link: '/zh/examples/low-precision-training' },
+                { text: '弹性 Rollout', link: '/zh/examples/elastic-rollout' },
                 { text: '算法参考', link: '/zh/examples/algorithms' }
               ]
             }

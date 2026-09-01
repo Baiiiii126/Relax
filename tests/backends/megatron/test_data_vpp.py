@@ -127,6 +127,8 @@ def test_log_rollout_data_creates_collective_stats_on_training_device(monkeypatc
         uses_unsplit_forward=False,
         dynamic_context_parallel=False,
         use_opd=False,
+        rollout_batch_size=2,
+        n_samples_per_prompt=1,
         ci_test=False,
         log_multi_turn=False,
         log_correct_samples=False,

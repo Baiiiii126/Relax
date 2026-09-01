@@ -13,8 +13,8 @@
 # max_staleness = N - 1, which controls how many rollouts ahead the
 # prefetch worker can look. Bigger N = better overlap between train step
 # and prefetch, at the cost of more pinned CPU memory. N=4 is a good
-# default; N=1 would degrade to synchronous prefetch (--sft-async-prepack
-# auto-bumps max_staleness to >= 1 in that case, but you'll want more).
+# default; --sft-async-prepack rejects N=1 because it cannot overlap the
+# next window with the current training step.
 #
 # 0.6B fits on a single GPU so TP/PP/CP are all 1 and DP=8.
 #

@@ -161,6 +161,7 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)
+    GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S = EnvProperty("GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S", float, 5.0)
 
     # ------------- Rollout -------------
     ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("ROLLOUT_SERVE_MAX_ONGOING_REQUESTS", int, 256)
@@ -202,8 +203,9 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_EMPTY_POLL_SLEEP_MS = EnvProperty("RELAX_EMPTY_POLL_SLEEP_MS", float, 50.0)
     RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
 
-    # ------------- LoRA -------------
-    RELAX_LORA_LIVE_DIR = EnvProperty("RELAX_LORA_LIVE_DIR", str, None)
+    # ------------- S3 model cache cleanup -------------
+    RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S = EnvProperty("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", float, 600.0)
+    RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S = EnvProperty("RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S", float, 30.0)
 
     # ------------- Extra Modules -------------
     RELAX_EXTRA_MODULES = EnvProperty("RELAX_EXTRA_MODULES", str, "")
@@ -217,12 +219,47 @@ class Envs(metaclass=_EnvsMeta):
     # Unset means "keep whatever the caller passed in", hence a None default.
     RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT = EnvProperty("RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT", int, None)
 
+    # ------------- Scale-out / weight-sync -------------
+    # Per-replica failure reasons are canonicalized and bounded before they reach
+    # ScaleOutRequest.error_message (exposed via /status and the monitor TUI).
+    RELAX_SCALE_OUT_MAX_REASON_ITEMS = EnvProperty("RELAX_SCALE_OUT_MAX_REASON_ITEMS", int, 3)
+    RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN = EnvProperty("RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN", int, 120)
+    RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN = EnvProperty("RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN", int, 512)
+    # Weight-send NCCL group rank-0 bind window. Kept below the Linux ephemeral
+    # range (32768-60999) to avoid collision with OS-assigned ephemeral ports;
+    # allocation never returns a port >= *_PORT_MAX.
+    RELAX_WEIGHT_SYNC_PORT_BASE = EnvProperty("RELAX_WEIGHT_SYNC_PORT_BASE", int, 20000)
+    RELAX_WEIGHT_SYNC_PORT_MAX = EnvProperty("RELAX_WEIGHT_SYNC_PORT_MAX", int, 32000)
+    # Full group-init attempts for self-healing on bind/init failure.
+    RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS = EnvProperty("RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS", int, 4)
+    # Independent rendezvous window for the precheck subprocesses; must not
+    # overlap the real direct-sync window above.
+    RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE = EnvProperty("RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE", int, 18000)
+    RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX = EnvProperty("RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX", int, 20000)
+    RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = EnvProperty(
+        "RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS", int, 2
+    )
+    # Minimum free VRAM before launching a probe (CUDA context + small NCCL bufs).
+    RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES = EnvProperty(
+        "RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES", int, 512 * 1024**2
+    )
+
     # ------------- Routing Replay -------------
     ENABLE_ROUTING_REPLAY = EnvProperty("ENABLE_ROUTING_REPLAY", bool, False)
 
     # ------------- TGD Profiling -------------
     RELAX_TGD_PROFILE = EnvProperty("RELAX_TGD_PROFILE", bool, False)
     RELAX_TGD_PROFILE_EVERY = EnvProperty("RELAX_TGD_PROFILE_EVERY", int, 50)
+
+    # ------------- Trajectory replay capture -------------
+    # Opt-in production capture. MegatronTrainRayActor.init calls
+    # maybe_enable_from_env — no CLI argument-parsing change.
+    RELAX_REPLAY_CAPTURE = EnvProperty("RELAX_REPLAY_CAPTURE", bool, False)
+    RELAX_REPLAY_CAPTURE_DIR = EnvProperty("RELAX_REPLAY_CAPTURE_DIR", str, None)
+    # Comma-separated actor steps as ROLLOUT_ID:STEP_ID (e.g. "0:0,0:1"). Unset = all.
+    RELAX_REPLAY_CAPTURE_STEPS = EnvProperty("RELAX_REPLAY_CAPTURE_STEPS", str, None)
+    # Comma-separated rollout ids (e.g. "0,1"). Unset = all.
+    RELAX_REPLAY_CAPTURE_ROLLOUTS = EnvProperty("RELAX_REPLAY_CAPTURE_ROLLOUTS", str, None)
 
     # ------------- SGLang Speculative Decoding & External Packages -----------
     SGLANG_ENABLE_SPEC_V2 = EnvProperty("SGLANG_ENABLE_SPEC_V2", str, "")

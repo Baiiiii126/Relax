@@ -40,6 +40,7 @@ from relax.utils.http_utils import get, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
@@ -77,6 +78,7 @@ class GenerateState(metaclass=SingletonMeta):
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
+        prepare_model_maybe_update_args(args, completeness="metadata")
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
@@ -1122,13 +1124,6 @@ async def generate_rollout_async(
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
             )
-            staleness_gaps = [
-                rollout_id - s.metadata.get("start_rollout_id", rollout_id) for group in data for s in group
-            ]
-            rollout_metrics["rollout/staleness/avg"] = np.mean(staleness_gaps).item()
-            rollout_metrics["rollout/staleness/max"] = np.max(staleness_gaps).item()
-            rollout_metrics["rollout/staleness/min"] = np.min(staleness_gaps).item()
-            rollout_metrics["rollout/global_batch_size"] = len(data) * args.n_samples_per_prompt
         _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
         if args.debug_rollout_only:
             logger.info("Debug rollout only mode - data system cleanup")
@@ -1176,6 +1171,7 @@ async def eval_rollout_single_dataset(
     """
     global EVAL_PROMPT_DATASET
 
+    prepare_model_maybe_update_args(args, completeness="metadata")
     cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)

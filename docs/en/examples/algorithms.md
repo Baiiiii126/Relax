@@ -2,7 +2,12 @@
 
 Relax supports multiple policy gradient algorithms, all selected via the `--advantage-estimator` flag. This document covers PPO and the primary GRPO-family algorithms (for On-Policy Distillation, see the [dedicated page](./on-policy-distillation.md)).
 
-GRPO, CISPO, GSPO, and SAPO share the same service topology, so their argument blocks can be swapped in existing scripts. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
+GRPO, RLOO, CISPO, GSPO, SAPO, and M2PO share the same actor/rollout service topology, although RLOO is synchronous-only and enforces fixed batch invariants. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
+
+REINFORCE++ and REINFORCE++-baseline also reuse the GRPO service topology, but
+their return, global normalization and KL contracts are algorithm-specific.
+See [REINFORCE++ Training](../guide/reinforce-plus-plus.md) before enabling
+either estimator.
 
 ---
 
@@ -39,6 +44,76 @@ DATA_DIR=/path/to/data \
 EXP_DIR=/path/to/exp \
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
+
+---
+
+## RLOO
+
+RLOO (REINFORCE Leave-One-Out) uses the other samples for the same prompt as an unbiased baseline. Relax implements synchronous RLOO with an unclipped REINFORCE policy loss; it does not use PPO ratios or clipping.
+
+Reference: [Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs](https://arxiv.org/abs/2402.14740).
+
+### How It Works
+
+For a prompt with $G$ sampled responses and scalar rewards $r_i$, the leave-one-out baseline and advantage are:
+
+$$b_i = \frac{1}{G-1}\sum_{j\ne i}r_j, \qquad A_i = r_i-b_i = \frac{G}{G-1}(r_i-\bar r)$$
+
+Unlike GRPO, RLOO does not divide by the group standard deviation. The token loss is:
+
+$$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$$
+
+Each sample's scalar advantage is broadcast to its response tokens. Relax masks padding and normalizes the summed loss by the global number of valid response tokens $N_{\mathrm{eff}}$:
+
+$$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
+
+This global-token reduction does not apply a separate $1/T_i$ weight to each response. `train/pg_clipfrac` is always `0` because RLOO uses no clipping.
+
+### Requirements and Parameters
+
+| Parameter | Requirement | Description |
+|-----------|-------------|-------------|
+| `--advantage-estimator rloo` | required | Enable RLOO |
+| `--n-samples-per-prompt` | at least `2` | Group size $G$; larger groups provide a more stable LOO baseline at higher rollout cost |
+| `--rollout-batch-size × --n-samples-per-prompt` | equals `--global-batch-size` | Exactly one optimizer update per rollout |
+| `--num-steps-per-rollout` | unset or `1` | Reusing the same rollout for multiple unclipped updates is rejected |
+| `--calculate-per-token-loss` | enabled | Use global valid-token normalization; per-response token means would reweight unequal-length responses by $1/T_i$ |
+| `--kl-coef` | `0` | Reward-side KL shaping is not implemented for RLOO; with a valid `--ref-load <checkpoint>`, use `--use-kl-loss --kl-loss-coef <value>` for the supported direct KL penalty |
+| `--max-staleness` | `0` | Stale rollouts are rejected because the unclipped objective has no importance-ratio correction |
+| reward normalization | enabled | RLOO's group transformation runs in the normalized-reward path |
+| `--normalize-advantages` | disabled | Post-DP whitening would change RLOO semantics and make results partition-dependent |
+| `--fully-async`, `--hybrid`, `--partial-rollout`, `--use-dynamic-global-batch-size` | disabled | RLOO currently requires synchronous, fixed-size rollout batches |
+
+The batch sizes are hardware-tunable as long as their equality is preserved. For example, `ROLLOUT_BATCH_SIZE=4`, `N_SAMPLES=8`, and `GLOBAL_BATCH_SIZE=32` retain one update per rollout while reducing per-step memory relative to `16 × 8 = 128`.
+
+### Diagnostics
+
+Training rollout logs publish the following final metric names:
+
+- `rollout/rloo/baseline_mean`: mean LOO baseline (equal to the mean group reward; retained as an explicit baseline trace)
+- `rollout/rloo/adv_abs_mean`: mean absolute RLOO advantage
+- `rollout/rloo/no_signal_frac`: fraction of effective loss tokens attached to zero-advantage samples
+- `rollout/rloo/empty_response_frac`: fraction of samples with a literally empty response
+- `rollout/rloo/zero_adv_group_frac`: fraction of complete groups with zero advantages throughout
+- `rollout/rloo/dropped_group_frac`: fraction of observed groups omitted from diagnostics because their size is incomplete
+
+These diagnostics are training-only, purely observational rollout statistics; they do not affect the training path. Evaluation uses its own sampling group size and does not emit misleading `eval/*/rloo/*` values. They are also omitted when a custom reward post-processor or agentic custom-advantage hook replaces the standard RLOO signal, because raw rewards cannot reconstruct the optimizer input in those modes.
+
+### Quick Start
+
+Use the dedicated Qwen3-0.6B GSM8K recipe. Its batch and rollout settings can be overridden with environment variables:
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+NUM_ROLLOUT=60 \
+ROLLOUT_BATCH_SIZE=4 \
+N_SAMPLES=8 \
+GLOBAL_BATCH_SIZE=32 \
+bash examples/algorithms/run-qwen3-0.6B-1xgpu-rloo.sh
+```
+
+Set `ADVANTAGE_ESTIMATOR=grpo` to run a control arm with the same recipe and seeds. The recipe writes normalized GSM8K data to a writable artifact cache (override with `RLOO_DATA_CACHE_DIR`) and appends an instruction to emit the final answer as `\boxed{...}`, matching the `math` reward parser contract.
 
 ---
 
@@ -202,19 +277,83 @@ SAPO_ARGS=(
 
 ---
 
+## M2PO
+
+M2PO (Second-Moment Trust Policy Optimization) uses the **second moment** of the log importance ratio over harmful tokens as its trust-region constraint: it tightens clipping only when that second moment exceeds a budget, and keeps the token otherwise. Compared to fixed clipping, it retains more useful gradient and mitigates entropy collapse in off-policy (stale-data) regimes, making it purpose-built for mini-batch reuse and asynchronous training.
+
+Reference: [Prosperity before Collapse: How Far Can Off-Policy RL Reach with Reuse of Mini-Batch Data?](https://arxiv.org/abs/2510.01161) (NeurIPS 2025).
+
+### How It Works
+
+M2PO only constrains the "harmful" tokens that PPO would clip — those whose advantage sign aligns with the ratio's drift and would cause an over-update:
+
+$$\mathcal{H} = \{t : \hat{A}_t > 0,\ r_t > 1\} \cup \{t : \hat{A}_t < 0,\ r_t < 1\}$$
+
+where $r_t = \exp(-\text{KL}_t)$ and $\text{KL}_t = \log\pi_{\theta_\text{old}}(o_t) - \log\pi_\theta(o_t)$. The second moment of the log-ratio over these tokens is:
+
+$$M_2 = \frac{1}{|\mathcal{H}|} \sum_{t \in \mathcal{H}} (\log r_t)^2$$
+
+- If $M_2 \le$ `kl2_budget`: no clipping, all tokens are kept;
+- Otherwise, solve for a trust-region radius $\tau$ by water-filling so the capped second moment returns exactly to budget, i.e. $\sum_{t\in\mathcal{H}} \min\!\left((\log r_t)^2,\ \tau^2\right) = |\mathcal{H}| \cdot \text{kl2\_budget}$, yielding the clip band $[e^{-\tau},\ e^{\tau}]$.
+
+The final clipping margin is $\varepsilon = \max(\text{adaptive value},\ \text{miniclip})$, guaranteeing it is never tighter than GRPO. The policy loss reuses the PPO-Clip pessimistic form from the GRPO section, with only the clip bounds solved adaptively.
+
+### Key Parameters
+
+| Parameter | Default | Recommended | Description |
+|-----------|---------|-------------|-------------|
+| `--advantage-estimator m2po` | — | — | Enable M2PO |
+| `--m2po-kl2-budget` | `0.01` | `0.01`–`0.04` | Second-moment budget per harmful token. Smaller = tighter/more-frequent clipping, larger = more off-policy tolerance (the paper uses `0.04`) |
+| `--m2po-miniclip-low` | `0.3` | `0.2` | Lower clip-margin floor (ratio lower bound is no less than `1 - miniclip_low`) |
+| `--m2po-miniclip-high` | `0.5` | `0.28` | Upper clip-margin floor |
+| `--use-tis` | off | on | Token Importance Sampling — recommended to enable with M2PO |
+
+> M2PO derives its clip bounds adaptively, so it does **not** use `--eps-clip` / `--eps-clip-high`.
+
+### When to Use
+
+M2PO's benefit grows with how off-policy the training data is, so reach for it **first** in these scenarios:
+
+- **Asynchronous training with large staleness**: in fully-async mode the rollout weights lag noticeably behind the actor (`--max-staleness` of 32, 256, or higher), and stale samples inflate the importance ratio. Fixed clipping then either zeroes out many tokens (losing gradient) or lets them through (causing over-updates); M2PO uses the second moment to adaptively tighten only the genuinely "harmful" fraction, suppressing collapse while preserving the learning signal.
+- **Mini-batch reuse / multi-step sampling**: when the same rollout batch is reused across several update steps, the later steps effectively train on off-policy data too, and M2PO extends the usable lifetime of that batch.
+- **Late-training entropy collapse or reward stagnation**: when fixed clipping narrows the policy too quickly and starves exploration, M2PO's looser adaptive bounds help sustain entropy and delay collapse.
+
+Conversely, under strictly on-policy synchronous training (`--max-staleness 0` with per-step weight sync), M2PO's gain over GRPO is limited — start from GRPO as a baseline there.
+
+### Quick Start
+
+Use any existing GRPO training script and replace `GRPO_ARGS` with `M2PO_ARGS`:
+
+```bash
+M2PO_ARGS=(
+   --advantage-estimator m2po
+   --m2po-kl2-budget 0.01
+   --m2po-miniclip-low 0.2
+   --m2po-miniclip-high 0.28
+   --use-tis
+)
+```
+
+---
+
 ## Algorithm Comparison
 
 | Algorithm | Advantage Computation | Policy Loss | KL Constraint |
 |-----------|----------------------|-------------|---------------|
 | **PPO** | Critic values + GAE | PPO-Clip (hard clip) | Disabled in the current synchronous topology |
 | **GRPO** | Group-relative reward | PPO-Clip (hard clip) | Optional KL loss |
+| **REINFORCE++** | Token KL-to-go return + global token normalization | PPO-Clip (hard clip) | k1 KL in shaped reward |
+| **REINFORCE++-baseline** | Inclusive group mean + global token normalization | PPO-Clip (hard clip) | Separate k2 KL loss |
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |
+| **M2PO** | Group-relative reward | Adaptive second-moment clip | Optional KL loss (favor for large-staleness / off-policy) |
+| **RLOO** | Leave-one-out baseline | Unclipped REINFORCE | Optional KL loss (same as GRPO) |
 
 ## Next Steps
 
 - [PPO Training](../guide/ppo-training.md)
+- [REINFORCE++ Training](../guide/reinforce-plus-plus.md)
 - [Quick Start](../guide/quick-start.md)
 - [On-Policy Distillation](./on-policy-distillation.md)
 - [Generative Reward Model](./generative-reward-model.md)

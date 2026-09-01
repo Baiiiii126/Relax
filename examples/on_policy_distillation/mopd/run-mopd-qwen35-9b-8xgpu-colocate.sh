@@ -26,8 +26,16 @@ set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
 export RELAX_OPD_PREEXPANDED_PATCH=1
-# Forward the patch flag into the Ray runtime env so remote-node teachers see it.
-export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH"
+# The OPD teacher needs a logprob at every response position, and
+# logits_processor.py:471 materializes [N, vocab] (fp32) in one shot by default.
+# N reaches tens of thousands, i.e. an 8-16 GiB single allocation -- exactly where
+# the teacher OOM'd. Enabling this routes through
+# process_input_logprobs_by_chunk(), capping the peak at
+# SGLANG_LOGITS_PROCESSER_CHUNK_SIZE (default 2048, ~1 GiB at TP=2) and thereby
+# decoupling logits memory from the prefill chunk size.
+export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=1
+export SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=8192
+export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH,SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
@@ -48,8 +56,6 @@ STUDENT_MODEL_NAME="${STUDENT_MODEL_NAME:-Qwen3.5-9B}"
 TEXT_TEACHER_MODEL_NAME="${TEXT_TEACHER_MODEL_NAME:-Qwen3.5-9B-dapo-teacher-hf}"
 VL_TEACHER_MODEL_NAME="${VL_TEACHER_MODEL_NAME:-Qwen3.5-9B-vl-teacher-hf}"
 PROMPT_SET="${PROMPT_SET:-${DATA_DIR}/MOPD/train.parquet}"
-# Derive eval set from PROMPT_SET's directory so overriding PROMPT_SET alone is
-# enough. Use the small balanced subset for fast monitoring.
 EVAL_SET="${EVAL_SET:-${PROMPT_SET%/*}/test_small.parquet}"
 
 ACTOR_GPUS="${ACTOR_GPUS:-8}"
@@ -70,32 +76,29 @@ ROLLOUT_ARGS=(
    --label-key label
    --metadata-key extra_info
    --apply-chat-template
-   # NOTE: --rollout-shuffle is intentionally OMITTED. prepare_data.py already
-   # (a) shuffles within each data_source and (b) interleaves the two sources so
-   # every contiguous 64-sample window (== one DP rank's per-step slice) holds
-   # both text and image samples. --rollout-shuffle re-permutes the whole epoch
-   # and destroys that interleaving, letting a DP-local step draw zero image
-   # samples — which leaves the student's vision-encoder params with no gradient
-   # and crashes Megatron grad-sync ("0/98 params have grad available"). Keep the
-   # deterministic interleaved order instead.
 
    --multimodal-keys '{"image":"images"}'
+   # The default is 16384 per image and mmlongbench rows carry up to 5 images, so a
+   # single sample reaches ~82K tokens. On the training side the full-vocab logits
+   # are seq x 248320 x 4B / (TP4 x CP2) = 9.45 GiB, which OOMs -- and TP x CP
+   # already spans all 8 GPUs, so no further sharding is available. 8192 caps the
+   # worst sample at ~49K tokens (logits 5.74 GiB) and roughly halves the rollout
+   # and teacher prefill volume as well.
+   --image-max-token-num 8192
 
    --rm-type mopd
    --num-rollout "${NUM_ROLLOUT}"
-   --rollout-batch-size 128
-   --n-samples-per-prompt 1
-   --rollout-max-prompt-len 2048
+   --rollout-batch-size 32
+   --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 1
-   --global-batch-size 128
+   --global-batch-size 256
 
    --log-passrate
    --use-fault-tolerance
    --use-streaming-dataset
 )
 
-# Teacher routes: data_source (stamped by prepare_data.py) -> HF checkpoint path.
 TEACHER_ROUTES="{\"dapo-math-17k\":\"${MODEL_DIR}/${TEXT_TEACHER_MODEL_NAME}/\",\"multimodal-open-r1\":\"${MODEL_DIR}/${VL_TEACHER_MODEL_NAME}/\"}"
 
 OPD_ARGS=(
@@ -106,13 +109,30 @@ OPD_ARGS=(
    --opd-teacher-key data_source
    --opd-teacher-routes "${TEACHER_ROUTES}"
    --teacher-num-gpus-per-engine "${TEACHER_NUM_GPUS_PER_ENGINE}"
-   --teacher-sglang-mem-fraction-static "${TEACHER_MEM_FRACTION:-0.7}"
-   --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-4096}"
-   --teacher-sglang-max-running-requests "${TEACHER_MAX_RUNNING_REQUESTS:-128}"
+   # The teacher is prefill-only, so its peak KV equals one in-flight request
+   # (45K tokens is ~1.4 GiB; the largest 5-image rows ~2.6 GiB) -- measured
+   # full token usage stays at 0.00-0.02. At 0.4 the KV pool is still ~29 GiB
+   # (11x the demand) and ~57 GiB is left for the logits gather peak plus ViT
+   # and attention workspace.
+   --teacher-sglang-mem-fraction-static "${TEACHER_MEM_FRACTION:-0.4}"
+   # A single multi-image request (~45K mm tokens) far exceeds the per-pass chunk
+   # budget, so PrefillAdder admits exactly one sequence per iteration: the
+   # chunked branch at schedule_policy.py:1101 drains rem_chunk_tokens and breaks
+   # out immediately. 4096 is too small -- ~11 passes per request, each too small
+   # a matmul for a 9B. 16384 is merely the max_prefill_tokens default; raising
+   # both to 32768 cuts it to ~2 passes. This relies on
+   # SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK above having decoupled the logits peak
+   # from the chunk size.
+   --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-32768}"
+   --teacher-sglang-max-prefill-tokens "${TEACHER_MAX_PREFILL_TOKENS:-32768}"
+   --teacher-sglang-max-running-requests "${TEACHER_MAX_RUNNING_REQUESTS:-16}"
    --teacher-sglang-disable-cuda-graph
    --opd-token-selection student_sampled
    --opd-log-prob-min-clamp -10.0
-   --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-300}"
+   # A multi-image teacher logprob re-prefills the whole multi-image context
+   # (~45K tokens per request); 300s times out on the slow tail and
+   # _raise_if_all_failed turns that into a hard error.
+   --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-1200}"
    --opd-teacher-image-key images
    --use-rollout-logprobs
 )
@@ -133,17 +153,6 @@ OPTIMIZER_ARGS=(
    --adam-beta1 0.9
    --adam-beta2 0.98
    --use-distributed-optimizer
-   # --overlap-grad-reduce / --overlap-param-gather are intentionally DISABLED.
-   # With overlap on, Megatron fires each grad bucket's async all-reduce only once
-   # EVERY param in that bucket has a gradient (via backward hooks). This student is
-   # multimodal: its vision-encoder params (the "98-param" bucket) get no gradient on
-   # steps whose batch happens not to exercise the vision tower, so that bucket never
-   # completes, the all-reduce is never issued, and finish_grad_sync asserts
-   # "Communication call has not been issued for this bucket (0/98 params have grad
-   # available)" — a data-dependent crash at random steps (observed at steps 3/8/1).
-   # Without overlap, finish_grad_sync issues a synchronous all-reduce for every
-   # bucket unconditionally (see Megatron param_and_grad_buffer.py:682), so a
-   # conditionally-unused module is harmless (its grad is simply zero that step).
    --accumulate-allreduce-grads-in-fp32
 )
 
@@ -169,13 +178,10 @@ MISC_ARGS=(
    --no-rope-fusion
 )
 
-# Student colocate on the full actor pool: TP=4, PP=1, DP=2 (actor 8 GPU).
-# Mirrors the proven text recipe scripts/training/text/run-qwen35-9B-8xgpu.sh.
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
@@ -187,9 +193,11 @@ PERF_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
+   # The student is serialised the same way (the 8192 default is also far below a
+   # single request's 45K mm tokens).
+   --sglang-chunked-prefill-size 16384
    --sglang-load-format dummy
    --sglang-enable-weights-cpu-backup
-   --sglang-disable-cuda-graph
 )
 
 RESOURCE_JSON="{\"actor\": [1, ${ACTOR_GPUS}], \"rollout\": [1, ${ROLLOUT_GPUS}], \"teacher\": [1, ${TEACHER_GPUS}]}"
