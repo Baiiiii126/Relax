@@ -36,7 +36,6 @@ def _load_data_module(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
 
     sys.modules.pop("relax.backends.megatron.data", None)
-    sys.modules.pop("relax.backends.megatron.cp_utils", None)
     return importlib.import_module("relax.backends.megatron.data")
 
 
@@ -120,6 +119,7 @@ def test_log_rollout_data_creates_collective_stats_on_training_device(monkeypatc
     monkeypatch.setattr(data_module.torch, "tensor", capture_tensor)
     monkeypatch.setattr(data_module.dist, "all_reduce", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(data_module, "gather_log_data", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(data_module, "maybe_padded_total_lengths", lambda *_args, **_kwargs: None)
 
     args = Namespace(
         qkv_format="thd",
