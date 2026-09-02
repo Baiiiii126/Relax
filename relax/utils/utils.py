@@ -245,10 +245,11 @@ def dict_to_tensordict(
     batch_size: Union[int, torch.Size, None] = None,
     device: Optional[torch.device] = None,
 ) -> TensorDict:
-    """Convert a nested-list dictionary to a TensorDict.
+    """Convert a nested-list / tensor-list dictionary to a TensorDict.
 
     Args:
-        data: Mapping of keys to nested lists (supports depth 1 or 2).
+        data: Mapping of keys to nested lists (supports depth 1 or 2) or
+            lists of per-sample tensors.
         batch_size: Optional batch size. If None, caller may set an appropriate
             batch size (TensorDict accepts None or an int/torch.Size).
         device: Optional target torch.device for created tensors.
@@ -283,6 +284,12 @@ def dict_to_tensordict(
         tensors = [torch.tensor(seq, dtype=dtype, device=device) for seq in lst]
         return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
 
+    def _to_nested_tensor_from_tensor_list(lst):
+        if not all(isinstance(item, torch.Tensor) for item in lst):
+            raise TypeError("Mixed tensor and non-tensor values are not supported")
+        tensors = [tensor.to(device=device) for tensor in lst] if device is not None else lst
+        return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+
     result = {}
 
     for key, value in data.items():
@@ -309,6 +316,9 @@ def dict_to_tensordict(
                 torch.from_numpy(np.ascontiguousarray(arr.reshape(arr.shape[0], -1))).to(torch.int32) for arr in value
             ]
             result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+            continue
+        if value and isinstance(value[0], torch.Tensor):
+            result[key] = _to_nested_tensor_from_tensor_list(value)
             continue
         depth = _nesting_depth(value)
         if depth == 0:  # empty list []
@@ -408,6 +418,11 @@ def post_process_env(args, env):
     extra_modules = Envs.RELAX_EXTRA_MODULES
     if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
         env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
+
+    # Producer and consumer derive the same TransferQueue partition names from
+    # this value, so it must be identical in every Serve and Megatron actor.
+    if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
+        env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
 
     # Generic env-var passthrough for overlay packages. Comma-separated list
     # of env-var names the driver wants forwarded to every Ray actor. Each
