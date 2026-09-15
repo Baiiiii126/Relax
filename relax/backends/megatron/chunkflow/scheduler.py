@@ -134,6 +134,7 @@ def build_chunks(
     chunk_size: int,
     repack_tail: bool = True,
     drop_tail: bool = False,
+    drop_tail_max_tokens: int | None = None,
 ) -> list[Chunk]:
     """Split/pack a batch of sequences (by length, 0-indexed) into chunks.
 
@@ -171,9 +172,19 @@ def build_chunks(
     fragment doesn't matter for your data/objective — it buys the cheapest
     possible fix (no extra chunk, no extra memory) at a correctness risk
     that ``repack_tail`` doesn't carry.
+
+    ``drop_tail_max_tokens`` bounds how much ``drop_tail`` is allowed to
+    discard per sequence — dropping is meant for a handful of leftover
+    tokens, not for silently truncating a large fraction of a sequence. A
+    tail at or above this cap is **not** dropped; it falls through to the
+    same tiny-own-chunk behavior as if both switches were off. Defaults to
+    a quarter of ``chunk_size`` when left unset; ignored when ``drop_tail``
+    is off.
     """
     if repack_tail and drop_tail:
         raise ValueError("repack_tail and drop_tail are mutually exclusive tail-handling strategies")
+
+    max_drop = drop_tail_max_tokens if drop_tail_max_tokens is not None else chunk_size // 4
 
     long_ids = [i for i, n in enumerate(seq_lengths) if n > chunk_size]
     short_ids = [i for i, n in enumerate(seq_lengths) if n <= chunk_size]
@@ -185,14 +196,15 @@ def build_chunks(
     for seq_id in long_ids:
         length = seq_lengths[seq_id]
         num_chunks = math.ceil(length / chunk_size)
-        has_tail = length % chunk_size != 0
-        group_size = num_chunks - 1 if (drop_tail and has_tail) else num_chunks
+        tail_len = length - (num_chunks - 1) * chunk_size
+        should_drop_tail = drop_tail and tail_len < chunk_size and tail_len <= max_drop
+        group_size = num_chunks - 1 if should_drop_tail else num_chunks
 
         for i in range(num_chunks):
             start = i * chunk_size
             seg_len = min(chunk_size, length - start)
             is_tail = i == num_chunks - 1 and seg_len < chunk_size
-            if is_tail and drop_tail:
+            if is_tail and should_drop_tail:
                 continue  # discard these trailing tokens entirely — see drop_tail docstring
             if is_tail and repack_tail:
                 tails.append((seq_id, start, seg_len, i, group_size))

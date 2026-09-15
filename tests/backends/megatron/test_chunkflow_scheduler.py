@@ -113,6 +113,24 @@ def test_drop_tail_is_noop_when_length_divides_evenly():
     assert [c.group_size for c in with_drop] == [c.group_size for c in without_drop] == [2, 2]
 
 
+def test_drop_tail_respects_default_max_tokens_threshold():
+    # chunk_size=1024 -> default cap is 256. A 300-token tail is too big to drop.
+    chunks = build_chunks([1024 + 300], chunk_size=1024, repack_tail=False, drop_tail=True)
+    dep = [c for c in chunks if c.is_dependent]
+    assert len(dep) == 2  # tail was NOT dropped, falls through to its own tiny chunk
+    assert sum(c.num_tokens for c in dep) == 1024 + 300  # nothing lost
+    assert [c.group_size for c in dep] == [2, 2]  # unchanged, since nothing was dropped
+
+
+def test_drop_tail_custom_threshold_allows_a_bigger_tail():
+    # Same 300-token tail, but with an explicit higher threshold it does get dropped.
+    chunks = build_chunks([1024 + 300], chunk_size=1024, repack_tail=False, drop_tail=True, drop_tail_max_tokens=500)
+    dep = [c for c in chunks if c.is_dependent]
+    assert len(dep) == 1
+    assert dep[0].num_tokens == 1024
+    assert dep[0].group_size == 1
+
+
 def test_drop_tail_and_repack_tail_are_mutually_exclusive():
     with pytest.raises(ValueError):
         build_chunks([1026], chunk_size=1024, repack_tail=True, drop_tail=True)
