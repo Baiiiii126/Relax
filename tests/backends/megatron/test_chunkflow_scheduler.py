@@ -91,6 +91,39 @@ def test_repack_tail_folds_tiny_tail_into_short_sequence_packing():
     assert sum(c.num_tokens for c in with_repack) == sum(lengths)
 
 
+def test_drop_tail_discards_trailing_tokens_and_shrinks_group_size():
+    # 1026 tokens, chunk_size 1024 -> 1 full chunk + a 2-token tail that gets dropped.
+    chunks = build_chunks([1026], chunk_size=1024, repack_tail=False, drop_tail=True)
+    dep = [c for c in chunks if c.is_dependent]
+
+    assert len(dep) == 1  # the tail never became a chunk at all
+    assert dep[0].num_tokens == 1024
+    assert dep[0].group_size == 1  # shrunk from 2 -> 1 to match reality, not stale
+    assert dep[0].group_idx == 0
+
+    # lossy: total output tokens is strictly less than the input length.
+    assert sum(c.num_tokens for c in chunks) == 1024 < 1026
+
+
+def test_drop_tail_is_noop_when_length_divides_evenly():
+    # 2048 tokens, chunk_size 1024 -> exactly 2 full chunks, no tail to drop.
+    with_drop = build_chunks([2048], chunk_size=1024, repack_tail=False, drop_tail=True)
+    without_drop = build_chunks([2048], chunk_size=1024, repack_tail=False, drop_tail=False)
+    assert sum(c.num_tokens for c in with_drop) == sum(c.num_tokens for c in without_drop) == 2048
+    assert [c.group_size for c in with_drop] == [c.group_size for c in without_drop] == [2, 2]
+
+
+def test_drop_tail_and_repack_tail_are_mutually_exclusive():
+    with pytest.raises(ValueError):
+        build_chunks([1026], chunk_size=1024, repack_tail=True, drop_tail=True)
+
+
+def test_drop_tail_schedule_still_validates_clean():
+    chunks = build_chunks([1026] + [500] * 2, chunk_size=1024, repack_tail=False, drop_tail=True)
+    ops = build_schedule(chunks, keep_last_k=2)
+    assert validate_schedule(chunks, ops) == []
+
+
 def test_group_of_sorts_by_group_idx_ascending():
     chunks = build_chunks([3000], chunk_size=1024, repack_tail=False)
     groups = group_of(chunks)

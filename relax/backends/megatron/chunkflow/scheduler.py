@@ -129,27 +129,52 @@ def _bin_pack_min_bins(lengths: list[int], cap: int) -> list[list[int]]:
     return [[i] for i in range(len(lengths))]
 
 
-def build_chunks(seq_lengths: Sequence[int], chunk_size: int, repack_tail: bool = True) -> list[Chunk]:
+def build_chunks(
+    seq_lengths: Sequence[int],
+    chunk_size: int,
+    repack_tail: bool = True,
+    drop_tail: bool = False,
+) -> list[Chunk]:
     """Split/pack a batch of sequences (by length, 0-indexed) into chunks.
 
     Sequences longer than ``chunk_size`` become an ascending dependency
     group of ``ceil(length / chunk_size)`` chunks. Sequences at or under
     ``chunk_size`` are bin-packed together into standalone chunks.
 
-    ``repack_tail`` (default on): a long sequence's last chunk is often
-    smaller than ``chunk_size`` (e.g. a ``chunk_size + 2`` sequence produces
-    one full chunk plus a lone 2-token chunk). Left on its own, that tiny
-    chunk still occupies a full pipeline unit *and* carries the group's
-    ordering constraint — pure overhead. With ``repack_tail=True`` it is
-    folded into the short-sequence packing pool instead (capped at one tail
-    per chunk, so a chunk never ends up belonging to two dependency groups
-    at once). This does trade memory for it: those short sequences are no
-    longer "free" (forward-then-immediately-backward-and-free) — they must
-    now wait for the whole dependency group's forward pass to finish before
-    the chunk they share can backward. Prefer it on data that is strongly
-    long-tailed; on weakly long-tailed data the memory cost can outweigh the
-    pipeline-slot savings.
+    A long sequence's last chunk is often smaller than ``chunk_size`` (e.g.
+    a ``chunk_size + 2`` sequence produces one full chunk plus a lone
+    2-token tail) — pure overhead if left alone: that tiny chunk still
+    occupies a full pipeline unit *and* carries the group's ordering
+    constraint. ``repack_tail`` and ``drop_tail`` are two independent,
+    mutually exclusive switches for what to do about it — passing both
+    raises ``ValueError``; passing neither keeps that tiny tail chunk as-is
+    (the fragmentation defect described above).
+
+    ``repack_tail`` (default on): folds the tail into the short-sequence
+    packing pool instead (capped at one tail per chunk, so a chunk never
+    ends up belonging to two dependency groups at once). This trades memory
+    for it: those short sequences are no longer "free"
+    (forward-then-immediately-backward-and-free) — they must now wait for
+    the whole dependency group's forward pass to finish before the chunk
+    they share can backward. Prefer it on data that is strongly
+    long-tailed; on weakly long-tailed data the memory cost can outweigh
+    the pipeline-slot savings.
+
+    ``drop_tail`` (default off): discards the tail's tokens outright
+    instead of building a chunk for them at all — the sequence's
+    dependency group shrinks by one chunk (``group_size`` is adjusted to
+    match) and those trailing tokens never get a forward or backward.
+    This is **lossy**: if the tail happens to fall inside content that
+    matters (e.g. the final answer tokens or an EOS marker in an RL
+    response), that content silently never contributes to the loss for
+    this sequence. Only turn this on once you've confirmed the dropped
+    fragment doesn't matter for your data/objective — it buys the cheapest
+    possible fix (no extra chunk, no extra memory) at a correctness risk
+    that ``repack_tail`` doesn't carry.
     """
+    if repack_tail and drop_tail:
+        raise ValueError("repack_tail and drop_tail are mutually exclusive tail-handling strategies")
+
     long_ids = [i for i, n in enumerate(seq_lengths) if n > chunk_size]
     short_ids = [i for i, n in enumerate(seq_lengths) if n <= chunk_size]
 
@@ -160,11 +185,17 @@ def build_chunks(seq_lengths: Sequence[int], chunk_size: int, repack_tail: bool 
     for seq_id in long_ids:
         length = seq_lengths[seq_id]
         num_chunks = math.ceil(length / chunk_size)
+        has_tail = length % chunk_size != 0
+        group_size = num_chunks - 1 if (drop_tail and has_tail) else num_chunks
+
         for i in range(num_chunks):
             start = i * chunk_size
             seg_len = min(chunk_size, length - start)
-            if repack_tail and i == num_chunks - 1 and seg_len < chunk_size:
-                tails.append((seq_id, start, seg_len, i, num_chunks))
+            is_tail = i == num_chunks - 1 and seg_len < chunk_size
+            if is_tail and drop_tail:
+                continue  # discard these trailing tokens entirely — see drop_tail docstring
+            if is_tail and repack_tail:
+                tails.append((seq_id, start, seg_len, i, group_size))
                 continue
             chunks.append(
                 Chunk(
@@ -172,7 +203,7 @@ def build_chunks(seq_lengths: Sequence[int], chunk_size: int, repack_tail: bool 
                     segments=[Segment(seq_id, start, seg_len)],
                     group=seq_id,
                     group_idx=i,
-                    group_size=num_chunks,
+                    group_size=group_size,
                 )
             )
             cid += 1
