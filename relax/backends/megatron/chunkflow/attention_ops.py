@@ -15,16 +15,19 @@ needed to merge across KV blocks incrementally, and (b) real flash-attention
 kernels need it to avoid materializing the full attention-probability matrix
 in their backward.
 
-``_manual_attn_forward``/``_manual_attn_backward`` are a plain-torch
-reference implementation of flash attention's forward/backward math
-(block-free here — chunkflow's chunking already bounds how much KV a single
-call sees). They exist so this module is testable on CPU without flash_attn
-or a GPU. The intended production kernel is flash_attn's low-level varlen
-forward/backward (the ones that expose ``softmax_lse``, unlike
-``flash_attn_varlen_func`` which hides it) — swapping them in only requires
-replacing the two functions behind ``ChunkCacheAttention``; the manual
-reference implements the identical math so this substitution changes
-nothing about the surrounding orchestration or its tests.
+Two backends sit behind ``ChunkCacheAttention``:
+
+* flash_attn's low-level varlen forward/backward on CUDA with fp16/bf16 —
+  the production path. The low-level pair is used (not
+  ``flash_attn_varlen_func``) because only it exposes ``softmax_lse`` and
+  lets us drive backward ourselves. Its ``causal=True`` aligns the mask to
+  the bottom right when ``seqlen_q < seqlen_k``, which is exactly the
+  "q short, kv long" semantics ``_causal_mask`` encodes.
+* ``_manual_attn_forward``/``_manual_attn_backward``, a plain-torch
+  reference implementing the identical math, used on CPU/fp32 so this module
+  stays testable without flash_attn or a GPU. It materialises the
+  ``[H, Tq, Tk]`` score matrix, so it is a correctness reference, not a
+  production path.
 
 Gradient accumulation across chunks is *not* done by hand here: every chunk
 reads the same K/V tensors out of one ``StateStore``, so calling
@@ -126,6 +129,81 @@ def _causal_mask(tq: int, tk: int, device: torch.device) -> torch.Tensor:
     return k_pos > q_pos
 
 
+def _flash_varlen_ops():
+    """flash_attn's low-level varlen forward/backward, or None.
+
+    The low-level pair is used rather than ``flash_attn_varlen_func`` because
+    only these expose ``softmax_lse`` and let us drive backward ourselves.
+    ``causal=True`` with ``seqlen_q < seqlen_k`` aligns the mask to the bottom
+    right, which is exactly chunkflow's "q short, kv long" semantics — verified
+    against the offset mask in ``_causal_mask``.
+    """
+    try:
+        from flash_attn.flash_attn_interface import (
+            _flash_attn_varlen_backward,
+            _flash_attn_varlen_forward,
+        )
+    except ImportError:
+        return None
+    return _flash_attn_varlen_forward, _flash_attn_varlen_backward
+
+
+def _use_flash(q: torch.Tensor) -> bool:
+    """Flash kernels need CUDA and fp16/bf16; CPU tests fall back to the
+    reference implementation."""
+    return q.is_cuda and q.dtype in (torch.float16, torch.bfloat16) and _flash_varlen_ops() is not None
+
+
+def _cu_seqlens(total: int, device: torch.device) -> torch.Tensor:
+    return torch.tensor([0, total], dtype=torch.int32, device=device)
+
+
+def _flash_fwd(q, k, v, causal, softmax_scale):
+    fwd, _bwd = _flash_varlen_ops()
+    out, lse, _s, _rng = fwd(
+        q,
+        k,
+        v,
+        _cu_seqlens(q.shape[0], q.device),
+        _cu_seqlens(k.shape[0], k.device),
+        q.shape[0],
+        k.shape[0],
+        0.0,  # dropout_p
+        softmax_scale,
+        causal,
+    )[:4]
+    return out, lse
+
+
+def _flash_bwd(dout, q, k, v, out, lse, causal, softmax_scale):
+    _fwd, bwd = _flash_varlen_ops()
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        dq,
+        dk,
+        dv,
+        _cu_seqlens(q.shape[0], q.device),
+        _cu_seqlens(k.shape[0], k.device),
+        q.shape[0],
+        k.shape[0],
+        0.0,  # dropout_p
+        softmax_scale,
+        causal,
+        -1,  # window_size_left
+        -1,  # window_size_right
+        0.0,  # softcap
+        None,  # alibi_slopes
+        False,  # deterministic
+    )
+    return dq, dk, dv
+
+
 class ChunkCacheAttention(torch.autograd.Function):
     """Chunk-internal attention op: ``q`` (this chunk) attends over the K/V of
     chunks ``0..i`` (cache-so-far, "q short, kv long").
@@ -147,14 +225,20 @@ class ChunkCacheAttention(torch.autograd.Function):
         ks, vs = kv_chunks[:num_chunks], kv_chunks[num_chunks:]
         k_all = torch.cat(ks, dim=0)
         v_all = torch.cat(vs, dim=0)
-        out, lse = _manual_attn_forward(q, k_all, v_all, causal, softmax_scale)
+        flash = _use_flash(q)
+        if flash:
+            out, lse = _flash_fwd(q, k_all, v_all, causal, softmax_scale)
+        else:
+            out, lse = _manual_attn_forward(q, k_all, v_all, causal, softmax_scale)
         # k_all/v_all deliberately NOT saved: they are concatenations, so saving
         # them would cost a fresh copy per chunk. The per-chunk tensors below are
         # shared across every chunk's ctx, so they cost one reference each.
-        ctx.save_for_backward(q, lse, *kv_chunks)
+        # `out` is saved only on the flash path, whose backward needs it.
+        ctx.save_for_backward(q, lse, *((out,) if flash else ()), *kv_chunks)
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.num_chunks = num_chunks
+        ctx.flash = flash
         ctx.chunk_lengths = [k.shape[0] for k in ks]
         return out, lse
 
@@ -163,11 +247,19 @@ class ChunkCacheAttention(torch.autograd.Function):
         # `_dlse` (grad w.r.t. lse) is unused: lse never flows forward into
         # the rest of the network, so nothing downstream produces a real
         # gradient for it.
-        q, lse, *kv_chunks = ctx.saved_tensors
+        saved = list(ctx.saved_tensors)
+        q, lse = saved.pop(0), saved.pop(0)
+        out = saved.pop(0) if ctx.flash else None
+        kv_chunks = saved
         n = ctx.num_chunks
         k_all = torch.cat(kv_chunks[:n], dim=0)  # transient, freed on return
         v_all = torch.cat(kv_chunks[n:], dim=0)
-        dq, dk_all, dv_all = _manual_attn_backward(dout, q, k_all, v_all, lse, ctx.causal, ctx.softmax_scale)
+        if ctx.flash:
+            dq, dk_all, dv_all = _flash_bwd(
+                dout.contiguous(), q, k_all, v_all, out, lse, ctx.causal, ctx.softmax_scale
+            )
+        else:
+            dq, dk_all, dv_all = _manual_attn_backward(dout, q, k_all, v_all, lse, ctx.causal, ctx.softmax_scale)
         dks = torch.split(dk_all, ctx.chunk_lengths, dim=0)
         dvs = torch.split(dv_all, ctx.chunk_lengths, dim=0)
         return (dq, None, None, None, *dks, *dvs)

@@ -229,3 +229,63 @@ def test_saved_activation_does_not_grow_with_chunk_count(chunk_size):
         f"{chunked / baseline:.2f}x the unchunked activation; the cache is "
         "probably being concatenated and saved again per chunk."
     )
+
+
+# ---------------------------------------------------------------------------
+# 4. flash backend (GPU only): must be at least as accurate as the reference
+# ---------------------------------------------------------------------------
+
+
+def _chunked_fwd_bwd(q, k, v, chunk_size, force_manual):
+    """Chunked forward + one backward; returns (out, dq, dk, dv)."""
+    from relax.backends.megatron.chunkflow import attention_ops as ao
+
+    original = ao._use_flash
+    if force_manual:
+        ao._use_flash = lambda _q: False
+    try:
+        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v)]
+        ql, kl, vl = leaves
+        store, outs = StateStore(), []
+        for chunk_id, start in enumerate(range(0, q.shape[0], chunk_size)):
+            sl = slice(start, start + chunk_size)
+            out, _lse = chunk_attention_forward(chunk_id, ql[sl], kl[sl], vl[sl], store)
+            outs.append(out)
+        torch.cat(outs, dim=0).sum().backward()
+        return torch.cat([o.detach() for o in outs], dim=0), ql.grad, kl.grad, vl.grad
+    finally:
+        ao._use_flash = original
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flash_backend_is_at_least_as_accurate_as_the_reference():
+    """Judge both bf16 backends against an fp32 reference.
+
+    Comparing two bf16 results to each other proves nothing -- bf16's ULP at
+    magnitude ~10 is already ~0.06. What matters is the distance to the true
+    answer; flash accumulates in fp32 and should not be worse.
+    """
+    from relax.backends.megatron.chunkflow import attention_ops as ao
+
+    if ao._flash_varlen_ops() is None:
+        pytest.skip("flash_attn not installed")
+
+    torch.manual_seed(0)
+    total, h, d, chunk_size = 256, 8, 64, 64
+    q32 = torch.randn(total, h, d, device="cuda")
+    k32 = torch.randn(total, h, d, device="cuda")
+    v32 = torch.randn(total, h, d, device="cuda")
+    qb, kb, vb = (t.bfloat16() for t in (q32, k32, v32))
+
+    ref = _chunked_fwd_bwd(q32, k32, v32, chunk_size, force_manual=True)
+    flash = _chunked_fwd_bwd(qb, kb, vb, chunk_size, force_manual=False)
+    manual = _chunked_fwd_bwd(qb, kb, vb, chunk_size, force_manual=True)
+
+    for name, r, f, m in zip(("out", "dq", "dk", "dv"), ref, flash, manual):
+        scale = r.float().abs().max().item()
+        err_flash = (f.float() - r.float()).abs().max().item() / scale
+        err_manual = (m.float() - r.float()).abs().max().item() / scale
+        assert err_flash <= err_manual * 3, (
+            f"{name}: flash rel-err {err_flash:.2e} vs reference {err_manual:.2e} -- "
+            "the flash path is materially less accurate than the fallback."
+        )
