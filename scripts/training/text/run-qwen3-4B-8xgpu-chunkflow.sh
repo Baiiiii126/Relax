@@ -26,6 +26,12 @@
 # Single phases, if a rerun is needed:
 #   MODE=dump  ... ; MODE=train CHUNK_SIZE=0 ... ; MODE=train CHUNK_SIZE=2048 ...
 #
+# MODE=rl runs a normal RL loop instead -- rollout and train every step, eval on
+# AIME -- for watching real training curves on ClearML (reward, passrate,
+# response length), which the replay phases cannot produce because they train on
+# a fixed dump. Use NUM_ROLLOUT=100+ there:
+#   NUM_ROLLOUT=100 MODE=rl CHUNK_SIZE=2048 bash .../run-qwen3-4B-8xgpu-chunkflow.sh
+#
 # This checks correctness only. Chunked attention does not reduce memory or
 # pipeline bubbles on its own; that needs the per-chunk backward schedule.
 
@@ -182,6 +188,29 @@ run_phase() {
             --chunkflow-chunk-size ${CHUNK_SIZE}
          )
          ;;
+      rl)
+         # A normal RL loop -- rollout and train every step, eval on AIME -- so
+         # ClearML gets the curves that only a real run produces (reward,
+         # passrate, response length). The replay phases above cannot: they
+         # train on three fixed rollouts, so reward never moves.
+         if [ "${CHUNK_SIZE}" -gt 0 ]; then
+            arm="rl-chunk${CHUNK_SIZE}"
+            mode_args=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE})
+         else
+            arm="rl-baseline"
+            mode_args=()
+         fi
+         mode_args+=(
+            "${SGLANG_ARGS[@]}"
+            --log-passrate
+            --eval-interval 20
+            --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
+            --n-samples-per-eval-prompt 8
+            --eval-max-response-len 16384
+            --eval-top-p 0.7
+            --use-fault-tolerance
+         )
+         ;;
       *)
          echo "unknown phase: ${phase}" >&2
          return 1
@@ -213,7 +242,9 @@ run_phase() {
       "${mode_args[@]}" \
       "${MISC_ARGS[@]}" ) 2>&1 | tee "${log_file}"
 
-   if [ "${phase}" = "chunk" ]; then
+   # A chunkflow arm whose patch never fired would look identical to the
+   # baseline and read as a pass, so check the arm was actually chunked.
+   if [ "${phase}" = "chunk" ] || { [ "${phase}" = "rl" ] && [ "${CHUNK_SIZE}" -gt 0 ]; }; then
       if ! grep -q "chunked attention installed" "${log_file}"; then
          echo "FAIL: chunkflow never installed -- this arm proves nothing." >&2
          return 1
@@ -237,8 +268,9 @@ case "${MODE}" in
    train)
       if [ "${CHUNK_SIZE}" -gt 0 ]; then run_phase chunk; else run_phase baseline; fi
       ;;
+   rl) run_phase rl ;;
    *)
-      echo "MODE must be one of: all, dump, train" >&2
+      echo "MODE must be one of: all, dump, train, rl" >&2
       exit 1
       ;;
 esac
