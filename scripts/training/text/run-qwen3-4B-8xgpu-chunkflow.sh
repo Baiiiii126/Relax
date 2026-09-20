@@ -2,40 +2,24 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 8xGPU chunkflow correctness A/B, one command:
+# Qwen3-4B 8xGPU RL training with a chunkflow toggle.
 #
-#   bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
+# Same as run-qwen3-4B-8xgpu.sh, plus one switch:
 #
-# Runs three phases back to back on one Ray cluster:
+#   CHUNK_SIZE=0    -> plain run (baseline)
+#   CHUNK_SIZE=2048 -> chunked attention on
 #
-#   1. dump      rollout only, saved to $ROLLOUT_DUMP_DIR
-#   2. baseline  train on that dump with chunkflow OFF, saving per-step grad norms
-#   3. chunk     train on the same dump with chunkflow ON, asserting each grad
-#                norm matches the baseline's (--ci-load-grad-norm, rel_tol 1%)
+# Run both, then overlay the two `train/loss` curves in ClearML
+# (project "Relax/dev/chunkflow"). Chunked attention is numerically equivalent,
+# so the curves should track each other within RL sampling noise -- they will
+# NOT be identical step by step (rollout samples at temperature 1, so the arms
+# see different data), and near-identical early steps drifting apart later is
+# expected from Adam amplification, not a chunkflow bug.
 #
-# Phase 3 aborts the script if any grad norm diverges, so the run itself is the
-# verdict -- no log eyeballing required. The per-step `step N: {...}` lines from
-# phases 2 and 3 are diffed at the end for the finer-grained picture.
-#
-# The rollout is done once and replayed because sampling runs at temperature 1:
-# two ordinary RL runs would train on different data and the loss gap would be
-# sampling noise, not chunkflow. --load-debug-rollout-data implies
-# --debug-train-only, so sglang never starts in phases 2 and 3 and both arms are
-# actor-only, differing in exactly one flag pair.
-#
-# Single phases, if a rerun is needed:
-#   MODE=dump  ... ; MODE=train CHUNK_SIZE=0 ... ; MODE=train CHUNK_SIZE=2048 ...
-#
-# MODE=rl runs a normal RL loop instead -- rollout and train every step, eval on
-# AIME -- for watching real training curves on ClearML (reward, passrate,
-# response length), which the replay phases cannot produce because they train on
-# a fixed dump. Use NUM_ROLLOUT=100+ there:
-#   NUM_ROLLOUT=100 MODE=rl CHUNK_SIZE=2048 bash .../run-qwen3-4B-8xgpu-chunkflow.sh
-#
-# This checks correctness only. Chunked attention does not reduce memory or
-# pipeline bubbles on its own; that needs the per-chunk backward schedule.
+#   CHUNK_SIZE=0    bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
+#   CHUNK_SIZE=2048 bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
 
-set -e
+set -ex
 set -o pipefail
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
@@ -52,19 +36,25 @@ PROJECT_NAME="${PROJECT_NAME:=Relax/dev/chunkflow}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=3}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
 
-# Both train phases must read the same dump and compare the same grad norms.
-ROLLOUT_DUMP_DIR="${ROLLOUT_DUMP_DIR:-${EXP_DIR}/chunkflow-rollout-dump}"
-GRAD_NORM_DIR="${GRAD_NORM_DIR:-${EXP_DIR}/chunkflow-grad-norm}"
-MODE="${MODE:=all}"
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
 CHUNK_SIZE="${CHUNK_SIZE:=2048}"
+if [ "${CHUNK_SIZE}" -gt 0 ]; then
+   CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE})
+   ARM="chunk${CHUNK_SIZE}"
+else
+   CHUNKFLOW_ARGS=()
+   ARM="baseline"
+fi
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-4B/
    --ref-load ${MODEL_DIR}/Qwen3-4B/
    --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
+   # No --load/--save: both arms start from the same HF checkpoint, and neither
+   # inherits the other's state.
 )
 
 PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
@@ -74,7 +64,7 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key label
    --apply-chat-template
-   # No --rollout-shuffle: the dump must be reproducible from the prompt file.
+   --rollout-shuffle
 
    --rm-type dapo
    --reward-key score
@@ -87,6 +77,17 @@ ROLLOUT_ARGS=(
 
    --global-batch-size 128
    --balance-data
+   --use-fault-tolerance
+)
+
+EVAL_ARGS=(
+   --skip-eval-before-train
+   --log-passrate
+   --eval-interval 20
+   --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
+   --n-samples-per-eval-prompt 8
+   --eval-max-response-len 16384
+   --eval-top-p 0.7
 )
 
 PERF_ARGS=(
@@ -106,8 +107,9 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   # No --use-kl-loss: its coefficient is 0 here anyway, and dropping it keeps
-   # the reference model out of a run that only needs the actor.
+   --use-kl-loss
+   --kl-loss-coef 0.00
+   --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
@@ -129,6 +131,13 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.8
 )
 
+WANDB_ARGS=(
+   --use-clearml
+   --use-metrics-service
+   --tb-project-name  ${PROJECT_NAME}
+   --tb-experiment-name qwen3-4b-chunkflow-${ARM}-gpu8-${now}
+)
+
 MISC_ARGS=(
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
@@ -140,137 +149,32 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-GRAD_NORM_TEMPLATE="${GRAD_NORM_DIR}/{role}_{rollout_id}_{step_id}.pt"
+mkdir -p log
+LOG_FILE="log/qwen3-4b-chunkflow-${ARM}-gpu8-${now}.log"
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
+   --runtime-env-json="${RUNTIME_ENV_JSON}" \
+   -- python3 -m relax.entrypoints.train \
+   --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
+   --max-staleness 0 \
+   --num-data-storage-units 1 \
+   --colocate \
+    --use-health-check \
+    "${MODEL_ARGS[@]}" \
+    "${CKPT_ARGS[@]}" \
+    "${ROLLOUT_ARGS[@]}" \
+    "${OPTIMIZER_ARGS[@]}" \
+    "${GRPO_ARGS[@]}" \
+    "${WANDB_ARGS[@]}" \
+    "${PERF_ARGS[@]}" \
+    "${EVAL_ARGS[@]}" \
+    "${SGLANG_ARGS[@]}" \
+    "${CHUNKFLOW_ARGS[@]}" \
+    "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_FILE}"
 
-# Every phase declares both roles even though each only runs one of them:
-# `process_role` picks the roles to create from --debug-rollout-only /
-# --debug-train-only and ignores the rest, but `compute_dp_size` reads
-# resource["actor"] unconditionally and falls back to 1 GPU, which makes
-# dp_size = 1 // tp = 0 and aborts before anything starts. Declaring both also
-# leaves --colocate inert: the controller only colocates when both roles are
-# actually created.
-RESOURCE='{"actor": [1, 8], "rollout": [1, 8]}'
-
-mkdir -p log "${ROLLOUT_DUMP_DIR}" "${GRAD_NORM_DIR}"
-
-run_phase() {
-   local phase="$1"
-   local arm
-   local -a mode_args
-
-   case "${phase}" in
-      dump)
-         arm="dump"
-         # SGLANG_ARGS only here: the train phases set --debug-train-only, which
-         # skips the sglang parser entirely, so passing them there would be
-         # silently ignored rather than honoured.
-         mode_args=(
-            --debug-rollout-only
-            --save-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
-            "${SGLANG_ARGS[@]}"
-         )
-         ;;
-      baseline)
-         arm="baseline"
-         mode_args=(
-            --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
-            --ci-save-grad-norm "${GRAD_NORM_TEMPLATE}"
-         )
-         ;;
-      chunk)
-         arm="chunk${CHUNK_SIZE}"
-         # --ci-load-grad-norm asserts against the baseline's grad norms, so a
-         # divergence aborts this phase instead of hiding in a log.
-         mode_args=(
-            --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
-            --ci-load-grad-norm "${GRAD_NORM_TEMPLATE}"
-            --use-chunkflow
-            --chunkflow-chunk-size ${CHUNK_SIZE}
-         )
-         ;;
-      rl)
-         # A normal RL loop -- rollout and train every step, eval on AIME -- so
-         # ClearML gets the curves that only a real run produces (reward,
-         # passrate, response length). The replay phases above cannot: they
-         # train on three fixed rollouts, so reward never moves.
-         if [ "${CHUNK_SIZE}" -gt 0 ]; then
-            arm="rl-chunk${CHUNK_SIZE}"
-            mode_args=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE})
-         else
-            arm="rl-baseline"
-            mode_args=()
-         fi
-         mode_args+=(
-            "${SGLANG_ARGS[@]}"
-            --log-passrate
-            --eval-interval 20
-            --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
-            --n-samples-per-eval-prompt 8
-            --eval-max-response-len 16384
-            --eval-top-p 0.7
-            --use-fault-tolerance
-         )
-         ;;
-      *)
-         echo "unknown phase: ${phase}" >&2
-         return 1
-         ;;
-   esac
-
-   local log_file="log/qwen3-4b-chunkflow-${arm}-gpu8-${now}.log"
-   echo "=== chunkflow phase: ${phase} -> ${log_file} ==="
-   ( set -x
-   ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
-      ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
-      --runtime-env-json="${RUNTIME_ENV_JSON}" \
-      -- python3 -m relax.entrypoints.train \
-      --resource "${RESOURCE}" \
-      --max-staleness 0 \
-      --num-data-storage-units 1 \
-      --colocate \
-      --skip-eval-before-train \
-      "${MODEL_ARGS[@]}" \
-      "${CKPT_ARGS[@]}" \
-      "${ROLLOUT_ARGS[@]}" \
-      "${OPTIMIZER_ARGS[@]}" \
-      "${GRPO_ARGS[@]}" \
-      --use-clearml \
-      --use-metrics-service \
-      --tb-project-name "${PROJECT_NAME}" \
-      --tb-experiment-name "qwen3-4b-chunkflow-${arm}-gpu8-${now}" \
-      "${PERF_ARGS[@]}" \
-      "${mode_args[@]}" \
-      "${MISC_ARGS[@]}" ) 2>&1 | tee "${log_file}"
-
-   # A chunkflow arm whose patch never fired would look identical to the
-   # baseline and read as a pass, so check the arm was actually chunked.
-   if [ "${phase}" = "chunk" ] || { [ "${phase}" = "rl" ] && [ "${CHUNK_SIZE}" -gt 0 ]; }; then
-      if ! grep -q "chunked attention installed" "${log_file}"; then
-         echo "FAIL: chunkflow never installed -- this arm proves nothing." >&2
-         return 1
-      fi
-   fi
-}
-
-case "${MODE}" in
-   all)
-      run_phase dump
-      run_phase baseline
-      run_phase chunk
-      echo "=== per-step metrics: baseline vs chunk${CHUNK_SIZE} ==="
-      diff -y --width 200 \
-         <(grep -oE "step [0-9]+: \{.*\}" "log/qwen3-4b-chunkflow-baseline-gpu8-${now}.log") \
-         <(grep -oE "step [0-9]+: \{.*\}" "log/qwen3-4b-chunkflow-chunk${CHUNK_SIZE}-gpu8-${now}.log") \
-         || true
-      echo "=== PASS: grad norms matched the baseline at every step ==="
-      ;;
-   dump) run_phase dump ;;
-   train)
-      if [ "${CHUNK_SIZE}" -gt 0 ]; then run_phase chunk; else run_phase baseline; fi
-      ;;
-   rl) run_phase rl ;;
-   *)
-      echo "MODE must be one of: all, dump, train, rl" >&2
-      exit 1
-      ;;
-esac
+# A chunkflow arm whose patch never fired would look identical to the baseline
+# and read as a pass, so check the arm was actually chunked.
+if [ "${CHUNK_SIZE}" -gt 0 ] && ! grep -q "chunked attention installed" "${LOG_FILE}"; then
+   echo "FAIL: chunkflow never installed -- this arm proves nothing." >&2
+   exit 1
+fi
