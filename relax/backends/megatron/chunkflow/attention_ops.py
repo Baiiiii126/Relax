@@ -26,14 +26,18 @@ replacing the two functions behind ``ChunkCacheAttention``; the manual
 reference implements the identical math so this substitution changes
 nothing about the surrounding orchestration or its tests.
 
-Gradient accumulation across chunks is *not* done by hand here: each
-chunk's K/V leaves live in a shared autograd graph (built via
-``torch.cat`` over whatever the caller passed to ``StateStore``), so calling
+Gradient accumulation across chunks is *not* done by hand here: every chunk
+reads the same K/V tensors out of one ``StateStore``, so calling
 ``.backward()`` once per chunk, in descending order, lets ordinary autograd
 ``+=`` accumulation do the summing (chunkflow lesson 3.4) — what is manual is
 *driving* those per-chunk backward calls in the right order and freeing the
 StateStore entry right after each one (lesson 3.5/3.6), instead of a single
 ``.backward()`` over the whole sequence.
+
+Memory: the op saves the per-chunk K/V, never their concatenation, so the
+activation kept for backward is O(T) rather than O(T^2 / chunk_size). See
+``ChunkCacheAttention`` for why, and the memory regression test in
+``tests/backends/megatron/test_chunkflow_attention_ops.py``.
 """
 
 from __future__ import annotations
@@ -123,20 +127,35 @@ def _causal_mask(tq: int, tk: int, device: torch.device) -> torch.Tensor:
 
 
 class ChunkCacheAttention(torch.autograd.Function):
-    """Chunk-internal attention op: ``q`` (this chunk) attends over
-    ``k_all``/``v_all`` (cache-so-far, "q short, kv long").
+    """Chunk-internal attention op: ``q`` (this chunk) attends over the K/V of
+    chunks ``0..i`` (cache-so-far, "q short, kv long").
 
-    Returns ``(out, lse)`` and saves exactly what backward needs (``q, k_all,
-    v_all, lse``) — mirrors the ``SparseMLA`` autograd.Function template in
+    Takes the PER-CHUNK k/v rather than a pre-concatenated cache, and saves
+    those for backward instead of the concatenation. Every chunk sees the same
+    k/v tensor objects (they come from one ``StateStore``), so saving them N
+    times costs one reference each, not one copy each: total saved activation
+    is O(T) instead of the O(T^2 / chunk_size) a saved ``torch.cat`` would
+    cost. Backward re-concatenates — one transient copy, freed immediately,
+    the same compute-for-memory trade real flash attention makes.
+
+    Mirrors the ``SparseMLA`` autograd.Function template in
     ``relax/models/glm_moe_dsa/ops/sparse_mla.py``.
     """
 
     @staticmethod
-    def forward(ctx, q, k_all, v_all, causal, softmax_scale):
+    def forward(ctx, q, causal, softmax_scale, num_chunks, *kv_chunks):
+        ks, vs = kv_chunks[:num_chunks], kv_chunks[num_chunks:]
+        k_all = torch.cat(ks, dim=0)
+        v_all = torch.cat(vs, dim=0)
         out, lse = _manual_attn_forward(q, k_all, v_all, causal, softmax_scale)
-        ctx.save_for_backward(q, k_all, v_all, lse)
+        # k_all/v_all deliberately NOT saved: they are concatenations, so saving
+        # them would cost a fresh copy per chunk. The per-chunk tensors below are
+        # shared across every chunk's ctx, so they cost one reference each.
+        ctx.save_for_backward(q, lse, *kv_chunks)
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
+        ctx.num_chunks = num_chunks
+        ctx.chunk_lengths = [k.shape[0] for k in ks]
         return out, lse
 
     @staticmethod
@@ -144,9 +163,14 @@ class ChunkCacheAttention(torch.autograd.Function):
         # `_dlse` (grad w.r.t. lse) is unused: lse never flows forward into
         # the rest of the network, so nothing downstream produces a real
         # gradient for it.
-        q, k_all, v_all, lse = ctx.saved_tensors
+        q, lse, *kv_chunks = ctx.saved_tensors
+        n = ctx.num_chunks
+        k_all = torch.cat(kv_chunks[:n], dim=0)  # transient, freed on return
+        v_all = torch.cat(kv_chunks[n:], dim=0)
         dq, dk_all, dv_all = _manual_attn_backward(dout, q, k_all, v_all, lse, ctx.causal, ctx.softmax_scale)
-        return dq, dk_all, dv_all, None, None
+        dks = torch.split(dk_all, ctx.chunk_lengths, dim=0)
+        dvs = torch.split(dv_all, ctx.chunk_lengths, dim=0)
+        return (dq, None, None, None, *dks, *dvs)
 
 
 def chunk_attention_forward(
@@ -167,10 +191,12 @@ def chunk_attention_forward(
     """
     store.put(chunk_id, ChunkState({"k": new_k, "v": new_v}))
     states = store.lookup(chunk_id)
-    k_all = torch.cat([s.tensors["k"] for s in states], dim=0)
-    v_all = torch.cat([s.tensors["v"] for s in states], dim=0)
+    ks = [s.tensors["k"] for s in states]
+    vs = [s.tensors["v"] for s in states]
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
-    return ChunkCacheAttention.apply(q, k_all, v_all, causal, scale)
+    # Pass the chunks themselves, not a concatenation: the op saves these for
+    # backward, and they are shared across chunks, so nothing is copied.
+    return ChunkCacheAttention.apply(q, causal, scale, len(ks), *ks, *vs)
 
 
 def chunk_attention_backward(chunk_id: int, out: torch.Tensor, dout: torch.Tensor, store: StateStore) -> None:

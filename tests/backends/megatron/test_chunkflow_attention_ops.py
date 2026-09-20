@@ -22,6 +22,10 @@ Covers:
    dependency-heavy case) and a chunk size that doesn't evenly divide the
    sequence length.
 3. The same equivalence under bf16, with a widened tolerance.
+4. Memory: the activation saved for backward must stay flat as the chunk count
+   grows. An earlier version concatenated the cache and saved that, costing
+   O(T^2 / chunk_size) -- 11x the unchunked baseline at 32 chunks, the exact
+   opposite of what chunking is for. This is regression-tested here.
 """
 
 from __future__ import annotations
@@ -174,3 +178,54 @@ def test_dk_dv_accumulate_contributions_from_later_chunks():
     # chunk 0 = tokens [0:4): read by query chunks 0, 1, and 2 (all of them).
     torch.testing.assert_close(dk_chunk[:chunk_size], dk_ref[:chunk_size], atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(dv_chunk[:chunk_size], dv_ref[:chunk_size], atol=1e-4, rtol=1e-4)
+
+
+def _saved_activation_bytes(out: torch.Tensor) -> int:
+    """Total bytes of tensors the autograd graph behind ``out`` keeps alive."""
+    seen: set[int] = set()
+    total = 0
+    stack = [out.grad_fn]
+    while stack:
+        fn = stack.pop()
+        if fn is None or id(fn) in seen:
+            continue
+        seen.add(id(fn))
+        for t in getattr(fn, "saved_tensors", ()):
+            if isinstance(t, torch.Tensor) and id(t) not in seen:
+                seen.add(id(t))
+                total += t.numel() * t.element_size()
+        stack.extend(next_fn for next_fn, _ in fn.next_functions)
+    return total
+
+
+def _chunked_forward_only(q, k, v, chunk_size):
+    store = StateStore()
+    outs = []
+    for chunk_id, start in enumerate(range(0, q.shape[0], chunk_size)):
+        sl = slice(start, start + chunk_size)
+        out, _lse = chunk_attention_forward(chunk_id, q[sl], k[sl], v[sl], store)
+        outs.append(out)
+    return torch.cat(outs, dim=0)
+
+
+@pytest.mark.parametrize("chunk_size", [64, 32, 16, 8])
+def test_saved_activation_does_not_grow_with_chunk_count(chunk_size):
+    """Chunking must not inflate what backward keeps alive.
+
+    Saving the concatenated cache per chunk costs O(T^2 / chunk_size); saving
+    the per-chunk K/V (shared objects) costs O(T). Without this test the
+    regression is invisible -- every numerical test still passes.
+    """
+    total, h, d = 128, 4, 16
+    q = torch.randn(total, h, d, requires_grad=True)
+    k = torch.randn(total, h, d, requires_grad=True)
+    v = torch.randn(total, h, d, requires_grad=True)
+
+    baseline = _saved_activation_bytes(_chunked_forward_only(q, k, v, total))
+    chunked = _saved_activation_bytes(_chunked_forward_only(q, k, v, chunk_size))
+
+    assert chunked <= baseline * 1.2, (
+        f"chunk_size={chunk_size} ({total // chunk_size} chunks) saves "
+        f"{chunked / baseline:.2f}x the unchunked activation; the cache is "
+        "probably being concatenated and saved again per chunk."
+    )
