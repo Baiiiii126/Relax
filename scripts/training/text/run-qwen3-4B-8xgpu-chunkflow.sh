@@ -2,22 +2,31 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 8xGPU colocate training with chunkflow's chunked attention.
-#
-# Drives BOTH arms of the chunkflow A/B from one file, so the two runs differ
-# in exactly one flag pair and nothing else:
-#
-#   CHUNK_SIZE=0    bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh   # baseline
-#   CHUNK_SIZE=2048 bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh   # chunkflow
+# Qwen3-4B 8xGPU chunkflow correctness A/B.
 #
 # Chunked attention is numerically equivalent to unchunked attention, so the
-# two arms' per-step loss should track each other to bf16 noise. It does not
-# reduce memory or pipeline bubbles on its own -- that needs the per-chunk
-# backward schedule, which is a separate step. This run is a correctness
-# check, not a perf check.
+# point of this run is to show the training loss is unchanged. Comparing two
+# ordinary RL runs cannot show that: rollout samples at temperature 1, so the
+# two arms would train on different data and the loss difference would be
+# dominated by sampling noise, not by chunkflow.
 #
-# Derived from run-qwen3-4B-8xgpu.sh; --load/--save are deliberately dropped so
-# every arm starts from the same HF checkpoint and cannot inherit the other's.
+# So the rollout is done ONCE and replayed. Three phases:
+#
+#   MODE=dump                    bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
+#   MODE=train CHUNK_SIZE=0      bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
+#   MODE=train CHUNK_SIZE=2048   bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
+#
+# `dump` generates and saves the rollout data (sglang only, no training). The
+# two `train` arms replay that exact data (--load-debug-rollout-data implies
+# --debug-train-only, so sglang never starts), differ in one flag pair, and
+# start from the same HF checkpoint. Any per-step loss difference between them
+# is attributable to chunked attention and nothing else.
+#
+# Run the three sequentially -- each uses all 8 GPUs.
+#
+# This checks correctness only. Chunked attention does not reduce memory or
+# pipeline bubbles on its own; that needs the per-chunk backward schedule,
+# which is a separate step.
 
 set -ex
 set -o pipefail
@@ -36,23 +45,18 @@ PROJECT_NAME="${PROJECT_NAME:=Relax/dev/chunkflow}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=10}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=3}"
 
+# Where the dumped rollout lives. Both train arms must read the same one.
+ROLLOUT_DUMP_DIR="${ROLLOUT_DUMP_DIR:-${EXP_DIR}/chunkflow-rollout-dump}"
+MODE="${MODE:=train}"
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
 CHUNK_SIZE="${CHUNK_SIZE:=2048}"
-if [ "${CHUNK_SIZE}" -gt 0 ]; then
-   CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE})
-   ARM="chunk${CHUNK_SIZE}"
-else
-   CHUNKFLOW_ARGS=()
-   ARM="baseline"
-fi
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-4B/
    --ref-load ${MODEL_DIR}/Qwen3-4B/
    --megatron-to-hf-mode bridge
-   --warm-hf-checkpoint-page-cache
 )
 
 PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
@@ -62,8 +66,7 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key label
    --apply-chat-template
-   # No --rollout-shuffle: both arms must see the same prompts in the same
-   # order, otherwise the loss curves are incomparable.
+   # No --rollout-shuffle: the dump must be reproducible from the prompt file.
 
    --rm-type dapo
    --reward-key score
@@ -76,11 +79,6 @@ ROLLOUT_ARGS=(
 
    --global-batch-size 128
    --balance-data
-   --use-fault-tolerance
-)
-
-EVAL_ARGS=(
-   --skip-eval-before-train
 )
 
 PERF_ARGS=(
@@ -100,9 +98,8 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
-   --kl-loss-coef 0.00
-   --kl-loss-type low_var_kl
+   # No --use-kl-loss: its coefficient is 0 here anyway, and dropping it keeps
+   # the reference model out of a run that only needs the actor.
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
@@ -124,13 +121,6 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.8
 )
 
-WANDB_ARGS=(
-   --use-clearml
-   --use-metrics-service
-   --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen3-4b-chunkflow-${ARM}-gpu8-${now}
-)
-
 MISC_ARGS=(
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
@@ -142,16 +132,47 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+if [ "${MODE}" = "dump" ]; then
+   mkdir -p "${ROLLOUT_DUMP_DIR}"
+   ARM="dump"
+   RESOURCE='{"rollout": [1, 8]}'
+   MODE_ARGS=(
+      --debug-rollout-only
+      --save-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
+   )
+elif [ "${CHUNK_SIZE}" -gt 0 ]; then
+   ARM="chunk${CHUNK_SIZE}"
+   RESOURCE='{"actor": [1, 8]}'
+   MODE_ARGS=(
+      --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
+      --use-chunkflow
+      --chunkflow-chunk-size ${CHUNK_SIZE}
+   )
+else
+   ARM="baseline"
+   RESOURCE='{"actor": [1, 8]}'
+   MODE_ARGS=(
+      --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
+   )
+fi
+
+WANDB_ARGS=(
+   --use-clearml
+   --use-metrics-service
+   --tb-project-name  ${PROJECT_NAME}
+   --tb-experiment-name qwen3-4b-chunkflow-${ARM}-gpu8-${now}
+)
+
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
+   --resource "${RESOURCE}" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \
-    --use-health-check \
+    --skip-eval-before-train \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
@@ -159,7 +180,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${GRPO_ARGS[@]}" \
     "${WANDB_ARGS[@]}" \
     "${PERF_ARGS[@]}" \
-    "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${CHUNKFLOW_ARGS[@]}" \
+    "${MODE_ARGS[@]}" \
     "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-4b-chunkflow-${ARM}-gpu8-${now}.log
