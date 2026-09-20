@@ -136,25 +136,36 @@ MISC_ARGS=(
 
 GRAD_NORM_TEMPLATE="${GRAD_NORM_DIR}/{role}_{rollout_id}_{step_id}.pt"
 
+# Every phase declares both roles even though each only runs one of them:
+# `process_role` picks the roles to create from --debug-rollout-only /
+# --debug-train-only and ignores the rest, but `compute_dp_size` reads
+# resource["actor"] unconditionally and falls back to 1 GPU, which makes
+# dp_size = 1 // tp = 0 and aborts before anything starts. Declaring both also
+# leaves --colocate inert: the controller only colocates when both roles are
+# actually created.
+RESOURCE='{"actor": [1, 8], "rollout": [1, 8]}'
+
 mkdir -p log "${ROLLOUT_DUMP_DIR}" "${GRAD_NORM_DIR}"
 
 run_phase() {
    local phase="$1"
-   local arm resource
+   local arm
    local -a mode_args
 
    case "${phase}" in
       dump)
          arm="dump"
-         resource='{"rollout": [1, 8]}'
+         # SGLANG_ARGS only here: the train phases set --debug-train-only, which
+         # skips the sglang parser entirely, so passing them there would be
+         # silently ignored rather than honoured.
          mode_args=(
             --debug-rollout-only
             --save-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
+            "${SGLANG_ARGS[@]}"
          )
          ;;
       baseline)
          arm="baseline"
-         resource='{"actor": [1, 8]}'
          mode_args=(
             --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
             --ci-save-grad-norm "${GRAD_NORM_TEMPLATE}"
@@ -162,7 +173,6 @@ run_phase() {
          ;;
       chunk)
          arm="chunk${CHUNK_SIZE}"
-         resource='{"actor": [1, 8]}'
          # --ci-load-grad-norm asserts against the baseline's grad norms, so a
          # divergence aborts this phase instead of hiding in a log.
          mode_args=(
@@ -185,7 +195,7 @@ run_phase() {
       ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
       --runtime-env-json="${RUNTIME_ENV_JSON}" \
       -- python3 -m relax.entrypoints.train \
-      --resource "${resource}" \
+      --resource "${RESOURCE}" \
       --max-staleness 0 \
       --num-data-storage-units 1 \
       --colocate \
@@ -200,7 +210,6 @@ run_phase() {
       --tb-project-name "${PROJECT_NAME}" \
       --tb-experiment-name "qwen3-4b-chunkflow-${arm}-gpu8-${now}" \
       "${PERF_ARGS[@]}" \
-      "${SGLANG_ARGS[@]}" \
       "${mode_args[@]}" \
       "${MISC_ARGS[@]}" ) 2>&1 | tee "${log_file}"
 
