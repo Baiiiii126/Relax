@@ -92,6 +92,66 @@ def test_chunkflow_sbhd_is_rejected():
         _attn(chunk_size=2)(torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_chunkflow_matches_flash_varlen_on_training_shapes():
+    """The production configuration, against the kernel it replaces.
+
+    Every test above runs fp64 on CPU, which takes the plain-torch fallback.
+    A real run is bf16 on CUDA with GQA and packed sequences, i.e. the flash
+    path -- and the thing chunkflow displaces there is Transformer Engine's
+    ``DotProductAttention``, which itself calls ``flash_attn_varlen_func``. So
+    that function is the oracle: it is what Megatron would have computed.
+
+    Shapes mirror Qwen3-4B under ``--tensor-model-parallel-size 2``: 32 query
+    heads and 8 KV heads halve to 16/4 per rank, head_dim 128.
+    """
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except ImportError:
+        pytest.skip("flash_attn not installed")
+
+    h, kv_h, d = 16, 4, 128
+    lengths = [3000, 1096]  # packed, and neither is a multiple of chunk_size
+    total = sum(lengths)
+    bounds = [0, lengths[0], total]
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(total, h, d, generator=g, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(total, kv_h, d, generator=g, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(total, kv_h, d, generator=g, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    dout = torch.randn(total, h * d, generator=g, device="cuda", dtype=torch.bfloat16)
+    packed = SimpleNamespace(cu_seqlens_q=torch.tensor(bounds, device="cuda", dtype=torch.int32))
+
+    def run(fn):
+        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v)]
+        fn(*leaves).backward(dout)
+        return [leaf.grad for leaf in leaves]
+
+    def chunked(ql, kl, vl):
+        return _attn(chunk_size=1024)(ql, kl, vl, packed_seq_params=packed)
+
+    def reference(ql, kl, vl):
+        cu = torch.tensor(bounds, device="cuda", dtype=torch.int32)
+        out = flash_attn_varlen_func(ql, kl, vl, cu, cu, max(lengths), max(lengths), causal=True)
+        return out.reshape(total, -1)
+
+    # Measured: dq 2.75e-04, dk 7.19e-03, dv 6.17e-03, relative to each
+    # tensor's own magnitude (an absolute tolerance is meaningless here -- bf16
+    # carries ~3 decimal digits and one ULP is already ~7.8e-03).
+    #
+    # dk/dv sit a decimal place above dq because a K token's gradient arrives
+    # from every later query chunk as a separate bf16 kernel output, summed by
+    # autograd in bf16, where the oracle sums inside one kernel in fp32. That
+    # is chunking's cost, not a bug: re-running this with chunk_size past the
+    # sequence length makes dk/dv bit-exact (0.0), and dropping GQA leaves them
+    # unchanged (7.04e-03 / 5.59e-03), which rules out the head widening.
+    rels = {
+        name: ((got.float() - want.float()).abs().max() / want.float().abs().max()).item()
+        for name, got, want in zip(("dq", "dk", "dv"), run(chunked), run(reference))
+    }
+    assert max(rels.values()) < 2e-2, f"chunked differs from flash_attn_varlen_func: {rels}"
+
+
 def test_chunkflow_install_swaps_and_uninstall_restores():
     class FakeAttn(torch.nn.Module):
         def __init__(self):
