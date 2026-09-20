@@ -2636,6 +2636,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
             return parser
 
+        def add_chunkflow_arguments(parser):
+            """Add chunkflow (chunked attention) arguments."""
+            parser.add_argument(
+                "--use-chunkflow",
+                action="store_true",
+                default=False,
+                help=(
+                    "Split each sequence into chunks inside attention, keeping every chunk's K/V in a "
+                    "per-layer StateStore so later chunks attend over the accumulated cache. "
+                    "Numerically identical to unchunked attention. Requires --chunkflow-chunk-size and "
+                    "--context-parallel-size 1."
+                ),
+            )
+            parser.add_argument(
+                "--chunkflow-chunk-size",
+                type=int,
+                default=0,
+                help=(
+                    "Tokens per chunk for --use-chunkflow. Must be > 0 when chunkflow is enabled; a value "
+                    "at or above the sequence length degenerates to a single chunk (no chunking)."
+                ),
+            )
+            return parser
+
         def add_ci_arguments(parser):
             parser.add_argument(
                 "--ci-test",
@@ -2714,6 +2738,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_genrm_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
+        parser = add_chunkflow_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_autoscaler_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
@@ -2948,6 +2973,30 @@ def _normalize_mtp_detach_paths(args) -> None:
     if unknown_paths:
         raise ValueError(f"Unknown --mtp-detach-paths values: {', '.join(unknown_paths)}.")
     args.mtp_detach_paths = tuple(path for path in _MTP_DETACH_PATHS if path in requested_paths)
+
+
+def _validate_chunkflow_args(args) -> None:
+    """Reject chunkflow configurations that cannot work, at parse time.
+
+    Both checks would otherwise surface much later: a missing chunk size as a
+    silently unchunked run, and CP>1 as a ``NotImplementedError`` from deep
+    inside the first attention call.
+    """
+    if not getattr(args, "use_chunkflow", False):
+        return
+
+    chunk_size = getattr(args, "chunkflow_chunk_size", 0)
+    if chunk_size <= 0:
+        raise ValueError(
+            f"--use-chunkflow requires --chunkflow-chunk-size > 0 (got {chunk_size}); "
+            "without it chunkflow would silently run unchunked."
+        )
+    if getattr(args, "context_parallel_size", 1) > 1:
+        raise ValueError(
+            "--use-chunkflow is incompatible with --context-parallel-size > 1: context parallelism "
+            "splits the very sequence chunkflow caches in its per-layer StateStore. "
+            "Remove one of the two."
+        )
 
 
 def _normalize_mtp_only_training_args(args) -> None:
@@ -3941,6 +3990,7 @@ def slime_validate_args(args):
 
     _normalize_mtp_detach_paths(args)
     _normalize_mtp_only_training_args(args)
+    _validate_chunkflow_args(args)
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"

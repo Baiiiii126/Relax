@@ -64,3 +64,45 @@ def test_chunkflow_patch_ignores_malformed_value(monkeypatch):
     model = torch.nn.Sequential(_FakeAttn())
     probe(model)
     assert not _is_chunked(model)
+
+
+def _reload_patch(monkeypatch):
+    """Reload the patch against a stubbed hook target; returns the wrapper."""
+    fake_mp = SimpleNamespace(_install_cp_probe=lambda model: None)
+    monkeypatch.setitem(__import__("sys").modules, "relax.backends.megatron.model_provider", fake_mp)
+    module = importlib.import_module("relax.backends.megatron.megatron_patch.chunkflow_attention_patch")
+    importlib.reload(module)
+    return module, fake_mp._install_cp_probe
+
+
+def _stub_args(monkeypatch, module, args):
+    """Make the patch's get_args() import return `args`."""
+    fake_global_vars = SimpleNamespace(get_args=lambda: args)
+    fake_training = SimpleNamespace(global_vars=fake_global_vars)
+    sys = __import__("sys")
+    monkeypatch.setitem(sys.modules, "megatron.training.global_vars", fake_global_vars)
+    monkeypatch.setitem(sys.modules, "megatron.training", fake_training)
+    del module
+
+
+def test_chunkflow_patch_prefers_args_over_env(monkeypatch):
+    """CLI args win: the env fallback must not override an explicit --use-
+    chunkflow."""
+    monkeypatch.setenv("RELAX_CHUNKFLOW_CHUNK_SIZE", "64")
+    module, probe = _reload_patch(monkeypatch)
+    _stub_args(monkeypatch, module, SimpleNamespace(use_chunkflow=True, chunkflow_chunk_size=256))
+
+    model = torch.nn.Sequential(_FakeAttn())
+    probe(model)
+    assert model[0].core_attention.chunk_size == 256
+
+
+def test_chunkflow_patch_args_off_beats_env_on(monkeypatch):
+    """--use-chunkflow absent means off, even with the env var set."""
+    monkeypatch.setenv("RELAX_CHUNKFLOW_CHUNK_SIZE", "64")
+    module, probe = _reload_patch(monkeypatch)
+    _stub_args(monkeypatch, module, SimpleNamespace(use_chunkflow=False, chunkflow_chunk_size=256))
+
+    model = torch.nn.Sequential(_FakeAttn())
+    probe(model)
+    assert not isinstance(model[0].core_attention, ChunkedCoreAttention)
