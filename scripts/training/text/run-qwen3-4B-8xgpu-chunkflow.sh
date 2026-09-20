@@ -2,33 +2,34 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 8xGPU chunkflow correctness A/B.
+# Qwen3-4B 8xGPU chunkflow correctness A/B, one command:
 #
-# Chunked attention is numerically equivalent to unchunked attention, so the
-# point of this run is to show the training loss is unchanged. Comparing two
-# ordinary RL runs cannot show that: rollout samples at temperature 1, so the
-# two arms would train on different data and the loss difference would be
-# dominated by sampling noise, not by chunkflow.
+#   bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
 #
-# So the rollout is done ONCE and replayed. Three phases:
+# Runs three phases back to back on one Ray cluster:
 #
-#   MODE=dump                    bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
-#   MODE=train CHUNK_SIZE=0      bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
-#   MODE=train CHUNK_SIZE=2048   bash scripts/training/text/run-qwen3-4B-8xgpu-chunkflow.sh
+#   1. dump      rollout only, saved to $ROLLOUT_DUMP_DIR
+#   2. baseline  train on that dump with chunkflow OFF, saving per-step grad norms
+#   3. chunk     train on the same dump with chunkflow ON, asserting each grad
+#                norm matches the baseline's (--ci-load-grad-norm, rel_tol 1%)
 #
-# `dump` generates and saves the rollout data (sglang only, no training). The
-# two `train` arms replay that exact data (--load-debug-rollout-data implies
-# --debug-train-only, so sglang never starts), differ in one flag pair, and
-# start from the same HF checkpoint. Any per-step loss difference between them
-# is attributable to chunked attention and nothing else.
+# Phase 3 aborts the script if any grad norm diverges, so the run itself is the
+# verdict -- no log eyeballing required. The per-step `step N: {...}` lines from
+# phases 2 and 3 are diffed at the end for the finer-grained picture.
 #
-# Run the three sequentially -- each uses all 8 GPUs.
+# The rollout is done once and replayed because sampling runs at temperature 1:
+# two ordinary RL runs would train on different data and the loss gap would be
+# sampling noise, not chunkflow. --load-debug-rollout-data implies
+# --debug-train-only, so sglang never starts in phases 2 and 3 and both arms are
+# actor-only, differing in exactly one flag pair.
+#
+# Single phases, if a rerun is needed:
+#   MODE=dump  ... ; MODE=train CHUNK_SIZE=0 ... ; MODE=train CHUNK_SIZE=2048 ...
 #
 # This checks correctness only. Chunked attention does not reduce memory or
-# pipeline bubbles on its own; that needs the per-chunk backward schedule,
-# which is a separate step.
+# pipeline bubbles on its own; that needs the per-chunk backward schedule.
 
-set -ex
+set -e
 set -o pipefail
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
@@ -47,9 +48,10 @@ MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=3}"
 
-# Where the dumped rollout lives. Both train arms must read the same one.
+# Both train phases must read the same dump and compare the same grad norms.
 ROLLOUT_DUMP_DIR="${ROLLOUT_DUMP_DIR:-${EXP_DIR}/chunkflow-rollout-dump}"
-MODE="${MODE:=train}"
+GRAD_NORM_DIR="${GRAD_NORM_DIR:-${EXP_DIR}/chunkflow-grad-norm}"
+MODE="${MODE:=all}"
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
 CHUNK_SIZE="${CHUNK_SIZE:=2048}"
 
@@ -132,54 +134,102 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-if [ "${MODE}" = "dump" ]; then
-   mkdir -p "${ROLLOUT_DUMP_DIR}"
-   ARM="dump"
-   RESOURCE='{"rollout": [1, 8]}'
-   MODE_ARGS=(
-      --debug-rollout-only
-      --save-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
-   )
-elif [ "${CHUNK_SIZE}" -gt 0 ]; then
-   ARM="chunk${CHUNK_SIZE}"
-   RESOURCE='{"actor": [1, 8]}'
-   MODE_ARGS=(
-      --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
-      --use-chunkflow
-      --chunkflow-chunk-size ${CHUNK_SIZE}
-   )
-else
-   ARM="baseline"
-   RESOURCE='{"actor": [1, 8]}'
-   MODE_ARGS=(
-      --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
-   )
-fi
+GRAD_NORM_TEMPLATE="${GRAD_NORM_DIR}/{role}_{rollout_id}_{step_id}.pt"
 
-WANDB_ARGS=(
-   --use-clearml
-   --use-metrics-service
-   --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen3-4b-chunkflow-${ARM}-gpu8-${now}
-)
+mkdir -p log "${ROLLOUT_DUMP_DIR}" "${GRAD_NORM_DIR}"
 
-mkdir -p log
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
-   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
-   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 -m relax.entrypoints.train \
-   --resource "${RESOURCE}" \
-   --max-staleness 0 \
-   --num-data-storage-units 1 \
-   --colocate \
-    --skip-eval-before-train \
-    "${MODEL_ARGS[@]}" \
-    "${CKPT_ARGS[@]}" \
-    "${ROLLOUT_ARGS[@]}" \
-    "${OPTIMIZER_ARGS[@]}" \
-    "${GRPO_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
-    "${PERF_ARGS[@]}" \
-    "${SGLANG_ARGS[@]}" \
-    "${MODE_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-4b-chunkflow-${ARM}-gpu8-${now}.log
+run_phase() {
+   local phase="$1"
+   local arm resource
+   local -a mode_args
+
+   case "${phase}" in
+      dump)
+         arm="dump"
+         resource='{"rollout": [1, 8]}'
+         mode_args=(
+            --debug-rollout-only
+            --save-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
+         )
+         ;;
+      baseline)
+         arm="baseline"
+         resource='{"actor": [1, 8]}'
+         mode_args=(
+            --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
+            --ci-save-grad-norm "${GRAD_NORM_TEMPLATE}"
+         )
+         ;;
+      chunk)
+         arm="chunk${CHUNK_SIZE}"
+         resource='{"actor": [1, 8]}'
+         # --ci-load-grad-norm asserts against the baseline's grad norms, so a
+         # divergence aborts this phase instead of hiding in a log.
+         mode_args=(
+            --load-debug-rollout-data "${ROLLOUT_DUMP_DIR}/{rollout_id}.pt"
+            --ci-load-grad-norm "${GRAD_NORM_TEMPLATE}"
+            --use-chunkflow
+            --chunkflow-chunk-size ${CHUNK_SIZE}
+         )
+         ;;
+      *)
+         echo "unknown phase: ${phase}" >&2
+         return 1
+         ;;
+   esac
+
+   local log_file="log/qwen3-4b-chunkflow-${arm}-gpu8-${now}.log"
+   echo "=== chunkflow phase: ${phase} -> ${log_file} ==="
+   ( set -x
+   ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+      ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
+      --runtime-env-json="${RUNTIME_ENV_JSON}" \
+      -- python3 -m relax.entrypoints.train \
+      --resource "${resource}" \
+      --max-staleness 0 \
+      --num-data-storage-units 1 \
+      --colocate \
+      --skip-eval-before-train \
+      "${MODEL_ARGS[@]}" \
+      "${CKPT_ARGS[@]}" \
+      "${ROLLOUT_ARGS[@]}" \
+      "${OPTIMIZER_ARGS[@]}" \
+      "${GRPO_ARGS[@]}" \
+      --use-clearml \
+      --use-metrics-service \
+      --tb-project-name "${PROJECT_NAME}" \
+      --tb-experiment-name "qwen3-4b-chunkflow-${arm}-gpu8-${now}" \
+      "${PERF_ARGS[@]}" \
+      "${SGLANG_ARGS[@]}" \
+      "${mode_args[@]}" \
+      "${MISC_ARGS[@]}" ) 2>&1 | tee "${log_file}"
+
+   if [ "${phase}" = "chunk" ]; then
+      if ! grep -q "chunked attention installed" "${log_file}"; then
+         echo "FAIL: chunkflow never installed -- this arm proves nothing." >&2
+         return 1
+      fi
+   fi
+}
+
+case "${MODE}" in
+   all)
+      run_phase dump
+      run_phase baseline
+      run_phase chunk
+      echo "=== per-step metrics: baseline vs chunk${CHUNK_SIZE} ==="
+      diff -y --width 200 \
+         <(grep -oE "step [0-9]+: \{.*\}" "log/qwen3-4b-chunkflow-baseline-gpu8-${now}.log") \
+         <(grep -oE "step [0-9]+: \{.*\}" "log/qwen3-4b-chunkflow-chunk${CHUNK_SIZE}-gpu8-${now}.log") \
+         || true
+      echo "=== PASS: grad norms matched the baseline at every step ==="
+      ;;
+   dump) run_phase dump ;;
+   train)
+      if [ "${CHUNK_SIZE}" -gt 0 ]; then run_phase chunk; else run_phase baseline; fi
+      ;;
+   *)
+      echo "MODE must be one of: all, dump, train" >&2
+      exit 1
+      ;;
+esac
