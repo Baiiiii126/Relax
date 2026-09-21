@@ -169,3 +169,109 @@ def test_chunkflow_install_swaps_and_uninstall_restores():
 
     assert uninstall(model) == 2
     assert model[0].core_attention is original
+
+
+# ---------------------------------------------------------------------------
+# Unit mode: chunks driven one at a time, backward descending
+# ---------------------------------------------------------------------------
+
+
+def _unit_attn(chunk_size, layer=1):
+    from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime
+
+    return ChunkedCoreAttention(
+        config=SimpleNamespace(context_parallel_size=1),
+        layer_number=layer,
+        chunk_size=chunk_size,
+        runtime=ChunkflowRuntime(chunk_size),
+    )
+
+
+def _drive_units(attn, q, k, v, dout, chunk_size, descending_backward=True):
+    """Forward chunk by chunk, then backward one unit at a time."""
+    from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
+    from relax.backends.megatron.chunkflow.scheduler import build_chunks
+    from relax.backends.megatron.chunkflow.units import build_micro_batches
+
+    total = q.shape[0]
+    chunks = build_chunks([total], chunk_size=chunk_size, repack_tail=False)
+    units = build_micro_batches(chunks, "staggered")
+
+    outs, bounds, cursor = [], [], 0
+    for unit in units:
+        cu = [0]
+        for chunk in unit.chunks:
+            for seg in chunk.segments:
+                cu.append(cu[-1] + seg.length)
+        n = cu[-1]
+        packed = SimpleNamespace(cu_seqlens_q_cpu=cu, **{UNIT_ATTR: unit})
+        outs.append(
+            attn(q[cursor : cursor + n], k[cursor : cursor + n], v[cursor : cursor + n], packed_seq_params=packed)
+        )
+        bounds.append((cursor, cursor + n))
+        cursor += n
+
+    order = list(reversed(range(len(outs)))) if descending_backward else list(range(len(outs)))
+    for i in order:
+        s, e = bounds[i]
+        outs[i].backward(dout[s:e])
+
+    return torch.cat([o.detach() for o in outs], dim=0)
+
+
+def test_unit_mode_matches_the_in_forward_loop():
+    """Driving chunks as separate units must equal chunking inside one
+    forward."""
+    torch.manual_seed(0)
+    total, h, d, chunk_size = 32, 2, 8, 16
+    q, k, v = _qkv(total, h, d)
+    q_ref, k_ref, v_ref = (t.clone().requires_grad_(True) for t in (q, k, v))
+    q_u, k_u, v_u = (t.clone().requires_grad_(True) for t in (q, k, v))
+
+    torch.testing.assert_close(_attn(chunk_size)(q_ref, k_ref, v_ref), _unit_attn(chunk_size)(q_u, k_u, v_u))
+
+    ref, dq_r, dk_r, dv_r = _grads(_attn(chunk_size), q_ref, k_ref, v_ref)
+    got, dq_u, dk_u, dv_u = _grads(_unit_attn(chunk_size), q_u, k_u, v_u)
+    torch.testing.assert_close(ref, got)
+    for got_g, want_g in ((dq_u, dq_r), (dk_u, dk_r), (dv_u, dv_r)):
+        torch.testing.assert_close(got_g, want_g)
+
+
+def _grads(module, q, k, v):
+    out = module(q, k, v)
+    out.backward(torch.ones_like(out))
+    return out.detach(), q.grad, k.grad, v.grad
+
+
+def test_unit_mode_survives_per_unit_descending_backward():
+    """The schedule backards one unit at a time, descending.
+
+    With the live K/V in the store the second ``.backward()`` would raise
+    "backward through the graph a second time"; with the detached leaf plus the
+    fold-back hook it must instead reproduce the single-pass gradients exactly.
+    """
+    torch.manual_seed(0)
+    total, h, d, chunk_size = 48, 2, 8, 16
+    q, k, v = _qkv(total, h, d)
+    dout = torch.randn(total, h * d) * 0.1
+
+    # Reference: one chunked forward, one backward.
+    q_r, k_r, v_r = (t.clone().requires_grad_(True) for t in (q, k, v))
+    ref = _attn(chunk_size)(q_r, k_r, v_r)
+    ref.backward(dout)  # same downstream gradient as the unit-mode run
+
+    # Unit mode, three units, backward 2 -> 1 -> 0.
+    q_u, k_u, v_u = (t.clone().requires_grad_(True) for t in (q, k, v))
+    attn = _unit_attn(chunk_size)
+    _drive_units(attn, q_u, k_u, v_u, dout, chunk_size)
+
+    for got, want in ((q_u.grad, q_r.grad), (k_u.grad, k_r.grad), (v_u.grad, v_r.grad)):
+        torch.testing.assert_close(got, want, atol=1e-9, rtol=1e-9)
+
+
+def test_unit_mode_leaves_no_state_behind_after_release():
+    from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime
+
+    runtime = ChunkflowRuntime(16)
+    assert runtime.num_stores() == 0
+    runtime.assert_empty("a fresh runtime")

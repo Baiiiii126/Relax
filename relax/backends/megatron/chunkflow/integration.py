@@ -18,11 +18,14 @@ which is a separate step.
 
 from __future__ import annotations
 
+import itertools
+
 import torch
 from torch import nn
 
 from relax.backends.megatron.chunkflow.attention_ops import chunk_attention_forward
-from relax.backends.megatron.chunkflow.state_store import StateStore
+from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
+from relax.backends.megatron.chunkflow.state_store import ChunkState, StateStore
 from relax.utils.logging_utils import get_logger
 
 
@@ -52,13 +55,66 @@ class ChunkedCoreAttention(nn.Module):
     is treated as one sequence.
     """
 
-    def __init__(self, config, layer_number: int, chunk_size: int, softmax_scale=None, **kwargs):
+    def __init__(self, config, layer_number: int, chunk_size: int, softmax_scale=None, runtime=None, **kwargs):
         super().__init__()
         del kwargs
         self.config = config
         self.layer_number = layer_number
         self.chunk_size = chunk_size
         self.softmax_scale = softmax_scale
+        self.runtime = runtime
+
+    def _forward_unit(self, query, key, value, packed_seq_params) -> torch.Tensor:
+        """One attention call for a whole unit, each sequence over its own K/V.
+
+        A dependent sequence attends its group's earlier chunks plus its own; a
+        standalone one attends only its own. Both go into a single varlen call,
+        which is where the call-count saving comes from.
+
+        The store keeps a *detached leaf* per chunk rather than the live tensor.
+        Later chunks then read a leaf instead of chaining into this chunk's
+        graph, which is what lets the schedule backward one unit at a time --
+        with the live tensor, the second ``.backward()`` would hit "backward
+        through the graph a second time".
+
+        Detaching loses the gradient later chunks owe this chunk, so a hook adds
+        it back: by the time this unit backwards (the schedule goes descending),
+        the leaf has collected every later chunk's contribution, and the hook
+        folds it into the gradient flowing to the live tensor.
+        """
+        from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
+        from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
+
+        unit = getattr(packed_seq_params, UNIT_ATTR, None)
+        cu = packed_seq_params.cu_seqlens_q_cpu
+        meta = [(c.group, c.group_idx) for c in unit.chunks for _ in c.segments]
+
+        ks, vs = [], []
+        for i, (group, group_idx) in enumerate(meta):
+            start, end = cu[i], cu[i + 1]
+            k_own, v_own = key[start:end], value[start:end]
+            if group is None:
+                ks.append(k_own)
+                vs.append(v_own)
+                continue
+
+            store = self.runtime.store(self.layer_number, group)
+            leaf_k = k_own.detach().requires_grad_(True)
+            leaf_v = v_own.detach().requires_grad_(True)
+            store.put(group_idx, ChunkState({"k": leaf_k, "v": leaf_v}))
+            _fold_leaf_grad_into(k_own, leaf_k)
+            _fold_leaf_grad_into(v_own, leaf_v)
+
+            earlier = store.lookup(group_idx)[:-1]  # this chunk's own entry is the leaf
+            ks.append(torch.cat([*(s.tensors["k"] for s in earlier), k_own], dim=0))
+            vs.append(torch.cat([*(s.tensors["v"] for s in earlier), v_own], dim=0))
+
+        device = query.device
+        cu_q = torch.tensor(cu, dtype=torch.int32, device=device)
+        cu_kv = torch.tensor([0, *itertools.accumulate(t.shape[0] for t in ks)], dtype=torch.int32, device=device)
+        scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1] ** -0.5
+        out, _lse = UnitCacheAttention.apply(query, True, scale, cu_q, cu_kv, *ks, *vs)
+        return out
 
     def _attend_one_sequence(self, q, k, v) -> torch.Tensor:
         """q/k/v: ``[T, H, D]`` for a single sequence. Returns ``[T, H, D]``."""
@@ -96,6 +152,9 @@ class ChunkedCoreAttention(nn.Module):
             key = key.repeat_interleave(repeat, dim=1)
             value = value.repeat_interleave(repeat, dim=1)
 
+        if packed_seq_params is not None and getattr(packed_seq_params, UNIT_ATTR, None) is not None:
+            return self._forward_unit(query, key, value, packed_seq_params).reshape(query.shape[0], -1)
+
         cu = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
         if cu is None:
             out = self._attend_one_sequence(query, key, value)
@@ -111,6 +170,22 @@ class ChunkedCoreAttention(nn.Module):
         return out.reshape(out.shape[0], -1)
 
 
+def _fold_leaf_grad_into(live: torch.Tensor, leaf: torch.Tensor) -> None:
+    """Add the leaf's accumulated gradient to ``live``'s on the way back.
+
+    ``live`` is detached into ``leaf`` for later chunks to read, so the
+    gradient they owe it never reaches ``live`` through the graph. By the time
+    ``live``'s own backward runs — the schedule descends — the leaf has every
+    later contribution, and this folds them in. One traversal, no second
+    backward.
+    """
+
+    def hook(grad: torch.Tensor) -> torch.Tensor:
+        return grad if leaf.grad is None else grad + leaf.grad
+
+    live.register_hook(hook)
+
+
 def _attention_modules(model):
     for module in model.modules():
         core = getattr(module, "core_attention", None)
@@ -121,8 +196,12 @@ def _attention_modules(model):
 def install(model, chunk_size: int) -> int:
     """Swap every ``core_attention`` for a chunked one.
 
-    Returns how many.
+    Also attaches the runtime the unit mode needs — the stores that outlive a
+    single forward call live there. Returns how many layers were swapped.
     """
+    from relax.backends.megatron.chunkflow.runtime import attach_runtime
+
+    runtime = attach_runtime(model, chunk_size)
     n = 0
     for attn in _attention_modules(model):
         if hasattr(attn, _ORIG_ATTR):
@@ -134,6 +213,7 @@ def install(model, chunk_size: int) -> int:
             layer_number=attn.layer_number,
             chunk_size=chunk_size,
             softmax_scale=getattr(original, "softmax_scale", None),
+            runtime=runtime,
         )
         n += 1
     logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
