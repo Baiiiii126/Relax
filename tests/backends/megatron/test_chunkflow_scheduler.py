@@ -24,12 +24,16 @@ import pytest
 
 try:
     from relax.backends.megatron.chunkflow.scheduler import (
+        STRATEGIES,
         Chunk,
         Segment,
         build_chunks,
         build_group_schedule,
         build_schedule,
+        classify_chunks,
+        gen_state_aware_1f1b_ops,
         group_of,
+        make_bwd_order,
         validate_backward_order,
         validate_completeness,
         validate_forward_order,
@@ -217,11 +221,12 @@ def test_validate_forward_order_catches_out_of_order_forward():
 def test_validate_backward_order_catches_ascending_drop_order_bug():
     """Reproduces chunkflow lesson 3 / demo1 scenario C: reading Algorithm 2's
     pseudocode literally (``if idx >= K: keep``, third loop ascending)
-    backward-orders the dropped chunks ascending instead of descending —
-    which is not just a different valid ordering, it silently drops
-    gradient contributions. Build that broken sequence by hand (the
-    scheduler itself never generates it) and confirm the validator flags
-    it.
+    backward-orders the dropped chunks ascending instead of descending — which
+    is not just a different valid ordering, it silently drops gradient
+    contributions.
+
+    Build that broken sequence by hand (the scheduler itself never generates
+    it) and confirm the validator flags it.
     """
     n, k = 5, 2
     group = _make_group(n)
@@ -253,3 +258,167 @@ def test_validate_completeness_catches_missing_and_double_backward():
 
     fp_only = [("Fp", 0), ("F", 1), ("B", 0), ("B", 1)]  # chunk 0 never got a graph-building forward
     assert any("without a prior graph-building forward" in p for p in validate_completeness(group, fp_only))
+
+
+# ---------------------------------------------------------------------------
+# 4. Multi-stage view: per-stage op sequences
+# ---------------------------------------------------------------------------
+
+
+def _mixed_batch():
+    """One long sequence (a 6-chunk dependency group) plus short sequences."""
+    return build_chunks([1024 * 6 + 7, 300, 400, 500], chunk_size=1024, repack_tail=False)
+
+
+def test_classify_keeps_last_k_of_each_group_and_all_standalone():
+    chunks = _mixed_batch()
+    keep, need_fr = classify_chunks(chunks, keep_last_k=2)
+
+    groups = group_of(chunks)
+    assert len(groups) == 1  # only the long sequence forms a dependency group
+    members = next(iter(groups.values()))
+    assert len(members) == 7
+
+    # The last K of the group keep; the rest are recomputed.
+    assert {c.chunk_id for c in members[-2:]} <= keep
+    assert {c.chunk_id for c in members[:-2]} == need_fr
+
+    # Standalone chunks always keep -- their N is 1, so K never drops them.
+    standalone = {c.chunk_id for c in chunks if not c.is_dependent}
+    assert standalone <= keep
+    assert not (standalone & need_fr)
+
+
+def test_classify_keeps_everything_when_k_covers_the_group():
+    chunks = _mixed_batch()
+    keep, need_fr = classify_chunks(chunks, keep_last_k=len(chunks))
+    assert need_fr == set()
+    assert keep == {c.chunk_id for c in chunks}
+
+
+def test_make_bwd_order_descends_within_a_group():
+    chunks = _mixed_batch()
+    fwd_order = [c.chunk_id for c in chunks]
+    bwd_order = make_bwd_order(chunks, fwd_order)
+
+    members = next(iter(group_of(chunks).values()))
+    group_ids = [c.chunk_id for c in members]
+    # Position of each group member in the backward order must be descending.
+    positions = [bwd_order.index(cid) for cid in group_ids]
+    assert positions == sorted(positions, reverse=True)
+
+    # ...and every member must backward after all of them have forwarded.
+    assert sorted(bwd_order) == sorted(fwd_order)
+
+
+def test_make_bwd_order_backwards_a_standalone_chunk_right_after_its_forward():
+    chunks = build_chunks([300] * 4, chunk_size=1024, repack_tail=False)
+    fwd_order = [c.chunk_id for c in chunks]
+    bwd_order = make_bwd_order(chunks, fwd_order)
+
+    assert all(not c.is_dependent for c in chunks)
+    # Nothing to accumulate across, so the backward order is the forward order.
+    assert bwd_order == fwd_order
+
+
+def test_make_bwd_order_validates_clean_when_nothing_is_recomputed():
+    """The K=N reading: forward ascending, backward from make_bwd_order."""
+    chunks = _mixed_batch()
+    fwd_order = [c.chunk_id for c in chunks]
+    bwd_order = make_bwd_order(chunks, fwd_order)
+    ops = [("F", cid) for cid in fwd_order] + [("B", cid) for cid in bwd_order]
+    assert validate_schedule(chunks, ops) == []
+
+
+@pytest.mark.parametrize("strategy", STRATEGIES)
+@pytest.mark.parametrize("pp", [1, 2, 4, 8])
+def test_every_stage_op_sequence_validates_clean(strategy, pp):
+    """Each stage's slice of the global plan must be a legal schedule.
+
+    ``gen_state_aware_1f1b_ops`` drops the ops belonging to other stages, so
+    for pp > 1 a single stage is a *partial* view: standalones from other
+    stages look missing. Completeness is therefore only asserted at pp=1; order
+    invariants must hold at every pp.
+    """
+    chunks = _mixed_batch()
+    for stage in range(pp):
+        ops = gen_state_aware_1f1b_ops(chunks, keep_last_k=2, pp=pp, stage=stage, strategy=strategy)
+        problems = validate_forward_order(chunks, ops) + validate_backward_order(chunks, ops)
+        assert problems == [], f"{strategy} pp={pp} stage={stage}: {problems}"
+
+        if pp == 1:
+            assert validate_schedule(chunks, ops) == []
+
+
+@pytest.mark.parametrize("strategy", STRATEGIES)
+def test_all_strategies_do_the_same_amount_of_forward_work(strategy):
+    """Strategies differ only in *where* Fr lands, never in how much is
+    computed."""
+    chunks = _mixed_batch()
+    _, need_fr = classify_chunks(chunks, keep_last_k=2)
+    ops = gen_state_aware_1f1b_ops(chunks, keep_last_k=2, pp=4, stage=0, strategy=strategy)
+    counts = {kind: sum(1 for k, _ in ops if k == kind) for kind in ("F", "Fp", "Fr", "B")}
+
+    # One backward per chunk, and one first-pass forward per chunk...
+    assert counts["B"] == len(chunks)
+    assert counts["F"] + counts["Fp"] == len(chunks)
+    # ...plus a second forward for every chunk that was dropped from the window.
+    assert counts["Fr"] == len(need_fr)
+
+    assert _strategy_work_counts(chunks, strategy) == counts
+
+
+def _strategy_work_counts(chunks, strategy) -> dict[str, int]:
+    ops = gen_state_aware_1f1b_ops(chunks, keep_last_k=2, pp=4, stage=0, strategy=strategy)
+    return {kind: sum(1 for k, _ in ops if k == kind) for kind in ("F", "Fp", "Fr", "B")}
+
+
+def test_strategies_agree_on_work_and_differ_only_in_fr_placement():
+    chunks = _mixed_batch()
+    counts = [_strategy_work_counts(chunks, s) for s in STRATEGIES]
+    assert counts[0] == counts[1] == counts[2]
+
+    # Fr placement is where they differ: eager pulls recomputes earlier in the
+    # sequence, local keeps them adjacent to their own backward.
+    placements = {}
+    for strategy in STRATEGIES:
+        ops = gen_state_aware_1f1b_ops(chunks, keep_last_k=2, pp=4, stage=0, strategy=strategy)
+        placements[strategy] = [i for i, (kind, _) in enumerate(ops) if kind == "Fr"]
+    assert placements["eager"] != placements["local"]
+
+
+def test_recompute_never_precedes_the_forward_that_produced_its_kv():
+    """An ``Fr`` needs the chunk's K/V, which only exists after its
+    ``Fp``/``F``."""
+    chunks = _mixed_batch()
+    ops = gen_state_aware_1f1b_ops(chunks, keep_last_k=1, pp=2, stage=0, strategy="local")
+
+    produced: set[int] = set()
+    for kind, cid in ops:
+        if kind in ("F", "Fp"):
+            produced.add(cid)
+        elif kind == "Fr":
+            assert cid in produced, f"Fr for chunk {cid} before its first forward"
+
+
+def test_each_stage_sees_the_same_chunks_in_the_same_forward_order():
+    """p2p alignment depends on this: every stage derives one global order."""
+    chunks = _mixed_batch()
+    per_stage = [
+        [
+            cid
+            for kind, cid in gen_state_aware_1f1b_ops(chunks, 2, pp=4, stage=s, strategy="local")
+            if kind in ("F", "Fp")
+        ]
+        for s in range(4)
+    ]
+    # Stage s does a suffix of the global forward order (it skips the warmup).
+    full = per_stage[0]
+    for order in per_stage[1:]:
+        assert order == full[len(full) - len(order) :]
+
+
+def test_unknown_strategy_is_rejected():
+    chunks = _mixed_batch()
+    with pytest.raises(ValueError, match="unknown strategy"):
+        gen_state_aware_1f1b_ops(chunks, keep_last_k=2, pp=2, stage=0, strategy="nope")

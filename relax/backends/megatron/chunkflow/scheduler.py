@@ -1,11 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""chunkflow scheduling: chunk construction and per-dependency-group op ordering.
+"""chunkflow scheduling: chunk construction, op ordering, and the multi-stage
+view.
 
 This module decides *what* needs to happen and in *what order* — it does not
-execute anything (see ``attention_ops.py`` / ``StateStore`` for that). It is
-the PP=1-view analogue of a real Megatron pipeline schedule: pipeline
-placement and pipelining interleave are a separate, later layer.
+execute anything (see ``attention_ops.py`` / ``StateStore`` for that).
 
 Two building blocks, both scoped to *one training step's* batch of sequences:
 
@@ -29,6 +28,14 @@ Two building blocks, both scoped to *one training step's* batch of sequences:
     ``validate_backward_order`` and the "ascending drop order" test in
     ``tests/backends/megatron/test_chunkflow_scheduler.py`` for the concrete
     failure this avoids.
+
+On top of those sits the multi-stage layer (``classify_chunks``,
+``make_bwd_order``, ``gen_state_aware_1f1b_ops``): given a pipeline size and a
+stage index it produces that one stage's op sequence, keeping the same global
+forward and backward orders on every stage so p2p send/recv pairs stay
+aligned. Everything it needs comes from the chunk list, and the chunk list
+comes from sequence lengths — which every PP stage has, so no stage needs the
+plan broadcast to it.
 
 Every generated schedule can (and, for anything driving real chunk_attention_*
 calls, should) be run through ``validate_schedule`` first: a violation means
@@ -73,9 +80,9 @@ class Chunk:
     """One pipeline unit: one or more ``Segment``s packed together.
 
     ``group`` is the id of the dependency group this chunk belongs to (the
-    originating long sequence's id), or ``None`` for a standalone chunk with
-    no ordering constraint. ``group_idx`` is this chunk's 0-based position
-    within the group, ascending.
+    originating long sequence's id), or ``None`` for a standalone chunk with no
+    ordering constraint. ``group_idx`` is this chunk's 0-based position within
+    the group, ascending.
     """
 
     chunk_id: int
@@ -101,10 +108,10 @@ class Chunk:
 def _bin_pack_min_bins(lengths: list[int], cap: int) -> list[list[int]]:
     """Pack ``lengths`` into as few bins of capacity ``cap`` as possible.
 
-    Starts from the theoretical lower bound (``ceil(sum/cap)``) and tries
-    best-fit-decreasing at each bin count until one succeeds, so short
-    sequences that need no ordering constraint at all don't waste pipeline
-    units one-per-chunk.
+    Starts from the theoretical lower bound (``ceil(sum/cap)``) and tries best-
+    fit-decreasing at each bin count until one succeeds, so short sequences
+    that need no ordering constraint at all don't waste pipeline units one-per-
+    chunk.
     """
     if not lengths:
         return []
@@ -265,7 +272,8 @@ def build_chunks(
 
 
 def group_of(chunks: Sequence[Chunk]) -> dict[int, list[Chunk]]:
-    """Gather dependent chunks by group id, each group sorted ascending by ``group_idx``."""
+    """Gather dependent chunks by group id, each group sorted ascending by
+    ``group_idx``."""
     groups: dict[int, list[Chunk]] = {}
     for c in chunks:
         if c.is_dependent:
@@ -281,7 +289,8 @@ def group_of(chunks: Sequence[Chunk]) -> dict[int, list[Chunk]]:
 
 
 def build_group_schedule(group: Sequence[Chunk], keep_last_k: int) -> list[Op]:
-    """Ascending-forward / descending-backward op sequence for one dependency group.
+    """Ascending-forward / descending-backward op sequence for one dependency
+    group.
 
     If the group has at most ``keep_last_k`` chunks, every chunk simply
     keeps its activation from the first forward (no recompute needed).
@@ -312,7 +321,8 @@ def build_group_schedule(group: Sequence[Chunk], keep_last_k: int) -> list[Op]:
 
 
 def build_schedule(chunks: Sequence[Chunk], keep_last_k: int) -> list[Op]:
-    """Combine standalone chunks and every dependency group's schedule into one PP=1-view op sequence."""
+    """Combine standalone chunks and every dependency group's schedule into one
+    PP=1-view op sequence."""
     ops: list[Op] = []
     for c in chunks:
         if not c.is_dependent:
@@ -329,7 +339,8 @@ def build_schedule(chunks: Sequence[Chunk], keep_last_k: int) -> list[Op]:
 
 
 def validate_forward_order(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[str]:
-    """Every dependent chunk's forward must come after all lower-``group_idx`` chunks in its group."""
+    """Every dependent chunk's forward must come after all lower-``group_idx``
+    chunks in its group."""
     by_id = {c.chunk_id: c for c in chunks}
     seen_fwd: set[int] = set()
     problems: list[str] = []
@@ -349,11 +360,12 @@ def validate_forward_order(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[s
 
 
 def validate_backward_order(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[str]:
-    """Every dependent chunk's backward must come after all higher-``group_idx`` chunks in its group.
+    """Every dependent chunk's backward must come after all
+    higher-``group_idx`` chunks in its group.
 
     A violation means dK/dV accumulation for the lower chunk is incomplete
-    (some later query chunk's contribution hasn't landed yet) — a silent
-    wrong-gradient bug, not a crash.
+    (some later query chunk's contribution hasn't landed yet) — a silent wrong-
+    gradient bug, not a crash.
     """
     by_id = {c.chunk_id: c for c in chunks}
     done_bwd: set[int] = set()
@@ -374,7 +386,8 @@ def validate_backward_order(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[
 
 
 def validate_completeness(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[str]:
-    """Every chunk must backward exactly once, and only after a graph-building forward (F or Fr, not just Fp)."""
+    """Every chunk must backward exactly once, and only after a graph-building
+    forward (F or Fr, not just Fp)."""
     problems: list[str] = []
     graph_fwd: set[int] = set()
     bwd_count: dict[int, int] = {}
@@ -395,7 +408,153 @@ def validate_completeness(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[st
 
 
 def validate_schedule(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[str]:
-    """Run all three checks; empty return means the schedule is safe to execute."""
+    """Run all three checks; empty return means the schedule is safe to
+    execute."""
     return (
         validate_forward_order(chunks, ops) + validate_backward_order(chunks, ops) + validate_completeness(chunks, ops)
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-stage view: how one stage's op sequence is laid out across a pipeline
+# ---------------------------------------------------------------------------
+#
+# Everything above is the single-GPU (PP=1) view. The functions below answer
+# "which ops does *this* stage execute, in what order" for a real pipeline —
+# the layer the module docstring calls "a separate, later layer".
+#
+# They are pure functions of the chunk list, and the chunk list is built from
+# sequence lengths, which every PP stage receives. That is what makes the
+# schedule derivable independently on each stage: the p2p send/recv pairs stay
+# aligned without anyone broadcasting the plan.
+#
+# Strategies control where a recompute op (``Fr``) lands, mirroring the paper's
+# Figure 6 discussion:
+#
+#   eager — Fr issued early (``fr_lead = 2*(pp - 1 - stage)``); crosses stage
+#           boundaries, so it overlaps.
+#   lazy  — Fr right before its own B but still waiting on the previous stage's
+#           Fr; serialises badly across stages.
+#   local — Fr right before its own B, recomputed from this stage's own Fp
+#           only; keeps eager's speed and lazy's activation peak.
+
+STRATEGIES = ("eager", "lazy", "local")
+
+
+def classify_chunks(chunks: Sequence[Chunk], keep_last_k: int) -> tuple[set[int], set[int]]:
+    """Split chunks into those that keep their first-pass activation and those
+    that must be recomputed (``Fr``) before their own backward.
+
+    Per Algorithm 2's paper-prose semantics: the *last* ``K`` chunks of each
+    dependency group keep; standalone chunks always keep (their N is 1).
+    """
+    keep: set[int] = set()
+    need_fr: set[int] = set()
+    for _, members in sorted(group_of(chunks).items()):
+        n = len(members)
+        if n <= keep_last_k:
+            keep.update(c.chunk_id for c in members)
+        else:
+            keep.update(c.chunk_id for c in members[n - keep_last_k :])
+            need_fr.update(c.chunk_id for c in members[: n - keep_last_k])
+    for c in chunks:
+        if not c.is_dependent:
+            keep.add(c.chunk_id)
+    return keep, need_fr
+
+
+def make_bwd_order(chunks: Sequence[Chunk], fwd_order: Sequence[int]) -> list[int]:
+    """Global backward order for a given forward order.
+
+    A standalone chunk backwards immediately after its own forward. A
+    dependency group backwards (descending) only once every member has appeared
+    in ``fwd_order`` — that is the condition for the group's dK/dV accumulation
+    to be complete when its lowest chunk runs (see
+    ``validate_backward_order``).
+    """
+    by_id = {c.chunk_id: c for c in chunks}
+    groups = {g: [c.chunk_id for c in members] for g, members in group_of(chunks).items()}
+    seen: set[int] = set()
+    out: list[int] = []
+    for cid in fwd_order:
+        seen.add(cid)
+        c = by_id[cid]
+        if not c.is_dependent:
+            out.append(cid)
+            continue
+        members = groups[c.group]
+        if all(m in seen for m in members):
+            out.extend(reversed(members))
+    return out
+
+
+def gen_state_aware_1f1b_ops(
+    chunks: Sequence[Chunk],
+    keep_last_k: int,
+    pp: int,
+    stage: int,
+    strategy: str = "local",
+    fr_lead: int | None = None,
+    bwd_lag: int | None = None,
+) -> list[Op]:
+    """The op sequence *one stage* executes, in order.
+
+    Four steps: classify chunks into keep (``F``) vs drop (``Fp``); build the
+    global backward order; run the standard 1F1B warmup/steady interleave over
+    it; splice an ``Fr`` in ``fr_lead`` ops ahead of each ``B`` that needs one.
+
+    Every stage must call this with the same ``chunks``/``keep_last_k``/``pp``
+    and with its own ``stage`` — that is what keeps p2p pairs aligned.
+    """
+    if strategy not in STRATEGIES:
+        raise ValueError(f"unknown strategy: {strategy!r}")
+    keep, need_fr = classify_chunks(chunks, keep_last_k)
+    fwd_order = [c.chunk_id for c in chunks]
+    bwd_order = make_bwd_order(chunks, fwd_order)
+
+    if fr_lead is None:
+        fr_lead = 2 * max(0, pp - stage - 1) if strategy == "eager" else 0
+
+    m, nb = len(fwd_order), len(bwd_order)
+    base: list[Op] = []
+    fi = bi = 0
+    fpos: dict[int, int] = {}
+    need = max(1, bwd_lag) if bwd_lag else 1
+
+    def emit_fwd() -> None:
+        nonlocal fi
+        u = fwd_order[fi]
+        fpos[u] = len(base)
+        base.append(("F" if u in keep else "Fp", u))
+        fi += 1
+
+    for _ in range(min(max(0, pp - stage - 1), m)):
+        emit_fwd()
+    while fi < m or bi < nb:
+        if fi < m:
+            emit_fwd()
+        if bi >= nb:
+            continue
+        ub = bwd_order[bi]
+        if ub in fpos and (len(base) - fpos[ub] >= need or fi >= m):
+            base.append(("B", ub))
+            bi += 1
+        elif fi >= m and ub not in fpos:
+            break  # bwd_order isn't a permutation of fwd_order -- caller bug
+
+    if not need_fr:
+        return base
+
+    out: list[Op] = []
+    emitted: set[int] = set()
+    fp_seen: set[int] = set()  # Fr(u) must come after Fp(u) -- no K/V to reuse otherwise
+    for i, op in enumerate(base):
+        for j in range(i, min(len(base), i + fr_lead + 1)):
+            kj, uj = base[j]
+            if kj == "B" and uj in need_fr and uj not in emitted and uj in fp_seen:
+                out.append(("Fr", uj))
+                emitted.add(uj)
+        out.append(op)
+        if op[0] == "Fp":
+            fp_seen.add(op[1])
+    return out
