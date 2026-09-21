@@ -9,18 +9,22 @@
 # loss curves should overlay to within bf16 noise. Any real divergence is
 # chunkflow's doing.
 #
-#   CHUNK_SIZE=0   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # baseline
-#   CHUNK_SIZE=512 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # chunkflow
+#   CHUNK_SIZE=0    bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # baseline
+#   CHUNK_SIZE=1024 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # chunkflow
 #
-# CHUNK_SIZE defaults to 512 -- NOT 2048 -- and that matters. chunkflow splits
+# CHUNK_SIZE defaults to 1024 -- NOT 2048 -- and that matters. chunkflow splits
 # per sequence, so a chunk size above a sample's length leaves it as a single
 # chunk, making chunked attention a no-op: the curves would match trivially and
-# prove nothing. The default dataset is the 2048-token long-sequence build
-# (scripts/training/sft/tools/build_long_sft_data.py), so 512 cuts every sample
-# into ~4 chunks and a larger size still leaves 2+.
+# prove nothing. OpenMathReasoning's CoT solutions run to thousands of tokens,
+# so 1024 cuts every sample into several chunks. If you point PROMPT_DATA at
+# short data instead (plain GSM8K is ~195 tokens/sample), drop the chunk size to
+# ~128 for the same reason.
 #
-# Point PROMPT_DATA at plain GSM8K (~195 tokens/sample) and the chunk size has
-# to come down to ~128 for the same reason.
+# One shard of OpenMathReasoning is enough (~22k samples); grab
+#   data/cot-00000-of-00144.parquet
+# from https://huggingface.co/datasets/nvidia/OpenMathReasoning and put it at
+# $DATA_DIR/sft/data/OpenMathReasoning-mini/data/cot-00000-of-00001.parquet
+# (the path the repo's other SFT scripts already expect).
 
 set -ex
 set -o pipefail
@@ -39,10 +43,10 @@ PROJECT_NAME="${PROJECT_NAME:=Relax/dev/chunkflow-sft}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-NUM_EPOCH="${NUM_EPOCH:=3}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=50}"
 
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
-CHUNK_SIZE="${CHUNK_SIZE:=512}"
+CHUNK_SIZE="${CHUNK_SIZE:=1024}"
 if [ "${CHUNK_SIZE}" -gt 0 ]; then
    CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE})
    ARM="chunk${CHUNK_SIZE}"
@@ -60,9 +64,10 @@ if [ ! -e "${MODEL_DIR}/Qwen3-4B" ]; then
    echo "  export DATA_DIR=/mnt/tidal-nj01/usr/yuzhe1/baihaonan/data" >&2
    exit 1
 fi
-PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/gsm8k-long/train.parquet}"
+PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/sft/data/OpenMathReasoning-mini/data/cot-00000-of-00001.parquet}"
 if [ ! -e "${PROMPT_DATA}" ]; then
    echo "ERROR: ${PROMPT_DATA} does not exist." >&2
+   echo "Download one shard of nvidia/OpenMathReasoning (cot split) there, or set PROMPT_DATA." >&2
    exit 1
 fi
 
@@ -71,17 +76,21 @@ CKPT_ARGS=(
    --ref-load ${MODEL_DIR}/Qwen3-4B/
    --megatron-to-hf-mode bridge
    # No --save: this run only produces curves.
-   --num-epoch ${NUM_EPOCH}
+   --num-epoch 1
 )
 
+# --rollout-batch-size defaults to global_batch_size // n_samples_per_prompt
+# (= 256 here), which makes args.train_iters == num_rollout, so NUM_ROLLOUT is
+# exactly the optimizer-step count.
 SFT_ARGS=(
    --loss-type sft
    --prompt-data "${PROMPT_DATA}"
-   --input-key question
-   --label-key answer
-   --global-batch-size 32
+   --input-key problem
+   --label-key generated_solution
+   --global-batch-size 256
+   --num-rollout ${NUM_ROLLOUT}
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 20480
    --sft-oversize-strategy skip
    --balance-data
 )
