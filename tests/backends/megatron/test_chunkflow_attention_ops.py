@@ -289,3 +289,124 @@ def test_flash_backend_is_at_least_as_accurate_as_the_reference():
             f"{name}: flash rel-err {err_flash:.2e} vs reference {err_manual:.2e} -- "
             "the flash path is materially less accurate than the fallback."
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. Unit-level batched call: one pass over several sequences with own K/V each
+# ---------------------------------------------------------------------------
+
+
+def _offset_causal_mask(ql, kl):
+    """Bottom-right aligned causal mask.
+
+    SDPA's is_causal is upper-left when ql != kl, which is not chunkflow's
+    q-short-kv-long convention.
+    """
+    qpos = torch.arange(ql).unsqueeze(1) + (kl - ql)
+    kpos = torch.arange(kl).unsqueeze(0)
+    return (kpos <= qpos).unsqueeze(0).unsqueeze(0)
+
+
+def _unit_attention_raw(q, k, v, cu_q, cu_kv, causal=True):
+    from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
+
+    parts = [k[s:e] for s, e in zip(cu_kv[:-1], cu_kv[1:])]
+    vparts = [v[s:e] for s, e in zip(cu_kv[:-1], cu_kv[1:])]
+    scale = q.shape[-1] ** -0.5
+    return UnitCacheAttention.apply(q, causal, scale, cu_q, cu_kv, *parts, *vparts)
+
+
+def _unit_attention(q, k, v, cu_q, cu_kv, causal=True):
+    return _unit_attention_raw(q, k, v, cu_q, cu_kv, causal)[0]
+
+
+def test_unit_attention_matches_per_sequence_sdpa():
+    """Several sequences in one call, each with its own K/V length.
+
+    That is the whole point of the unit op: a chunk with a prefix has a longer
+    K/V than query, and different sequences have different prefixes.
+    """
+    torch.manual_seed(0)
+    total_q, h, d = 20, 2, 8
+    # Two sequences: q lengths 10 and 10; k/v lengths 30 and 14 (prefixes 20, 4).
+    cu_q = torch.tensor([0, 10, 20], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 30, 44], dtype=torch.int32)
+
+    q = torch.randn(total_q, h, d)
+    k = torch.randn(int(cu_kv[-1]), h, d)
+    v = torch.randn(int(cu_kv[-1]), h, d)
+
+    got = _unit_attention(q, k, v, cu_q, cu_kv)
+
+    want = []
+    for ql, kl, qo in ((10, 30, 0), (10, 14, 10)):
+        ko = 0 if qo == 0 else 30
+        want.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                q[qo : qo + ql].permute(1, 0, 2).unsqueeze(0),
+                k[ko : ko + kl].permute(1, 0, 2).unsqueeze(0),
+                v[ko : ko + kl].permute(1, 0, 2).unsqueeze(0),
+                attn_mask=_offset_causal_mask(ql, kl),
+                scale=d**-0.5,
+            )
+            .squeeze(0)
+            .permute(1, 0, 2)
+        )
+    torch.testing.assert_close(got, torch.cat(want), atol=1e-5, rtol=1e-5)
+
+
+def test_unit_attention_backward_matches_per_sequence_sdpa():
+    torch.manual_seed(0)
+    h, d = 2, 8
+    cu_q = torch.tensor([0, 10, 20], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 30, 44], dtype=torch.int32)
+
+    q0 = torch.randn(20, h, d, dtype=torch.float64)
+    k0 = torch.randn(44, h, d, dtype=torch.float64)
+    v0 = torch.randn(44, h, d, dtype=torch.float64)
+    dout = torch.randn(20, h, d, dtype=torch.float64)
+
+    q_, k_, v_ = (t.clone().requires_grad_(True) for t in (q0, k0, v0))
+    _unit_attention(q_, k_, v_, cu_q, cu_kv).backward(dout)
+
+    qr, kr, vr = (t.clone().requires_grad_(True) for t in (q0, k0, v0))
+    outs = []
+    for ql, kl, qo, ko in ((10, 30, 0, 0), (10, 14, 10, 30)):
+        o = torch.nn.functional.scaled_dot_product_attention(
+            qr[qo : qo + ql].permute(1, 0, 2).unsqueeze(0),
+            kr[ko : ko + kl].permute(1, 0, 2).unsqueeze(0),
+            vr[ko : ko + kl].permute(1, 0, 2).unsqueeze(0),
+            attn_mask=_offset_causal_mask(ql, kl),
+            scale=d**-0.5,
+        )
+        outs.append(o.squeeze(0).permute(1, 0, 2))
+    torch.cat(outs).backward(dout)
+
+    torch.testing.assert_close(q_.grad, qr.grad, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(k_.grad, kr.grad, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(v_.grad, vr.grad, atol=1e-9, rtol=1e-9)
+
+
+def test_unit_attention_gradients_do_not_leak_across_sequences():
+    """Gradient on one sequence's K/V must come only from that sequence's own
+    queries -- the property that makes packing several sequences into one call
+    equivalent to running them separately."""
+    torch.manual_seed(0)
+    h, d = 2, 8
+    cu_q = torch.tensor([0, 8, 16], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 16, 24], dtype=torch.int32)  # seq 0 kv 0..16, seq 1 kv 16..24
+
+    q = torch.randn(16, h, d, dtype=torch.float64, requires_grad=True)
+    k = torch.randn(24, h, d, dtype=torch.float64, requires_grad=True)
+    v = torch.randn(24, h, d, dtype=torch.float64, requires_grad=True)
+
+    # Silence sequence 1's queries entirely; only sequence 0 should move.
+    dout = torch.ones_like(q)
+    dout[8:16] = 0
+    out, _lse = _unit_attention_raw(q, k, v, cu_q, cu_kv)
+    out.backward(dout)
+
+    assert k.grad[16:24].abs().sum() == 0, "sequence 1's K/V moved without its queries"
+    assert v.grad[16:24].abs().sum() == 0
+    assert k.grad[:16].abs().sum() > 0, "sequence 0's K/V should still get gradient"
+    assert q.grad[8:16].abs().sum() == 0, "silenced queries must not move"

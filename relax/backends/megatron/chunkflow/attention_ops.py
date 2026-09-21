@@ -305,3 +305,146 @@ def chunk_attention_backward(chunk_id: int, out: torch.Tensor, dout: torch.Tenso
     """
     out.backward(dout)
     store.free(chunk_id)
+
+
+def _split_sizes_by_cu(cu: torch.Tensor) -> list[int]:
+    return [int(cu[i + 1] - cu[i]) for i in range(cu.numel() - 1)]
+
+
+class UnitCacheAttention(torch.autograd.Function):
+    """One varlen call for a whole execution unit.
+
+    A unit packs several sequences, each attending over its own K/V: its
+    group's prefix plus its own chunk. ``cu_seqlens_q`` gives the query lengths
+    and ``cu_seqlens_kv`` the K/V lengths -- the two differ for any chunk with
+    a prefix, which is what lets one call serve them all instead of one call
+    per chunk. Call count, not FLOPs, dominates chunked attention's cost.
+    """
+
+    @staticmethod
+    def forward(ctx, q, causal, softmax_scale, cu_q, cu_kv, *kv):
+        n = len(kv) // 2
+        k_all = torch.cat(kv[:n], dim=0)
+        v_all = torch.cat(kv[n:], dim=0)
+        flash = _use_flash(q)
+        if flash:
+            out, lse = _flash_varlen(q, k_all, v_all, cu_q, cu_kv, causal, softmax_scale)
+        else:
+            out, lse = _manual_varlen_forward(q, k_all, v_all, cu_q, cu_kv, causal, softmax_scale)
+
+        ctx.save_for_backward(q, lse, cu_q, cu_kv, *((out,) if flash else ()), *kv)
+        ctx.causal = causal
+        ctx.softmax_scale = softmax_scale
+        ctx.flash = flash
+        ctx.n = n
+        ctx.kv_lengths = [k.shape[0] for k in kv[:n]]
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, _dlse):
+        saved = list(ctx.saved_tensors)
+        q, lse, cu_q, cu_kv = saved[:4]
+        rest = saved[4:]
+        out = rest.pop(0) if ctx.flash else None
+        n = ctx.n
+        k_all = torch.cat(rest[:n], dim=0)
+        v_all = torch.cat(rest[n:], dim=0)
+        if ctx.flash:
+            dq, dk_all, dv_all = _flash_varlen_backward(
+                dout.contiguous(), q, k_all, v_all, out, lse, cu_q, cu_kv, ctx.causal, ctx.softmax_scale
+            )
+        else:
+            dq, dk_all, dv_all = _manual_varlen_backward(
+                dout, q, k_all, v_all, lse, cu_q, cu_kv, ctx.causal, ctx.softmax_scale
+            )
+        dks = torch.split(dk_all, ctx.kv_lengths, dim=0)
+        dvs = torch.split(dv_all, ctx.kv_lengths, dim=0)
+        return (dq, None, None, None, None, *dks, *dvs)
+
+
+def _manual_varlen_forward(q, k, v, cu_q, cu_kv, causal, softmax_scale):
+    """Per-sequence causal attention over a shared packed K/V, one pass."""
+    outs, lses = [], []
+    qs = _split_sizes_by_cu(cu_q)
+    ks = _split_sizes_by_cu(cu_kv)
+    qo = ko = 0
+    for ql, kl in zip(qs, ks):
+        out, lse = _manual_attn_forward(
+            q[qo : qo + ql], k[ko : ko + kl], v[ko : ko + kl], causal=causal, softmax_scale=softmax_scale
+        )
+        outs.append(out)
+        lses.append(lse)
+        qo += ql
+        ko += kl
+    return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
+
+
+def _manual_varlen_backward(dout, q, k, v, lse, cu_q, cu_kv, causal, softmax_scale):
+    qs = _split_sizes_by_cu(cu_q)
+    ks = _split_sizes_by_cu(cu_kv)
+    dqs, dks, dvs = [], [], []
+    qo = ko = lo = do = 0
+    for ql, kl in zip(qs, ks):
+        dq, dk, dv = _manual_attn_backward(
+            dout[do : do + ql],
+            q[qo : qo + ql],
+            k[ko : ko + kl],
+            v[ko : ko + kl],
+            lse[lo : lo + ql],
+            causal=causal,
+            softmax_scale=softmax_scale,
+        )
+        dqs.append(dq)
+        dks.append(dk)
+        dvs.append(dv)
+        qo += ql
+        ko += kl
+        lo += ql
+        do += ql
+    return torch.cat(dqs, dim=0), torch.cat(dks, dim=0), torch.cat(dvs, dim=0)
+
+
+def _flash_varlen(q, k, v, cu_q, cu_kv, causal, softmax_scale):
+    fwd, _bwd = _flash_varlen_ops()
+    out, lse, _s, _rng = fwd(
+        q,
+        k,
+        v,
+        cu_q.to(torch.int32),
+        cu_kv.to(torch.int32),
+        int(cu_q[-1]),
+        int(cu_kv[-1]),
+        0.0,
+        softmax_scale,
+        causal,
+    )[:4]
+    return out, lse
+
+
+def _flash_varlen_backward(dout, q, k, v, out, lse, cu_q, cu_kv, causal, softmax_scale):
+    _fwd, bwd = _flash_varlen_ops()
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        dq,
+        dk,
+        dv,
+        cu_q.to(torch.int32),
+        cu_kv.to(torch.int32),
+        int(cu_q[-1]),
+        int(cu_kv[-1]),
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0.0,
+        None,
+        False,
+    )
+    return dq, dk, dv
