@@ -168,6 +168,43 @@ def main() -> None:
     print(f"  calls: {len(lengths)} vs 1 fused -- pure launch/occupancy cost")
     print(f"  per call: {1000 * t_per_seq / len(lengths):.1f} us")
 
+    # Does the length distribution decide the outcome? Cost per call is roughly
+    # fixed, so what matters is CALLS PER TOKEN -- i.e. how many sequences the
+    # same token budget is chopped into, and how many chunks each one needs.
+    print("\ndata-mix sensitivity (chunk_size=512, normalised per 1M tokens):")
+    mixes = {
+        "all short (308)": [308],
+        "all long (2764)": [2764],
+        # The actual A/B dataset histogram, scaled down.
+        "A/B mix (as run)": [l for l, c in LENGTH_BUCKETS for _ in range(max(1, c // 8))],
+        "long-heavy 50/50": [2764] * 5 + [308] * 5,
+    }
+    print(f"{'mix':<20}{'seqs':>7}{'tokens':>10}{'calls':>8}{'base ms/M':>12}{'chunk ms/M':>13}{'overhead':>11}")
+    for name, pool in mixes.items():
+        rep = max(1, 500_000 // sum(pool))
+        lens = pool * rep
+        total_i = sum(lens)
+        bounds_i = [0]
+        for n in lens:
+            bounds_i.append(bounds_i[-1] + n)
+        gen = torch.Generator(device=DEVICE).manual_seed(0)
+        qi = torch.randn(total_i, HEADS, HEAD_DIM, generator=gen, device=DEVICE, dtype=DTYPE)
+        ki = torch.randn(total_i, KV_HEADS, HEAD_DIM, generator=gen, device=DEVICE, dtype=DTYPE)
+        vi = torch.randn(total_i, KV_HEADS, HEAD_DIM, generator=gen, device=DEVICE, dtype=DTYPE)
+        cui = torch.tensor(bounds_i, device=DEVICE, dtype=torch.int32)
+        maxi = max(lens)
+        packed_i = SimpleNamespace(cu_seqlens_q=cui)
+        ai = ChunkedCoreAttention(config=SimpleNamespace(context_parallel_size=1), layer_number=1, chunk_size=512)
+        n_calls = sum((n + 511) // 512 for n in lens)
+        tb = timeit(lambda: flash_attn_varlen_func(qi, ki, vi, cui, cui, maxi, maxi, causal=True), warmup=2, iters=5)
+        tc = timeit(lambda: ai(qi, ki, vi, packed_seq_params=packed_i), warmup=2, iters=5)
+        scale = 1e6 / total_i
+        print(
+            f"{name:<20}{len(lens):>7}{total_i:>10}{n_calls:>8}"
+            f"{tb * scale:>12.2f}{tc * scale:>13.2f}{tc / tb:>10.2f}x"
+        )
+        del qi, ki, vi
+
 
 if __name__ == "__main__":
     main()
