@@ -53,6 +53,24 @@ else
    ARM="baseline"
 fi
 
+# ── ClearML ──────────────────────────────────────────────────────────────────
+# QS pods are ephemeral: /root is wiped every time a trial is recreated, so a
+# conf installed by hand on one pod is gone on the next. Keep the authoritative
+# copy on the shared mount (which survives) and install it here when missing --
+# otherwise MetricsService only logs "Failed to initialize ClearML adapter" and
+# the whole run finishes having uploaded nothing.
+CLEARML_CONF_SHARED="${CLEARML_CONF_SHARED:-${DATA_DIR}/../clearml.conf}"
+if [ ! -f "${HOME}/clearml.conf" ] && [ -f "${CLEARML_CONF_SHARED}" ]; then
+   install -m 600 "${CLEARML_CONF_SHARED}" "${HOME}/clearml.conf"
+   echo "ClearML: installed config from ${CLEARML_CONF_SHARED}"
+fi
+if [ ! -f "${HOME}/clearml.conf" ] && [ -z "${CLEARML_API_HOST:-}" ]; then
+   echo "ERROR: ClearML is not configured on this machine, so --use-clearml would" >&2
+   echo "upload nothing. Put a conf at \${HOME}/clearml.conf, or at" >&2
+   echo "${CLEARML_CONF_SHARED} for this script to install automatically." >&2
+   exit 1
+fi
+
 # Fail here rather than deep inside transformers: a non-existent --hf-checkpoint
 # reaches ``cached_file`` as-is, which then treats the path as a Hub repo id and
 # dies with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'".
