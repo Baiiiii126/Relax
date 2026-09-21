@@ -488,6 +488,74 @@ def make_bwd_order(chunks: Sequence[Chunk], fwd_order: Sequence[int]) -> list[in
     return out
 
 
+def interleave_1f1b(
+    fwd_order: Sequence[int],
+    bwd_order: Sequence[int],
+    keep: set[int],
+    pp: int,
+    stage: int,
+    bwd_lag: int | None = None,
+) -> list[Op]:
+    """Standard 1F1B warmup/steady interleave of two global orders.
+
+    Shared by the chunk-level and unit-level schedules rather than written
+    twice: the interleave does not care what the ids name, only that both
+    orders are global (every stage derives the same ones) and that
+    ``bwd_order`` is a permutation of ``fwd_order``.
+    """
+    m, nb = len(fwd_order), len(bwd_order)
+    base: list[Op] = []
+    fi = bi = 0
+    fpos: dict[int, int] = {}
+    need = max(1, bwd_lag) if bwd_lag else 1
+
+    def emit_fwd() -> None:
+        nonlocal fi
+        u = fwd_order[fi]
+        fpos[u] = len(base)
+        base.append(("F" if u in keep else "Fp", u))
+        fi += 1
+
+    for _ in range(min(max(0, pp - stage - 1), m)):
+        emit_fwd()
+    while fi < m or bi < nb:
+        if fi < m:
+            emit_fwd()
+        if bi >= nb:
+            continue
+        ub = bwd_order[bi]
+        if ub in fpos and (len(base) - fpos[ub] >= need or fi >= m):
+            base.append(("B", ub))
+            bi += 1
+        elif fi >= m and ub not in fpos:
+            break  # bwd_order isn't a permutation of fwd_order -- caller bug
+    return base
+
+
+def splice_recomputes(base: Sequence[Op], need_fr: set[int], fr_lead: int) -> list[Op]:
+    """Insert an ``Fr`` for each dropped id, ``fr_lead`` ops ahead of its ``B``.
+
+    ``fr_lead`` is how far ahead of the backward the recompute is issued — 0
+    for the local/lazy strategies (immediately before), larger for eager (so
+    it can overlap across a stage boundary). A recompute is only ever emitted
+    after the forward that produced this id's K/V; without that there would be
+    nothing to reuse and the recompute would be a wasted extra forward.
+    """
+    out: list[Op] = []
+    emitted: set[int] = set()
+    fp_seen: set[int] = set()
+    for i, op in enumerate(base):
+        for j in range(i, min(len(base), i + fr_lead + 1)):
+            kj, uj = base[j]
+            if kj == "B" and uj in need_fr and uj not in emitted and uj in fp_seen:
+                out.append(("Fr", uj))
+                emitted.add(uj)
+        out.append(op)
+        if op[0] == "Fp":
+            fp_seen.add(op[1])
+    return out
+
+
 def gen_state_aware_1f1b_ops(
     chunks: Sequence[Chunk],
     keep_last_k: int,
@@ -515,46 +583,7 @@ def gen_state_aware_1f1b_ops(
     if fr_lead is None:
         fr_lead = 2 * max(0, pp - stage - 1) if strategy == "eager" else 0
 
-    m, nb = len(fwd_order), len(bwd_order)
-    base: list[Op] = []
-    fi = bi = 0
-    fpos: dict[int, int] = {}
-    need = max(1, bwd_lag) if bwd_lag else 1
-
-    def emit_fwd() -> None:
-        nonlocal fi
-        u = fwd_order[fi]
-        fpos[u] = len(base)
-        base.append(("F" if u in keep else "Fp", u))
-        fi += 1
-
-    for _ in range(min(max(0, pp - stage - 1), m)):
-        emit_fwd()
-    while fi < m or bi < nb:
-        if fi < m:
-            emit_fwd()
-        if bi >= nb:
-            continue
-        ub = bwd_order[bi]
-        if ub in fpos and (len(base) - fpos[ub] >= need or fi >= m):
-            base.append(("B", ub))
-            bi += 1
-        elif fi >= m and ub not in fpos:
-            break  # bwd_order isn't a permutation of fwd_order -- caller bug
-
+    base = interleave_1f1b(fwd_order, bwd_order, keep, pp, stage, bwd_lag)
     if not need_fr:
         return base
-
-    out: list[Op] = []
-    emitted: set[int] = set()
-    fp_seen: set[int] = set()  # Fr(u) must come after Fp(u) -- no K/V to reuse otherwise
-    for i, op in enumerate(base):
-        for j in range(i, min(len(base), i + fr_lead + 1)):
-            kj, uj = base[j]
-            if kj == "B" and uj in need_fr and uj not in emitted and uj in fp_seen:
-                out.append(("Fr", uj))
-                emitted.add(uj)
-        out.append(op)
-        if op[0] == "Fp":
-            fp_seen.add(op[1])
-    return out
+    return splice_recomputes(base, need_fr, fr_lead)
