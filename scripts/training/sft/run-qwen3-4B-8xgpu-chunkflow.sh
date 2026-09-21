@@ -10,14 +10,17 @@
 # chunkflow's doing.
 #
 #   CHUNK_SIZE=0   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # baseline
-#   CHUNK_SIZE=128 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # chunkflow
+#   CHUNK_SIZE=512 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # chunkflow
 #
-# CHUNK_SIZE defaults to 128 -- NOT 2048 -- and that matters. These samples are
-# only ~195 tokens long on average (max 544), and chunkflow splits per sequence.
-# A chunk size above the sequence length leaves every sample as a single chunk,
-# which makes chunked attention a no-op: the curves would match trivially and
-# prove nothing. 128 reliably cuts each sample into 2+ chunks, so the chunk
-# boundary path is actually exercised.
+# CHUNK_SIZE defaults to 512 -- NOT 2048 -- and that matters. chunkflow splits
+# per sequence, so a chunk size above a sample's length leaves it as a single
+# chunk, making chunked attention a no-op: the curves would match trivially and
+# prove nothing. The default dataset is the 2048-token long-sequence build
+# (scripts/training/sft/tools/build_long_sft_data.py), so 512 cuts every sample
+# into ~4 chunks and a larger size still leaves 2+.
+#
+# Point PROMPT_DATA at plain GSM8K (~195 tokens/sample) and the chunk size has
+# to come down to ~128 for the same reason.
 
 set -ex
 set -o pipefail
@@ -36,10 +39,10 @@ PROJECT_NAME="${PROJECT_NAME:=Relax/dev/chunkflow-sft}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-NUM_EPOCH="${NUM_EPOCH:=1}"
+NUM_EPOCH="${NUM_EPOCH:=3}"
 
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
-CHUNK_SIZE="${CHUNK_SIZE:=128}"
+CHUNK_SIZE="${CHUNK_SIZE:=512}"
 if [ "${CHUNK_SIZE}" -gt 0 ]; then
    CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE})
    ARM="chunk${CHUNK_SIZE}"
@@ -57,7 +60,7 @@ if [ ! -e "${MODEL_DIR}/Qwen3-4B" ]; then
    echo "  export DATA_DIR=/mnt/tidal-nj01/usr/yuzhe1/baihaonan/data" >&2
    exit 1
 fi
-PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/gsm8k/main/train-00000-of-00001.parquet}"
+PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/gsm8k-long/train.parquet}"
 if [ ! -e "${PROMPT_DATA}" ]; then
    echo "ERROR: ${PROMPT_DATA} does not exist." >&2
    exit 1
@@ -76,7 +79,7 @@ SFT_ARGS=(
    --prompt-data "${PROMPT_DATA}"
    --input-key question
    --label-key answer
-   --global-batch-size 64
+   --global-batch-size 32
    --use-dynamic-batch-size
    --max-tokens-per-gpu 8192
    --sft-oversize-strategy skip
