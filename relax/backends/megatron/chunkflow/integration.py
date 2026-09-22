@@ -213,6 +213,13 @@ def install(model, chunk_size: int) -> int:
     from relax.backends.megatron.chunkflow.runtime import attach_runtime
 
     runtime = attach_runtime(model, chunk_size)
+
+    # The unit path needs RoPE's unfused branch: it applies the position offset
+    # chunkflow patches in, while Transformer Engine's fused_rope kernel takes
+    # the padded cu_seqlens literally and reads past the frequency table (that
+    # is the illegal memory access at step 0, not an attention bug). The flag
+    # is read per forward, and install() runs after the model -- and therefore
+    # its config -- is built, so flipping it here takes effect everywhere.
     n = 0
     for attn in _attention_modules(model):
         if hasattr(attn, _ORIG_ATTR):
@@ -227,6 +234,12 @@ def install(model, chunk_size: int) -> int:
             runtime=runtime,
         )
         n += 1
+    if n:
+        for module in model.modules():
+            cfg = getattr(module, "config", None)
+            if cfg is not None and getattr(cfg, "apply_rope_fusion", False):
+                cfg.apply_rope_fusion = False
+        logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
     logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
     return n
 
