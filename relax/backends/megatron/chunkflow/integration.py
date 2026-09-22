@@ -110,6 +110,11 @@ class ChunkedCoreAttention(nn.Module):
             vs.append(torch.cat([*(s.tensors["v"] for s in earlier), v_own], dim=0))
 
         device = query.device
+        # The unit batch is padded to an alignment multiple, so ``query`` can
+        # carry rows past cu[-1]. The kernel is given exactly the rows the
+        # cu_seqlens describe: a tensor longer than its own cu_seqlens is
+        # out-of-bounds by construction.
+        query = query[: cu[-1]]
         cu_q = torch.tensor(cu, dtype=torch.int32, device=device)
         cu_kv = torch.tensor([0, *itertools.accumulate(t.shape[0] for t in ks)], dtype=torch.int32, device=device)
         scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1] ** -0.5
@@ -153,7 +158,13 @@ class ChunkedCoreAttention(nn.Module):
             value = value.repeat_interleave(repeat, dim=1)
 
         if packed_seq_params is not None and getattr(packed_seq_params, UNIT_ATTR, None) is not None:
-            return self._forward_unit(query, key, value, packed_seq_params).reshape(query.shape[0], -1)
+            padded_rows = query.shape[0]
+            out = self._forward_unit(query, key, value, packed_seq_params).reshape(-1, query.shape[1] * query.shape[2])
+            # The unit batch is padded for alignment; the layer expects one
+            # output row per input row, and the pad rows' values are never read.
+            if out.shape[0] < padded_rows:
+                out = torch.nn.functional.pad(out, (0, 0, 0, padded_rows - out.shape[0]))
+            return out
 
         cu = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
         if cu is None:
