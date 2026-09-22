@@ -3037,12 +3037,6 @@ def _validate_chunkflow_args(args) -> None:
             f"--chunkflow-pipeline ({pipeline}) must equal --pipeline-model-parallel-size "
             f"({args.pipeline_model_parallel_size}) so the chunk plan and the pipeline agree."
         )
-    if pipeline > 0:
-        raise NotImplementedError(
-            "--chunkflow-pipeline is wired but the pipeline executor is not implemented yet. "
-            "The scheduler already produces per-stage op orders (gen_state_aware_1f1b_ops); the missing piece is "
-            "driving them with p2p send/recv across stages."
-        )
 
 
 def _normalize_mtp_only_training_args(args) -> None:
