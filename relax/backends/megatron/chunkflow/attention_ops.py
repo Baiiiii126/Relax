@@ -1,46 +1,16 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Chunk-local, KV-cache-aware causal attention for chunkflow.
+"""Chunk-local causal attention over a KV cache for chunkflow.
 
-Shapes follow the repo's THD convention: ``[T, H, D]`` (sequence, heads,
-head-dim) — see e.g. ``relax/models/gemma4/attention.py``.
+THD ``[T, H, D]`` shapes. Within one chunk, ``q`` is the chunk's queries
+(``Tq``) and ``k_all``/``v_all`` are the accumulated K/V up to it (``Tk >=
+Tq``). Two backends: flash_attn's low-level varlen forward/backward on CUDA
+fp16/bf16 (production), and a plain-torch reference on CPU/fp32 (for tests).
 
-Within one chunk's forward, ``q`` is the *new* chunk's queries (length
-``Tq``) and ``k_all``/``v_all`` are the full accumulated key/value up to and
-including this chunk (length ``Tk >= Tq``) — the "q short, kv long" shape a
-KV cache produces. The op returns ``(out, lse)``: ``lse`` is not consumed
-anywhere in this module (it never flows forward into the rest of the
-network), but is threaded through because (a) it is the sufficient statistic
-needed to merge across KV blocks incrementally, and (b) real flash-attention
-kernels need it to avoid materializing the full attention-probability matrix
-in their backward.
-
-Two backends sit behind ``ChunkCacheAttention``:
-
-* flash_attn's low-level varlen forward/backward on CUDA with fp16/bf16 —
-  the production path. The low-level pair is used (not
-  ``flash_attn_varlen_func``) because only it exposes ``softmax_lse`` and
-  lets us drive backward ourselves. Its ``causal=True`` aligns the mask to
-  the bottom right when ``seqlen_q < seqlen_k``, which is exactly the
-  "q short, kv long" semantics ``_causal_mask`` encodes.
-* ``_manual_attn_forward``/``_manual_attn_backward``, a plain-torch
-  reference implementing the identical math, used on CPU/fp32 so this module
-  stays testable without flash_attn or a GPU. It materialises the
-  ``[H, Tq, Tk]`` score matrix, so it is a correctness reference, not a
-  production path.
-
-Gradient accumulation across chunks is *not* done by hand here: every chunk
-reads the same K/V tensors out of one ``StateStore``, so calling
-``.backward()`` once per chunk, in descending order, lets ordinary autograd
-``+=`` accumulation do the summing (chunkflow lesson 3.4) — what is manual is
-*driving* those per-chunk backward calls in the right order and freeing the
-StateStore entry right after each one (lesson 3.5/3.6), instead of a single
-``.backward()`` over the whole sequence.
-
-Memory: the op saves the per-chunk K/V, never their concatenation, so the
-activation kept for backward is O(T) rather than O(T^2 / chunk_size). See
-``ChunkCacheAttention`` for why, and the memory regression test in
-``tests/backends/megatron/test_chunkflow_attention_ops.py``.
+The op saves per-chunk K/V (shared across chunks), never their concatenation,
+so saved activation is O(T) rather than O(T^2 / chunk_size). The per-chunk
+backward calls run in descending order; autograd accumulates dk/dv into the
+shared leaves.
 """
 
 from __future__ import annotations

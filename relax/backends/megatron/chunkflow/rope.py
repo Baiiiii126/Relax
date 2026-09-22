@@ -1,35 +1,18 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Give a chunk's tokens their true RoPE positions when the chunk is its own
-forward.
+"""Give a chunk's tokens their true RoPE positions when it is its own forward.
 
-A chunk of a long sequence presented as a standalone packed batch looks like a
-sequence starting at token 0. RoPE then computes
+A chunk presented as a standalone packed batch looks like a sequence starting
+at token 0, so RoPE restarts positions at 0 instead of ``prefix..prefix+L-1`` --
+silently wrong scores. (Chunking *inside* one attention forward never hits
+this, because RoPE has already run on the whole batch.)
 
-    freq_pos = local_pos + global_seq_start,   global_seq_start = cu_seqlens[0]
-
-with ``cu_seqlens = [0, L]`` that is ``local_pos`` — positions 0..L-1 for a
-chunk whose real positions are ``prefix..prefix+L-1``. Nothing errors; the
-attention scores are simply wrong. (Chunking *inside* one attention forward, as
-``ChunkedCoreAttention`` does today, never hits this: RoPE has already run on
-the whole packed batch by then.)
-
-Megatron exposes the two things needed, but the stock sizing makes them
-unusable together:
-
-* ``attention.py`` applies RoPE over ``cu_seqlens_q_padded``/``cu_seqlens_kv_padded``
-  when present — so the *offset* can be supplied without touching attention.
-* ``rope_utils._apply_rotary_pos_emb_thd`` only adds that offset when
-  ``freqs.size(0) > max_seqlen``, and ``freqs.size(0)`` is
-  ``max(max_seqlen_q, max_seqlen_kv)``. That is never strictly greater than
-  both, so the query side would shift and the key side would not — the same
-  token getting two different positions.
-
-So ``install()`` extends the table by a headroom instead, which makes the
-comparison strict on both sides. Everything is driven by a marker attribute on
-``PackedSeqParams``; when a batch has no marker, ``headroom`` is 0, the table
-is sized exactly as before, and the shift never fires — every existing path is
-bit-for-bit unchanged.
+``apply_rope_offset()`` keeps ``cu_seqlens_q/kv`` chunk-local for the attention
+kernels and puts the absolute positions in the ``*_padded`` fields RoPE reads,
+with a headroom marker so the frequency table covers them. ``install()``
+extends the table by that headroom. Without the marker, every existing path is
+unchanged. The fused RoPE kernel takes the padded cu_seqlens literally and
+reads past the table, so chunkflow also disables ``apply_rope_fusion``.
 """
 
 from __future__ import annotations

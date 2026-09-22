@@ -2,22 +2,12 @@
 
 """Per-rank state that has to outlive a single forward call.
 
-``StateStore`` is per (layer, dependency group): chunk ``i`` of a long sequence
-reads chunks ``0..i`` of *that* layer's K/V, and chunk ``i+1`` needs them again
-after chunk ``i``'s forward has returned. A store created inside one forward —
-what the current in-forward chunk loop does — cannot serve that, so the stores
-live here instead, hung off the built model and reached by the attention
-modules.
-
-Lifetime is a training step: stores appear when a group's first chunk forwards
-and go away when its last chunk backwards. ``release_group`` is called by the
-schedule at that point; ``assert_empty`` at the start of the next step turns a
-leaked store into an immediate error rather than a slow memory climb.
-
-Which unit is currently executing travels on ``packed_seq_params`` (see
-``unit_batch.py``), not through a global here — the attention reads it from the
-batch it was handed, which keeps the backward path correct under recompute where
-a forward runs a second time.
+``StateStore`` is per (layer, dependency group): chunk ``i`` reads chunks
+``0..i`` of that layer's K/V, and chunk ``i+1`` needs them again after chunk
+``i``'s forward has returned. Stores live here, hung off the built model, and
+appear with a group's first chunk and go away with its last backward
+(``release_group``); ``assert_empty`` turns a leaked store into an error. Which
+unit is executing travels on ``packed_seq_params``, not through a global.
 """
 
 from __future__ import annotations

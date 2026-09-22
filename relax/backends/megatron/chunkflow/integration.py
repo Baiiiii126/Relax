@@ -2,18 +2,11 @@
 
 """Wire chunkflow's chunked attention into a built Megatron model.
 
-``ChunkedCoreAttention`` is a drop-in replacement for Megatron's
-``core_attention`` (same contract as ``relax/models/gemma4/attention.py``):
-it splits each sequence into chunks and attends each chunk over the K/V of all
-chunks up to it, held in a per-layer :class:`StateStore`.
-
-Numerically this is identical to unchunked attention (verified against the real
-Qwen3-0.6B: logits/grads match to fp32 noise, independent of chunk count). It
-does not by itself reduce memory -- that needs the per-chunk backward schedule,
-which is a separate step.
-
-``install(model, chunk_size)`` walks a built model and swaps every
-``self_attention.core_attention`` instance; ``uninstall(model)`` restores.
+``ChunkedCoreAttention`` is a drop-in ``core_attention`` replacement: it splits
+each sequence into chunks and attends each chunk over the K/V of all chunks up
+to it, held in a per-layer ``StateStore``. Numerically identical to unchunked
+attention. ``install(model, chunk_size)`` swaps every ``core_attention``;
+``uninstall(model)`` restores.
 """
 
 from __future__ import annotations

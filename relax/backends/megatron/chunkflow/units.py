@@ -2,34 +2,17 @@
 
 """Execution units: which chunks share one forward/backward call.
 
-``scheduler.py`` decides the op order over *chunks*. This module decides how
-chunks are grouped into the things that actually get executed, and produces the
-same op order over those units.
+An attention call happens once per (layer, unit), and chunkflow's attention
+cost is dominated by call count, not FLOPs. So the number of calls is set by
+how many chunks share a unit, which is the lever this module provides:
 
-Why grouping matters: an attention call happens once per (layer, unit), and the
-measured cost of chunkflow's attention is dominated by call count rather than
-FLOPs — one call per sequence instead of one per batch already costs 4.57x on
-its own. So the number of *calls* is set by how many chunks share a unit, not
-by how the op sequence is arranged. Merging chunks into units is therefore the
-lever for that cost, and the trade is explicit:
+``staggered``: one unit per chunk. Groups can sit at different depths, which
+fills pipeline bubbles but maximizes call count.
+``lockstep``: same-depth chunks across groups share a unit. Far fewer calls,
+but no stagger left to hide bubbles with.
 
-``staggered``
-    One unit per chunk. Dependency groups can sit at different depths, which
-    is what lets the schedule fill pipeline bubbles — but every chunk is its
-    own attention call.
-
-``lockstep``
-    Chunks at the same depth (``group_idx``) across dependency groups share a
-    unit. Far fewer calls, but groups march together, so there is little
-    stagger left to hide bubbles with.
-
-Both are correct; they trade call count against schedule flexibility, and only
-end-to-end measurement can say which wins.
-
-Merging is safe because chunks at the same depth in *different* groups are
-mutually independent: a dependency only ever runs between adjacent depths of
-the same group (``group_idx - 1`` -> ``group_idx``). A unit may never contain
-two chunks of the same group.
+Merging is safe because chunks at the same depth in different groups are
+mutually independent; a unit never holds two chunks of the same group.
 """
 
 from __future__ import annotations

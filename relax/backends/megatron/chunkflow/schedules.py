@@ -3,18 +3,12 @@
 """The chunkflow schedule: chunks are the units that flow through the model.
 
 ``streaming_schedules.py`` is the template -- keyword-only signature, one-shot
-iterators handed to ``forward_step``, gradients accumulated under ``no_sync``
-with one ``finalize_model_grads`` at the end. The difference is the unit of
-work: a chunk (or a batch of independent chunks) instead of a micro-batch, in
-the order ``gen_unit_ops`` prescribes.
-
-For PP=1 that order is ascending forward / descending backward. Descending is
-not cosmetic: a group's chunk ``m`` accumulates dK/dV from every chunk ``j >= m``,
-so it can only backward once the later ones have.
-
-This is the no-recompute path: every unit keeps its activation, so no ``Fp``/``Fr``
-is emitted. The recompute policy slots in at the op dispatch below without
-changing anything else.
+iterators, gradients accumulated under ``no_sync`` with one
+``finalize_model_grads`` at the end. The difference is the unit of work: a
+chunk (or a batch of independent chunks) instead of a micro-batch, in the order
+``gen_unit_ops`` prescribes. For PP=1 that order is ascending forward /
+descending backward, because a group's chunk ``m`` can only backward once every
+chunk ``j >= m`` has (dK/dV accumulation must be complete).
 """
 
 from __future__ import annotations

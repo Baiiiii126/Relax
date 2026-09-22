@@ -1,48 +1,24 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""chunkflow scheduling: chunk construction, op ordering, and the multi-stage
-view.
+"""Chunk construction and op ordering for chunkflow.
 
-This module decides *what* needs to happen and in *what order* — it does not
-execute anything (see ``attention_ops.py`` / ``StateStore`` for that).
+Decides *what* runs and in *what order*; it executes nothing.
 
-Two building blocks, both scoped to *one training step's* batch of sequences:
+``build_chunks``: split sequences longer than ``chunk_size`` into causally
+dependent chunks (a dependency group); bin-pack the short ones into standalone
+chunks. ``build_group_schedule`` / ``build_schedule``: keep only the last
+``keep_last_k`` chunks' activations; the earlier ones are recomputed (``Fr``)
+right before their own backward, and every group backwards descending (dK/dV
+accumulation must be complete before a chunk runs).
 
-``build_chunks``
-    Splits sequences longer than ``chunk_size`` into ascending, causally-
-    dependent chunks (a "dependency group"); bin-packs the remaining short
-    sequences (and, optionally, long sequences' leftover tail chunks — see
-    ``repack_tail``) into standalone chunks that carry no ordering
-    constraint at all.
+The multi-stage layer (``classify_chunks``, ``make_bwd_order``,
+``gen_state_aware_1f1b_ops``) gives each pipeline stage its op sequence. Every
+input comes from sequence lengths, which every stage already has, so the plan
+is derived identically on each stage and p2p pairs stay aligned.
 
-``build_group_schedule`` / ``build_schedule``
-    For a chunk_size that would otherwise force a dependency group to hold
-    every one of its chunks' activations simultaneously, only the *last*
-    ``K`` chunks keep their activation from the first forward pass; the
-    earlier ones are recomputed right before their own backward. This
-    implements the paper-prose reading of "the forward passes of the first
-    (N-K) chunks are executed twice" — deliberately *not* the literal
-    Algorithm-2-pseudocode reading (``if idx >= K: keep``), which produces
-    incomplete gradients (a later query chunk's backward can run before an
-    even-later chunk that reads the same K/V has backpropagated). See
-    ``validate_backward_order`` and the "ascending drop order" test in
-    ``tests/backends/megatron/test_chunkflow_scheduler.py`` for the concrete
-    failure this avoids.
-
-On top of those sits the multi-stage layer (``classify_chunks``,
-``make_bwd_order``, ``gen_state_aware_1f1b_ops``): given a pipeline size and a
-stage index it produces that one stage's op sequence, keeping the same global
-forward and backward orders on every stage so p2p send/recv pairs stay
-aligned. Everything it needs comes from the chunk list, and the chunk list
-comes from sequence lengths — which every PP stage has, so no stage needs the
-plan broadcast to it.
-
-Every generated schedule can (and, for anything driving real chunk_attention_*
-calls, should) be run through ``validate_schedule`` first: a violation means
-the caller's chunk ordering is wrong and any gradient computed downstream
-would be silently incorrect, exactly the failure mode ``StateStore`` guards
-against at runtime. These validators are the offline, look-before-you-run
-counterpart to that runtime enforcement.
+``validate_schedule`` is the offline check a caller should run before driving
+real attention: a violation means silently wrong gradients, exactly what
+``StateStore`` enforces at runtime.
 """
 
 from __future__ import annotations

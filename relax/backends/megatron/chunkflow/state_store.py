@@ -2,20 +2,10 @@
 
 """Local, communication-free per-chunk state storage for chunkflow.
 
-chunkflow splits a long sequence into causally-dependent chunks: chunk ``i``'s
-attention needs the K/V (or, for other attention structures, whatever
-per-chunk state a forward pass produces) of every chunk ``0..i``. Because of
-this dependency, forward must visit chunks in ascending order (a chunk's
-state only exists once its forward has run) and backward must visit them in
-descending order: key-chunk ``m`` is read by every query chunk ``j >= m``, so
-in a descending backward the highest live chunk is always the last (and
-therefore only safe) one to free next.
-
-``StateStore`` does not interpret what is inside a chunk's state — callers
-(softmax-attention chunking, DSA chunking, ...) decide what to store. It only
-enforces the ascending-put / descending-free ordering invariant, so a
-scheduling bug surfaces immediately as a ``StateStoreError`` instead of
-silently producing wrong gradients later.
+A chunk's attention needs the K/V of every earlier chunk, so state is put in
+ascending order and freed in descending order. ``StateStore`` only enforces
+that ordering invariant (so a scheduling bug surfaces as ``StateStoreError``
+rather than a silently wrong gradient); it does not interpret the payload.
 """
 
 from __future__ import annotations

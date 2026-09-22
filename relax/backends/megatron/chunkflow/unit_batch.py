@@ -2,22 +2,15 @@
 
 """Slice one micro-batch into per-unit batches the existing loss can consume.
 
-The schedule pulls a micro-batch, runs ``get_batch`` on it once (so every
-alignment rule — SFT mask shift, padding, cu_seqlens — is applied exactly as
-the baseline applies it), and then cuts that processed batch into one batch per
-execution unit. Each unit batch is shaped so ``loss_function`` works unmodified,
-which is what makes the chunked run comparable to the baseline at all.
+The schedule runs ``get_batch`` once per micro-batch (so alignment, padding and
+cu_seqlens match the baseline exactly), then cuts the result into one batch per
+execution unit, shaped so ``loss_function`` works unmodified.
 
-The one field that must not survive the slice is ``unconcat_tokens``: the loss
-pairs logit row *j* with token *j+1* (``loss.py``: ``logits[start-1:end-1]``
-against ``tokens[-R:]``), so a unit covering parent rows ``[s, e)`` must report
-as its targets the parent's tokens ``[s+1, e+1)`` — one row past its own input.
-Feeding the unit its own tokens there would train it to predict the token it
-was just given.
-
-RoPE gets the same treatment from ``chunkflow.rope``: the unit's
-``packed_seq_params`` stays chunk-local for the attention kernels and carries
-the absolute offsets for RoPE.
+``unconcat_tokens`` must not survive the slice: the loss pairs logit row *j*
+with token *j+1*, so a unit covering parent rows ``[s, e)`` reports the
+parent's tokens ``[s+1, e+1)`` as targets -- never past the owning sequence's
+end. The unit's ``packed_seq_params`` stays chunk-local for the attention
+kernels and carries absolute offsets for RoPE.
 """
 
 from __future__ import annotations
