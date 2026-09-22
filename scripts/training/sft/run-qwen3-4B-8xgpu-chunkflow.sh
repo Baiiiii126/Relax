@@ -2,15 +2,20 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B SFT with a chunkflow toggle, 8xGPU single-node.
+# Qwen3-4B SFT with a chunkflow toggle, 8xGPU single-node, TP2 x PP4.
+#
+#   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh              # chunkflow
+#   CHUNK_SIZE=0 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh # baseline
+#
+# Same PP on both arms, or the comparison is "no bubbles vs bubbles" instead of
+# "chunkflow vs no chunkflow". PP defaults to 4 because that is the deepest
+# pipeline (and the most bubbles) this node can run, which is where chunkflow's
+# benefit is supposed to show.
 #
 # SFT is the right vehicle for checking chunked attention: the data is fixed, so
 # unlike RL (temperature-1 sampling) the two arms see identical tokens and the
 # loss curves should overlay to within bf16 noise. Any real divergence is
 # chunkflow's doing.
-#
-#   CHUNK_SIZE=0   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # baseline
-#   CHUNK_SIZE=512 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh  # chunkflow
 #
 # CHUNK_SIZE defaults to 512 -- NOT 2048 -- and that matters. chunkflow splits
 # per sequence, so a chunk size above a sample's length leaves it as a single
@@ -43,8 +48,14 @@ MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_EPOCH="${NUM_EPOCH:=2}"
 
+# Pipeline depth: 8 GPUs = TP2 x PP x DP, so PP=4 is dp=1. Must be set here,
+# above the argparse block -- that block reads it to emit --chunkflow-pipeline.
+PP_SIZE="${PP_SIZE:=4}"
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
 CHUNK_SIZE="${CHUNK_SIZE:=512}"
+# How many chunks share one attention call. `lockstep` merges same-depth chunks
+# across sequences, which is the lever on chunkflow's call-count overhead; the
+# default `staggered` (one chunk per call) fills pipeline bubbles best.
 PACK_POLICY="${PACK_POLICY:=staggered}"
 # 0 = keep every chunk's activation (no recompute). >0 = recompute the earlier
 # ones of a group, keeping only this many. Defaults ON (1) -- that is the whole
@@ -128,11 +139,6 @@ EVAL_ARGS=(
    --eval-interval 50
 )
 
-# Pipeline depth. 8 GPUs = TP2 x PP x DP, so PP=4 gives dp=1 -- the deepest
-# pipeline (and the most bubbles) on this node, which is where chunkflow's
-# benefit shows. The baseline arm must run at the same PP or the comparison is
-# "no bubbles vs bubbles", not "chunkflow vs no chunkflow".
-PP_SIZE="${PP_SIZE:=1}"
 # Trace is on so a hang shows where it stopped; the untested gate is set
 # automatically at PP>1 so the command line stays bare.
 export RELAX_CHUNKFLOW_TRACE="${RELAX_CHUNKFLOW_TRACE:=1}"
