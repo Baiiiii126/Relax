@@ -126,8 +126,14 @@ def chunkflow_forward_backward_no_pipelining(
     with no_sync_func():
         for _ in range(num_mb):
             parent_batch = data_iterator.get_next(_BATCH_KEYS)
+            # get_batch's non-DataIterator branch unpacks a (batch, meta) pair
+            # off the iterator, the shape StreamingTQIterator yields.
             parent = get_batch(
-                iter([parent_batch]), _BATCH_KEYS, args.data_pad_size_multiplier, args.qkv_format, args.allgather_cp
+                iter([(parent_batch, {})]),
+                _BATCH_KEYS,
+                args.data_pad_size_multiplier,
+                args.qkv_format,
+                args.allgather_cp,
             )
             chunks, units = _plan(parent, chunk_size, policy)
             ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
