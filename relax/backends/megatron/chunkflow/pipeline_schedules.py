@@ -3,23 +3,21 @@
 """PP>1 chunkflow schedule: chunks are the units that flow through the
 pipeline.
 
-The pipeline structure is ``streaming_forward_backward_pipelining_without_interleaving``
-(warmup / steady 1F1B / cooldown, ``P2PCommunicator``, ``no_sync`` with one
-``finalize_model_grads``). The difference is the unit of work and its order: a
-chunk (or a batch of independent chunks) instead of a micro-batch, in the order
-``gen_unit_ops`` prescribes for this stage.
+The p2p pattern is Megatron's standard non-interleaved 1F1B (bare warmup
+forwards, fused steady ``send_forward_recv_backward`` /
+``send_backward_recv_forward``, bare cooldown backwards). That pattern is
+deadlock-free because the backward a steady step receives lags the forward it
+sends by the warmup depth, so the peer has always produced it already.
 
-Each stage derives the identical chunk plan from the batch's sequence lengths
-(see ``units.build_micro_batches`` and ``scheduler.gen_state_aware_1f1b_ops``),
-so the p2p send/recv pairs stay aligned without broadcasting the plan. Every
-stage issues the same sequence of p2p calls, which is the only invariant the
-communicator needs.
-
-The one thing that does *not* follow from "chunk = micro-batch" is ``Fp``: a
-unit whose activation is dropped still has to run its layers **on every stage**,
-because each stage keeps its own layers' K/V in its own store for the later
-chunks of that group to read. So an Fp forward sends its output downstream like
-any other, it just keeps no graph and takes no loss.
+The op order is what makes it chunkflow. A dependency group's chunk ``m`` can
+only backward once every chunk ``j >= m`` has (the dK/dV fold-back must be
+complete), and a group's backward can only run once the whole group has
+forwarded (the store is only full then). ``_pipeline_schedule`` lays that out
+as a forward order and a backward order, and adds ``C`` -- a constant of extra
+warmup that covers the first group's completion -- to the standard
+``pp - stage - 1`` depth so the steady phase always has a backward ready. Every
+stage derives the identical orders from the batch's sequence lengths, so the
+p2p send/recv pairs stay aligned without broadcasting the plan.
 """
 
 from __future__ import annotations
@@ -43,7 +41,7 @@ from megatron.core.utils import get_model_config
 
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, attach_runtime
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
-from relax.backends.megatron.chunkflow.units import gen_unit_ops
+from relax.backends.megatron.chunkflow.units import classify_units, make_unit_bwd_order
 from relax.utils.logging_utils import get_logger
 
 
@@ -68,64 +66,46 @@ def _no_loss_step_func(forward_step_func):
     return step
 
 
-def _trace(enabled: bool, mb_idx: int, ops: list) -> None:
+def _pipeline_schedule(units, chunks, keep_last_k, pp, stage):
+    """The per-stage plan: forward order, backward order, warmup depth.
+
+    ``fwd_seq`` runs standalones first -- they backward immediately -- then the
+    dependent units by depth, so a group always forwards its earlier chunks
+    first. ``bwd_seq`` is ``make_unit_bwd_order``'s dependency-valid order. The
+    warmup depth is the standard ``pp - stage - 1`` plus ``C``, a constant that
+    covers the first group's completion, so the steady phase always has a
+    backward ready; ``C`` is identical on every stage, so the offset between
+    neighbouring stages stays exactly 1.
+    """
+    standalone = [u.unit_id for u in units if not u.is_dependent]
+    dependent = sorted((u for u in units if u.is_dependent), key=lambda u: u.round)
+    fwd_seq = standalone + [u.unit_id for u in dependent]
+    bwd_seq = make_unit_bwd_order(units, fwd_seq)
+    _, need_fr = classify_units(units, chunks, keep_last_k)
+
+    by_id = {u.unit_id: u for u in units}
+    fwd_pos = {u: i for i, u in enumerate(fwd_seq)}
+    done_at: dict[int, int] = {}
+    for u in units:
+        for g in u.groups:
+            done_at[g] = max(done_at.get(g, -1), fwd_pos[u.unit_id])
+
+    def ready(unit_id):
+        """Forward position at which this backward's store is full."""
+        unit = by_id[unit_id]
+        if not unit.groups:
+            return fwd_pos[unit_id]
+        return max(done_at[g] for g in unit.groups)
+
+    C = max((ready(u) - i) for i, u in enumerate(bwd_seq)) if bwd_seq else 0
+    W = min(C + (pp - stage - 1), len(fwd_seq))
+    return fwd_seq, bwd_seq, need_fr, W
+
+
+def _trace(enabled: bool, mb_idx: int, msg: str) -> None:
     if not enabled or parallel_state.get_data_parallel_rank() != 0:
         return
-    logger.info(f"[chunkflow-trace] pp{parallel_state.get_pipeline_model_parallel_rank()} mb{mb_idx}: {ops}")
-
-
-def plan_p2p_calls(ops, *, is_first: bool, is_last: bool) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
-    """The p2p calls one stage issues for its op list, as ``(before, after)``.
-
-    ``before`` is issued ahead of the op's compute and ``after`` once its output
-    exists, and each tuple is a single atomic communicator call -- everything in
-    it is posted together, which is what ``batch_isend_irecv`` gives us.
-
-    Sends and receives in *opposite* directions go in the same call. Two stages
-    that each block on a bare send in opposite directions never post the receives
-    that would free them, so a forward is fused with the following backward's
-    receive (and vice versa) whenever the op order turns. Bare sends are left
-    only where the direction is already established and the peer is guaranteed to
-    be receiving: a run of forwards, or a run of backwards.
-
-    ``Fr`` is a local recompute and never communicates. A receive on the first
-    stage, and a send on the first/last stage, is a no-op and is left out.
-
-    Kept as a pure function of the op list so the deadlock check in
-    ``tests/backends/megatron/test_chunkflow_pipeline_schedule.py`` can simulate
-    exactly what the executor below will do.
-    """
-    plan: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
-    prefetched_input = prefetched_grad = False
-    for idx, (kind, _) in enumerate(ops):
-        # The next op that pairs with a p2p call: Fr sits inside the sequence
-        # without talking to anyone, so it must not be mistaken for a turn.
-        next_kind = next((k for k, _ in ops[idx + 1 :] if k != "Fr"), None)
-
-        if kind == "Fr":
-            plan.append(((), ()))
-            continue
-
-        if kind == "B":
-            before = () if (prefetched_grad or is_last) else ("recv_bwd",)
-            prefetched_grad = False
-            if next_kind in ("F", "Fp"):
-                # Both stages are turning at the same time; exchange in one call.
-                after = () if is_first else ("send_bwd", "recv_fwd")
-                prefetched_input = not is_first
-            else:
-                after = () if is_first else ("send_bwd",)
-        else:
-            before = () if (prefetched_input or is_first) else ("recv_fwd",)
-            prefetched_input = False
-            if next_kind == "B":
-                after = () if is_last else ("send_fwd", "recv_bwd")
-                prefetched_grad = not is_last
-            else:
-                after = () if is_last else ("send_fwd",)
-
-        plan.append((before, after))
-    return plan
+    logger.info(f"[chunkflow-trace] pp{parallel_state.get_pipeline_model_parallel_rank()} mb{mb_idx}: {msg}")
 
 
 def chunkflow_forward_backward_pipelining_without_interleaving(
@@ -146,7 +126,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     force_all_reduce: Optional[bool] = False,
     **kwargs,
 ):
-    """Streaming 1F1B structure, chunkflow units and order."""
+    """Standard 1F1B structure, chunkflow units and order."""
     if forward_only:
         raise NotImplementedError("chunkflow pipeline schedule is training-only")
     if isinstance(model, list):
@@ -230,37 +210,17 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
 
     forward_data_store: list = []
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-    # Fp units are never backwarded, so nothing of theirs reaches the caller --
-    # neither the token count nor the loss metrics.
     discarded: list = []
+    fp_step_func = _no_loss_step_func(forward_step_func)
 
-    # A deadlock here shows up as nothing: no traceback, no log, GPUs idle. So
-    # when the trace is on, every rank also arms a watchdog that dumps all stacks
-    # and exits after a single op has taken this long -- a normal forward is
-    # sub-second, so 300s means stuck, not slow. The dump lands in the worker's
-    # stderr, which the job log does capture.
     if trace:
         import faulthandler
 
         faulthandler.dump_traceback_later(
             int(os.environ.get("RELAX_CHUNKFLOW_WATCHDOG_S", "120")), repeat=True, exit=True
         )
-    # (input, output) of every forward still owing a backward, keyed by unit: the
-    # op order, not a FIFO, decides which one a ``B`` consumes.
-    in_flight: dict[int, tuple] = {}
-    # Stage input held for an Fp unit until its recompute. One tensor per such
-    # chunk, not per layer -- the per-layer activations are still dropped, which
-    # is what Fp is for.
-    fp_inputs: dict[int, torch.Tensor] = {}
-    # Tensor received for the next forward/backward, when the previous op already
-    # fetched it as part of a fused send+recv (see ``plan_p2p_calls``).
-    pending_input: Optional[torch.Tensor] = None
-    pending_grad: Optional[torch.Tensor] = None
-    fp_step_func = _no_loss_step_func(forward_step_func)
 
     def next_parent() -> dict:
-        """The processed micro-batch every stage sees, and therefore the same
-        plan on every stage."""
         get_next = getattr(data_iterator, "get_next", None)
         raw = get_next(_BATCH_KEYS) if get_next is not None else next(data_iterator)[0]
         return get_batch(
@@ -277,64 +237,24 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
             chunks, units = _plan(parent, chunk_size, policy, runtime.next_group_offset(None))
             used_max = max((c.group for c in chunks if c.group is not None), default=None)
             runtime.next_group_offset(used_max)
-            ops = gen_unit_ops(
-                units,
-                chunks,
-                keep_last_k,
-                pp=p2p_communicator.total_stages,
-                stage=p2p_communicator.current_stage,
+            by_id = {u.unit_id: u for u in units}
+            fwd_seq, bwd_seq, need_fr, W = _pipeline_schedule(
+                units, chunks, keep_last_k, p2p_communicator.total_stages, p2p_communicator.current_stage
             )
-            _trace(trace, mb_idx, ops)
-            # An Fp unit is recomputed by a later Fr, and the recompute needs the
-            # activation that entered *this* stage -- only the first stage can
-            # rebuild it from the tokens. So the Fp pass keeps the input tensor
-            # for exactly the units that have one coming.
-            fr_units = {unit_id for kind, unit_id in ops if kind == "Fr"}
-            p2p_plan = plan_p2p_calls(ops, is_first=is_first, is_last=is_last)
+            n = len(fwd_seq)
+            _trace(trace, mb_idx, f"fwd={fwd_seq} bwd={bwd_seq} W={W} n={n} need_fr={sorted(need_fr)}")
 
-            for idx, (kind, unit_id) in enumerate(ops):
-                unit = units[unit_id]
-                before, after = p2p_plan[idx]
-                if trace and mb_idx == 0:
-                    # One line per op, first micro-batch only: on a hang the last
-                    # line each stage printed is the op it never finished, and the
-                    # watchdog stack shows the call inside it.
-                    logger.info(
-                        f"[chunkflow-trace] pp{p2p_communicator.current_stage} mb{mb_idx} "
-                        f"op[{idx}/{len(ops)}]=({kind},{unit_id}) before={before} after={after}"
-                    )
+            def do_forward(unit_id, input_tensor, mb_idx):
+                """One unit's forward through this stage.
 
-                if kind == "B":
-                    if "recv_bwd" in before:
-                        output_tensor_grad = p2p_communicator.recv_backward(send_tensor_shapes, is_last)
-                    else:
-                        output_tensor_grad, pending_grad = pending_grad, None
-                    input_tensor, output_tensor = in_flight.pop(unit_id)
-                    input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-                    if "recv_fwd" in after:
-                        pending_input = p2p_communicator.send_backward_recv_forward(
-                            input_tensor_grad, recv_tensor_shapes, is_first
-                        )
-                    elif after:
-                        p2p_communicator.send_backward(input_tensor_grad, is_first)
-                    # Every forward of this group has run by the time its first
-                    # unit backwards (the backward order guarantees it), so no
-                    # chunk will look these up again.
-                    for group in unit.groups:
-                        runtime.release_group(group)
-                    continue
-
-                if kind == "Fr":
-                    input_tensor = fp_inputs.pop(unit_id)
-                elif "recv_fwd" in before:
-                    input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes, is_first)
-                else:
-                    input_tensor, pending_input = pending_input, None
+                Fp runs under no_grad (K/V only) and keeps the input for the
+                later recompute; F and Fr build a graph and take a loss.
+                """
+                unit = by_id[unit_id]
                 batch = slice_parent_batch(parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args)
                 batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
-                batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, kind == "Fr")
-
-                if kind == "Fp":
+                if unit_id in need_fr:
+                    batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, False)
                     with torch.no_grad():
                         output_tensor, _ = forward_step(
                             fp_step_func,
@@ -350,10 +270,44 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                             current_microbatch=mb_idx,
                             is_last_stage=is_last,
                         )
-                    if unit_id in fr_units:
-                        fp_inputs[unit_id] = input_tensor
-                else:
-                    output_tensor, num_tokens = forward_step(
+                    return output_tensor, input_tensor, None
+                output_tensor, num_tokens = forward_step(
+                    forward_step_func,
+                    iter([(batch, {})]),
+                    model,
+                    1,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    cp_group_size=cp_size,
+                    collect_non_loss_data=False,
+                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, mb_idx == 0),
+                    current_microbatch=mb_idx,
+                    is_last_stage=is_last,
+                )
+                return output_tensor, input_tensor, num_tokens
+
+            # (input, output) of keep units still owing a backward, and the input
+            # of recompute units until their Fr rebuilds a graph.
+            in_flight: dict[int, tuple] = {}
+            fp_inputs: dict[int, torch.Tensor] = {}
+
+            def backward(unit_id, output_tensor_grad):
+                """One unit's backward.
+
+                A recompute unit rebuilds its graph first (Fr), reusing the K/V
+                leaf the Fp pass stored.
+                """
+                fr_num_tokens = None
+                if unit_id in need_fr:
+                    input_tensor = fp_inputs.pop(unit_id)
+                    unit = by_id[unit_id]
+                    batch = slice_parent_batch(
+                        parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args
+                    )
+                    batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
+                    batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, True)
+                    output_tensor, fr_num_tokens = forward_step(
                         forward_step_func,
                         iter([(batch, {})]),
                         model,
@@ -363,27 +317,71 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         config,
                         cp_group_size=cp_size,
                         collect_non_loss_data=False,
-                        is_first_microbatch=check_first_val_step(first_val_step, forward_only, mb_idx == 0),
+                        is_first_microbatch=False,
                         current_microbatch=mb_idx,
                         is_last_stage=is_last,
                     )
-                    total_num_tokens += num_tokens
-                    in_flight[unit_id] = (input_tensor, output_tensor)
-
-                if not after:
-                    continue
-                if "recv_bwd" in after:
-                    pending_grad = p2p_communicator.send_forward_recv_backward(
-                        output_tensor, send_tensor_shapes, is_last
-                    )
                 else:
+                    input_tensor, output_tensor = in_flight.pop(unit_id)
+                input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                for group in by_id[unit_id].groups:
+                    runtime.release_group(group)
+                return input_tensor_grad, fr_num_tokens
+
+            # ── Warmup ────────────────────────────────────────────────────
+            for i in range(W):
+                input_tensor = None if is_first else p2p_communicator.recv_forward(recv_tensor_shapes, is_first)
+                output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[i], input_tensor, mb_idx)
+                if num_tokens is not None:
+                    total_num_tokens += num_tokens
+                    in_flight[fwd_seq[i]] = (fwd_input, output_tensor)
+                else:
+                    fp_inputs[fwd_seq[i]] = fwd_input
+                if not is_last:
                     p2p_communicator.send_forward(output_tensor, is_last)
                 deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
-            if in_flight:
+            # ── Steady 1F1B ────────────────────────────────────────────────
+            n_steady = n - W
+            input_tensor = None
+            if n_steady > 0 and not is_first:
+                input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes, is_first)
+            for i in range(n_steady):
+                last_iter = i == n_steady - 1
+                output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[W + i], input_tensor, mb_idx)
+                if num_tokens is not None:
+                    total_num_tokens += num_tokens
+                    in_flight[fwd_seq[W + i]] = (fwd_input, output_tensor)
+                else:
+                    fp_inputs[fwd_seq[W + i]] = fwd_input
+                output_tensor_grad = p2p_communicator.send_forward_recv_backward(
+                    output_tensor, send_tensor_shapes, is_last
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
+                if fr_num_tokens is not None:
+                    total_num_tokens += fr_num_tokens
+                if last_iter:
+                    if not is_first:
+                        p2p_communicator.send_backward(input_tensor_grad, is_first)
+                else:
+                    input_tensor = p2p_communicator.send_backward_recv_forward(
+                        input_tensor_grad, recv_tensor_shapes, is_first
+                    )
+
+            # ── Cooldown ──────────────────────────────────────────────────
+            for i in range(n_steady, n):
+                output_tensor_grad = None if is_last else p2p_communicator.recv_backward(send_tensor_shapes, is_last)
+                input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
+                if fr_num_tokens is not None:
+                    total_num_tokens += fr_num_tokens
+                if not is_first:
+                    p2p_communicator.send_backward(input_tensor_grad, is_first)
+
+            if in_flight or fp_inputs:
                 raise RuntimeError(
-                    f"chunkflow pipeline: micro-batch {mb_idx} forwarded {len(in_flight)} unit(s) "
-                    f"that its op order never backwarded ({sorted(in_flight)}) -- schedule bug"
+                    f"chunkflow pipeline: mb{mb_idx} ended with {len(in_flight)} forwarded and "
+                    f"{len(fp_inputs)} unrecomputed unit(s) -- schedule bug"
                 )
 
     if config.grad_sync_func is not None:
