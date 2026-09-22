@@ -90,12 +90,17 @@ def slice_parent_batch(
     unit_targets = torch.cat(target_parts)
     unit_mask = torch.cat(mask_parts)
 
+    # loss_masks and full_loss_masks are two different things: the loss splits
+    # log-probs by response_lengths and multiplies by loss_masks element-wise,
+    # so that one must stay the unpadded length; the model's forward wants one
+    # mask row per padded token, so full_loss_masks is padded alongside tokens.
+    full_mask = unit_mask.clone()
     pad = (-unit_tokens.size(0)) % 128
     if pad:
         unit_tokens = torch.cat(
             [unit_tokens, torch.full((pad,), pad_token_id, dtype=unit_tokens.dtype, device=unit_tokens.device)]
         )
-        unit_mask = torch.cat([unit_mask, torch.zeros(pad, dtype=unit_mask.dtype, device=unit_mask.device)])
+        full_mask = torch.cat([full_mask, torch.zeros(pad, dtype=unit_mask.dtype, device=unit_mask.device)])
 
     offsets = [parent_cu[seg.seq_id] + seg.prefix for seg in segments]
     packed = _build_packed_seq_params(unit_tokens, lengths, offsets)
@@ -103,7 +108,7 @@ def slice_parent_batch(
     batch: dict = {
         "tokens": unit_tokens.unsqueeze(0),
         "unconcat_tokens": [unit_targets],
-        "full_loss_masks": unit_mask.unsqueeze(0),
+        "full_loss_masks": full_mask.unsqueeze(0),
         "loss_masks": [unit_mask],
         "total_lengths": [sum(lengths) + 1],
         "response_lengths": [sum(lengths)],
