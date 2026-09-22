@@ -41,6 +41,22 @@ class ChunkflowRuntime:
         # Set by the schedule for the duration of one unit's forward; cleared
         # right after so a stray read cannot silently use the wrong group.
         self.current_unit = None
+        # Group ids must be unique for the runtime's whole lifetime, not just
+        # one schedule call -- the stores persist across calls, and resetting the
+        # counter per call reuses ids and collides with a store an earlier call
+        # left behind.
+        self._group_offset = 0
+
+    def next_group_offset(self, used_max: int | None) -> int:
+        """Advance the global group counter past ``used_max``; returns the value to start from next time.
+
+        ``used_max`` is the highest group id this micro-batch used (already
+        offset), or None when it had none. The returned value is what the next
+        micro-batch starts from, so ids are unique across schedule calls.
+        """
+        if used_max is not None:
+            self._group_offset = used_max + 1
+        return self._group_offset
 
     def store(self, layer_number: int, group_id: int) -> StateStore:
         """The store for one layer of one group, created on first use."""

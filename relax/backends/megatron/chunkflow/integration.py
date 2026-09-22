@@ -34,6 +34,12 @@ logger = get_logger(__name__)
 _ORIG_ATTR = "_chunkflow_original_core_attention"
 
 
+def _chunkflow_trace() -> bool:
+    import os
+
+    return os.environ.get("RELAX_CHUNKFLOW_TRACE") == "1"
+
+
 def split_sizes(total: int, chunk_size: int) -> list[int]:
     """Chunk lengths covering ``total``; the tail keeps whatever is left."""
     if chunk_size <= 0 or chunk_size >= total:
@@ -99,6 +105,8 @@ class ChunkedCoreAttention(nn.Module):
                 continue
 
             store = self.runtime.store(self.layer_number, group)
+            if _chunkflow_trace():
+                logger.info(f"[chunkflow-trace] put layer={self.layer_number} group={group} idx={group_idx} live={store.live_chunk_ids}")
             leaf_k = k_own.detach().requires_grad_(True)
             leaf_v = v_own.detach().requires_grad_(True)
             store.put(group_idx, ChunkState({"k": leaf_k, "v": leaf_v}))

@@ -133,7 +133,6 @@ def chunkflow_forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     with no_sync_func():
-        group_offset = 0
         for _ in range(num_mb):
             parent_batch = data_iterator.get_next(_BATCH_KEYS)
             # get_batch's non-DataIterator branch unpacks a (batch, meta) pair
@@ -145,9 +144,21 @@ def chunkflow_forward_backward_no_pipelining(
                 args.qkv_format,
                 args.allgather_cp,
             )
-            chunks, units = _plan(parent, chunk_size, policy, group_offset)
-            group_offset = max((c.group for c in chunks if c.group is not None), default=group_offset - 1) + 1
+            chunks, units = _plan(parent, chunk_size, policy, runtime.next_group_offset(None))
+            used_max = max((c.group for c in chunks if c.group is not None), default=None)
+            runtime.next_group_offset(used_max)
             ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
+
+            import os as _os
+
+            if _os.environ.get("RELAX_CHUNKFLOW_TRACE") == "1":
+                from megatron.core import parallel_state as _mpu
+
+                if _mpu.get_data_parallel_rank() == 0:
+                    logger.info(
+                        f"[chunkflow-trace] microbatch: {len(chunks)} chunks, "
+                        f"groups={sorted({(c.group, c.group_idx) for c in chunks if c.group is not None})}, ops={ops}"
+                    )
 
             pending: dict[int, torch.Tensor] = {}
             for kind, unit_id in ops:
