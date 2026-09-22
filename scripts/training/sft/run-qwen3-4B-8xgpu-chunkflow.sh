@@ -84,6 +84,22 @@ if [ ! -f "${HOME}/clearml.conf" ] && [ -z "${CLEARML_API_HOST:-}" ]; then
    exit 1
 fi
 
+# Ray workers read their env from the runtime env, not this shell (same lesson
+# as ClearML): the trace flag and the untested-pipeline gate have to travel in
+# RUNTIME_ENV_JSON or the actors never see them.
+if [ "${PP_SIZE}" -gt 1 ] || [ "${RELAX_CHUNKFLOW_TRACE:-0}" = "1" ]; then
+   export RUNTIME_ENV_JSON=$(python3 -c '
+import json, os
+env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+target = env.setdefault("env_vars", {})
+for name in ("RELAX_CHUNKFLOW_TRACE", "RELAX_CHUNKFLOW_PIPELINE_UNTESTED"):
+    value = os.environ.get(name)
+    if value:
+        target[name] = value
+print(json.dumps(env))
+')
+fi
+
 # Fail here rather than deep inside transformers: a non-existent --hf-checkpoint
 # reaches ``cached_file`` as-is, which then treats the path as a Hub repo id and
 # dies with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'".
