@@ -2658,6 +2658,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "at or above the sequence length degenerates to a single chunk (no chunking)."
                 ),
             )
+            parser.add_argument(
+                "--chunkflow-pack-policy",
+                type=str,
+                default="staggered",
+                choices=["staggered", "lockstep"],
+                help=(
+                    "How chunks share an attention call. 'staggered': one unit per chunk, dependency groups may sit "
+                    "at different depths (best for filling pipeline bubbles, most calls). 'lockstep': same-depth "
+                    "chunks from different groups share a unit (fewest calls, no stagger). Cost is dominated by call "
+                    "count, so which wins needs an end-to-end measurement."
+                ),
+            )
+            parser.add_argument(
+                "--chunkflow-keep-last-k",
+                type=int,
+                default=0,
+                help=(
+                    "How many of a dependency group's last chunks keep their activation; the earlier ones are "
+                    "recomputed before their backward. 0 (default) keeps every chunk, i.e. no recompute -- that "
+                    "path is not implemented yet, so a smaller value is rejected at parse time."
+                ),
+            )
             return parser
 
         def add_ci_arguments(parser):
@@ -2996,6 +3018,11 @@ def _validate_chunkflow_args(args) -> None:
             "--use-chunkflow is incompatible with --context-parallel-size > 1: context parallelism "
             "splits the very sequence chunkflow caches in its per-layer StateStore. "
             "Remove one of the two."
+        )
+    if getattr(args, "chunkflow_keep_last_k", 0):
+        raise ValueError(
+            "--chunkflow-keep-last-k is not implemented yet: the recompute path (Fp/Fr) has no executor, so a "
+            "value below the group size would silently be ignored. Leave it at 0."
         )
 
 
