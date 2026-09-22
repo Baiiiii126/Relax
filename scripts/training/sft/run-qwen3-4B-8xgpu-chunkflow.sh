@@ -124,10 +124,16 @@ EVAL_ARGS=(
    --eval-interval 50
 )
 
+# Pipeline depth. 8 GPUs = TP2 x PP x DP, so PP=4 gives dp=1 -- the deepest
+# pipeline (and the most bubbles) on this node, which is where chunkflow's
+# benefit shows. The baseline arm must run at the same PP or the comparison is
+# "no bubbles vs bubbles", not "chunkflow vs no chunkflow".
+PP_SIZE="${PP_SIZE:=1}"
+
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size 1
+   --pipeline-model-parallel-size ${PP_SIZE}
    # chunkflow's StateStore is local to one sequence, so CP must stay 1.
    --context-parallel-size 1
    --expert-model-parallel-size 1
