@@ -233,6 +233,18 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     # Fp units are never backwarded, so nothing of theirs reaches the caller --
     # neither the token count nor the loss metrics.
     discarded: list = []
+
+    # A deadlock here shows up as nothing: no traceback, no log, GPUs idle. So
+    # when the trace is on, every rank also arms a watchdog that dumps all stacks
+    # and exits after a single op has taken this long -- a normal forward is
+    # sub-second, so 300s means stuck, not slow. The dump lands in the worker's
+    # stderr, which the job log does capture.
+    if trace:
+        import faulthandler
+
+        faulthandler.dump_traceback_later(
+            int(os.environ.get("RELAX_CHUNKFLOW_WATCHDOG_S", "120")), repeat=True, exit=True
+        )
     # (input, output) of every forward still owing a backward, keyed by unit: the
     # op order, not a FIFO, decides which one a ``B`` consumes.
     in_flight: dict[int, tuple] = {}
@@ -283,6 +295,14 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
             for idx, (kind, unit_id) in enumerate(ops):
                 unit = units[unit_id]
                 before, after = p2p_plan[idx]
+                if trace and mb_idx == 0:
+                    # One line per op, first micro-batch only: on a hang the last
+                    # line each stage printed is the op it never finished, and the
+                    # watchdog stack shows the call inside it.
+                    logger.info(
+                        f"[chunkflow-trace] pp{p2p_communicator.current_stage} mb{mb_idx} "
+                        f"op[{idx}/{len(ops)}]=({kind},{unit_id}) before={before} after={after}"
+                    )
 
                 if kind == "B":
                     if "recv_bwd" in before:
