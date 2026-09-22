@@ -38,6 +38,66 @@ MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
 
+# Fail here rather than deep inside transformers: an --hf-checkpoint that does
+# not exist is passed to ``cached_file`` as-is, which then treats the path as a
+# Hub repo id and dies with "Repo id must be in the form 'repo_name' or
+# 'namespace/repo_name'". Override with MODEL_DIR / DATA_DIR when this machine
+# keeps models and data beside (not under) EXP_DIR.
+for required in "${MODEL_DIR}/Qwen3-4B" "${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl"; do
+   if [ ! -e "${required}" ]; then
+      echo "ERROR: ${required} does not exist." >&2
+      echo "Set MODEL_DIR / DATA_DIR before running, e.g." >&2
+      echo "  export MODEL_DIR=/path/to/models DATA_DIR=/path/to/data" >&2
+      exit 1
+   fi
+done
+
+# ── ClearML ──────────────────────────────────────────────────────────────────
+# MetricsService builds its ClearML adapter inside a Ray Serve replica and
+# reports a missing config ONLY as a log line (relax/utils/metrics/service.py:128
+# catches the exception), so training runs to completion uploading nothing --
+# which is exactly how a 100-rollout run gets finished with no curves. Check
+# before burning the GPUs instead.
+CLEARML_CONF="${CLEARML_CONF:-${HOME}/clearml.conf}"
+CLEARML_PASSTHROUGH="CLEARML_API_HOST,CLEARML_API_ACCESS_KEY,CLEARML_API_SECRET_KEY,CLEARML_CONFIG_FILE,CLEARML_PROJECT,CLEARML_TASK,CLEARML_TAGS"
+
+if [ -z "${CLEARML_API_HOST:-}" ] && [ ! -f "${CLEARML_CONF}" ]; then
+   cat >&2 <<EOF
+ERROR: ClearML is not configured on this machine, so --use-clearml would upload
+nothing. Provide credentials one of two ways:
+
+  # 1. the conf file clearml looks for by default
+  cp <a-machine-that-has-one>:/root/clearml.conf ${CLEARML_CONF}
+
+  # 2. environment variables
+  export CLEARML_API_HOST=https://xray-clearml-api.devops.xiaohongshu.com/
+  export CLEARML_API_ACCESS_KEY=<access_key>
+  export CLEARML_API_SECRET_KEY=<secret_key>
+EOF
+   exit 1
+fi
+
+# The Serve replicas that do the uploading read their environment from the Ray
+# runtime env, not from this shell -- both entrypoints set
+# RAY_OVERRIDE_JOB_RUNTIME_ENV=1, which discards the submitting shell's env
+# rather than merging it. So carry the credentials across explicitly; without
+# this the adapter still fails to initialize and the run uploads nothing.
+if [ -f "${CLEARML_CONF}" ] && [ -z "${CLEARML_CONFIG_FILE:-}" ]; then
+   export CLEARML_CONFIG_FILE="${CLEARML_CONF}"
+fi
+# python3 below reads both of these from its own environment, so export first.
+export CLEARML_PASSTHROUGH
+export RUNTIME_ENV_JSON=$(python3 -c '
+import json, os
+env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+target = env.setdefault("env_vars", {})
+for name in os.environ["CLEARML_PASSTHROUGH"].split(","):
+    value = os.environ.get(name)
+    if value:
+        target[name] = value
+print(json.dumps(env))
+')
+
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
 CHUNK_SIZE="${CHUNK_SIZE:=2048}"
 if [ "${CHUNK_SIZE}" -gt 0 ]; then
@@ -178,3 +238,11 @@ if [ "${CHUNK_SIZE}" -gt 0 ] && ! grep -q "chunked attention installed" "${LOG_F
    echo "FAIL: chunkflow never installed -- this arm proves nothing." >&2
    exit 1
 fi
+
+# ClearML failures never fail the job, so the curves have to be confirmed here.
+if ! grep -q "ClearML adapter initialized" "${LOG_FILE}"; then
+   echo "WARNING: ClearML adapter never initialized -- this run uploaded no curves." >&2
+   grep -m1 "Failed to initialize ClearML adapter" "${LOG_FILE}" >&2 || true
+   exit 1
+fi
+grep -m1 "Saving clearml log to project" "${LOG_FILE}" || true

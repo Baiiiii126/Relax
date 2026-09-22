@@ -45,9 +45,19 @@ NUM_EPOCH="${NUM_EPOCH:=2}"
 
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
 CHUNK_SIZE="${CHUNK_SIZE:=512}"
+# 1 = drive chunks as the schedule's units (new); 0 = chunk inside one forward.
+SCHEDULE="${SCHEDULE:=0}"
+PACK_POLICY="${PACK_POLICY:=staggered}"
 if [ "${CHUNK_SIZE}" -gt 0 ]; then
    CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE})
    ARM="chunk${CHUNK_SIZE}"
+   # SCHEDULE=1 switches from chunking inside one attention forward (verified)
+   # to running chunks as the schedule's units of work (new). Kept separate so
+   # a failure points at one of them.
+   if [ "${SCHEDULE}" -gt 0 ]; then
+      CHUNKFLOW_ARGS+=(--chunkflow-schedule --chunkflow-pack-policy "${PACK_POLICY}")
+      ARM="${ARM}-sched-${PACK_POLICY}"
+   fi
 else
    CHUNKFLOW_ARGS=()
    ARM="baseline"
