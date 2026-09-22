@@ -2680,6 +2680,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "path is not implemented yet, so a smaller value is rejected at parse time."
                 ),
             )
+            parser.add_argument(
+                "--chunkflow-pipeline",
+                type=int,
+                default=0,
+                help=(
+                    "Enable the pipelined chunkflow schedule. 0 (default) runs the PP=1 executor; a value equal "
+                    "to --pipeline-model-parallel-size runs the pipeline executor, driving chunks through the "
+                    "stages. The pipeline executor is not implemented yet -- setting it raises at parse time."
+                ),
+            )
             return parser
 
         def add_ci_arguments(parser):
@@ -3021,6 +3031,18 @@ def _validate_chunkflow_args(args) -> None:
         )
     if getattr(args, "chunkflow_keep_last_k", 0) < 0:
         raise ValueError(f"--chunkflow-keep-last-k must be >= 0 (0 keeps every chunk), got {args.chunkflow_keep_last_k}")
+    pipeline = getattr(args, "chunkflow_pipeline", 0)
+    if pipeline and pipeline != getattr(args, "pipeline_model_parallel_size", 1):
+        raise ValueError(
+            f"--chunkflow-pipeline ({pipeline}) must equal --pipeline-model-parallel-size "
+            f"({args.pipeline_model_parallel_size}) so the chunk plan and the pipeline agree."
+        )
+    if pipeline > 0:
+        raise NotImplementedError(
+            "--chunkflow-pipeline is wired but the pipeline executor is not implemented yet. "
+            "The scheduler already produces per-stage op orders (gen_state_aware_1f1b_ops); the missing piece is "
+            "driving them with p2p send/recv across stages."
+        )
 
 
 def _normalize_mtp_only_training_args(args) -> None:

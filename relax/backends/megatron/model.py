@@ -1174,11 +1174,16 @@ def train_one_step(
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
     if getattr(args, "use_chunkflow", False):
-        if mpu.get_pipeline_model_parallel_world_size() > 1:
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size > 1:
+            if getattr(args, "chunkflow_pipeline", 0) != pp_size:
+                raise NotImplementedError(
+                    f"chunkflow at --pipeline-model-parallel-size {pp_size} needs --chunkflow-pipeline {pp_size} "
+                    "(the pipeline executor is not implemented yet)."
+                )
             raise NotImplementedError(
-                "chunkflow's pipelined schedule is not implemented yet; --use-chunkflow currently runs at "
-                "--pipeline-model-parallel-size 1. The scheduler layer already produces per-stage op orders "
-                "(gen_state_aware_1f1b_ops), so this is the p2p driving that is missing."
+                "chunkflow's pipeline executor is not implemented yet: the scheduler already produces per-stage "
+                "op orders (gen_state_aware_1f1b_ops), so the missing piece is driving them with p2p send/recv."
             )
         from relax.backends.megatron.chunkflow.schedules import chunkflow_forward_backward_no_pipelining
 
