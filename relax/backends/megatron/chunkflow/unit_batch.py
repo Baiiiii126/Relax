@@ -11,6 +11,12 @@ with token *j+1*, so a unit covering parent rows ``[s, e)`` reports the
 parent's tokens ``[s+1, e+1)`` as targets -- never past the owning sequence's
 end. The unit's ``packed_seq_params`` stays chunk-local for the attention
 kernels and carries absolute offsets for RoPE.
+
+The result is a ``PrepackedBatch``: it is a slice *of* an already-processed
+micro-batch, so the second ``get_batch`` inside ``forward_step_func`` must hand
+it back untouched. Letting that pass run would recompute ``packed_seq_params``
+from the concatenated tokens as one sequence, losing both the per-segment
+``cu_seqlens`` and the unit attributes the attention reads.
 """
 
 from __future__ import annotations
@@ -98,16 +104,20 @@ def slice_parent_batch(
     offsets = [parent_cu[seg.seq_id] + seg.prefix for seg in segments]
     packed = _build_packed_seq_params(unit_tokens, lengths, offsets)
 
-    batch: dict = {
-        "tokens": unit_tokens.unsqueeze(0),
-        "unconcat_tokens": [unit_targets],
-        "full_loss_masks": full_mask.unsqueeze(0),
-        "loss_masks": [unit_mask],
-        "total_lengths": [sum(lengths) + 1],
-        "response_lengths": [sum(lengths)],
-        "max_seq_lens": [max(lengths)],
-        "packed_seq_params": packed,
-    }
+    from relax.backends.megatron.data import PrepackedBatch
+
+    batch: dict = PrepackedBatch(
+        {
+            "tokens": unit_tokens.unsqueeze(0),
+            "unconcat_tokens": [unit_targets],
+            "full_loss_masks": full_mask.unsqueeze(0),
+            "loss_masks": [unit_mask],
+            "total_lengths": [sum(lengths) + 1],
+            "response_lengths": [sum(lengths)],
+            "max_seq_lens": [max(lengths)],
+            "packed_seq_params": packed,
+        }
+    )
 
     _slice_response_aligned_keys(parent, batch, unit, rows)
     for key in ("__is_dummy__", "__loss_scale__", "replay_micro_batch_index"):

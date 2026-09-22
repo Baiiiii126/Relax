@@ -50,9 +50,9 @@ def _plan(parent: dict, chunk_size: int, policy: str, group_offset: int):
     """Chunks and execution units for one processed micro-batch.
 
     ``build_chunks`` numbers a dependency group by the sequence's index in this
-    micro-batch, so group ids repeat from one micro-batch to the next -- and the
-    runtime's stores live on the model across all of them. Offset by micro-batch
-    so a group id is unique for the whole step, not just the batch.
+    micro-batch, so group ids repeat from one micro-batch to the next -- and
+    the runtime's stores live on the model across all of them. Offset by micro-
+    batch so a group id is unique for the whole step, not just the batch.
     """
     cu = parent["packed_seq_params"].cu_seqlens_q_cpu
     lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
@@ -61,6 +61,16 @@ def _plan(parent: dict, chunk_size: int, policy: str, group_offset: int):
         if chunk.group is not None:
             chunk.group += group_offset
     return chunks, build_micro_batches(chunks, policy)
+
+
+def _num_microbatches(num_microbatches) -> int:
+    """``num_microbatches`` as an int -- the caller hands over an int, a list
+    or a 0-d tensor depending on the path."""
+    if isinstance(num_microbatches, (list, tuple)):
+        num_microbatches = num_microbatches[0]
+    elif torch.is_tensor(num_microbatches):
+        num_microbatches = int(num_microbatches.reshape(-1)[0])
+    return int(num_microbatches)
 
 
 def _forward_kwargs(batch: dict) -> dict:
@@ -100,12 +110,7 @@ def chunkflow_forward_backward_no_pipelining(
     # Unlike the streaming schedules -- which get a StreamingTQIterator and pull
     # until StopIteration -- the standard path hands us a DataIterator, which has
     # no __iter__: micro-batches come from get_next() and the caller owns the count.
-    num_mb = num_microbatches
-    if isinstance(num_mb, (list, tuple)):
-        num_mb = num_mb[0]
-    elif torch.is_tensor(num_mb):
-        num_mb = int(num_mb.reshape(-1)[0])
-    num_mb = int(num_mb)
+    num_mb = _num_microbatches(num_microbatches)
 
     from megatron.training.global_vars import get_args
 
