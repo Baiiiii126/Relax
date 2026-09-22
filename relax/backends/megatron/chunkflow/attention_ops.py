@@ -404,6 +404,17 @@ def _manual_varlen_backward(dout, q, k, v, lse, cu_q, cu_kv, causal, softmax_sca
     return torch.cat(dqs, dim=0), torch.cat(dks, dim=0), torch.cat(dvs, dim=0)
 
 
+def _max_seqlen(cu: torch.Tensor) -> int:
+    """Largest single-sequence length in a ``cu_seqlens``.
+
+    flash's varlen kernels want the per-sequence maximum, not the total. With
+    several sequences packed, ``cu[-1]`` is far larger than any one of them and
+    the kernel reads past the end of the packed rows -- an illegal memory
+    access, not a wrong number.
+    """
+    return max(int(cu[i + 1] - cu[i]) for i in range(cu.numel() - 1))
+
+
 def _flash_varlen(q, k, v, cu_q, cu_kv, causal, softmax_scale):
     fwd, _bwd = _flash_varlen_ops()
     out, lse, _s, _rng = fwd(
@@ -412,8 +423,8 @@ def _flash_varlen(q, k, v, cu_q, cu_kv, causal, softmax_scale):
         v,
         cu_q.to(torch.int32),
         cu_kv.to(torch.int32),
-        int(cu_q[-1]),
-        int(cu_kv[-1]),
+        _max_seqlen(cu_q),
+        _max_seqlen(cu_kv),
         0.0,
         softmax_scale,
         causal,
@@ -436,8 +447,8 @@ def _flash_varlen_backward(dout, q, k, v, out, lse, cu_q, cu_kv, causal, softmax
         dv,
         cu_q.to(torch.int32),
         cu_kv.to(torch.int32),
-        int(cu_q[-1]),
-        int(cu_kv[-1]),
+        _max_seqlen(cu_q),
+        _max_seqlen(cu_kv),
         0.0,
         softmax_scale,
         causal,
