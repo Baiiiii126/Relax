@@ -52,11 +52,20 @@ _BATCH_KEYS = (
 )
 
 
-def _plan(parent: dict, chunk_size: int, policy: str):
-    """Chunks and execution units for one processed micro-batch."""
+def _plan(parent: dict, chunk_size: int, policy: str, group_offset: int):
+    """Chunks and execution units for one processed micro-batch.
+
+    ``build_chunks`` numbers a dependency group by the sequence's index in this
+    micro-batch, so group ids repeat from one micro-batch to the next -- and the
+    runtime's stores live on the model across all of them. Offset by micro-batch
+    so a group id is unique for the whole step, not just the batch.
+    """
     cu = parent["packed_seq_params"].cu_seqlens_q_cpu
     lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
     chunks = build_chunks(lengths, chunk_size=chunk_size, repack_tail=False)
+    for chunk in chunks:
+        if chunk.group is not None:
+            chunk.group += group_offset
     return chunks, build_micro_batches(chunks, policy)
 
 
@@ -124,6 +133,7 @@ def chunkflow_forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     with no_sync_func():
+        group_offset = 0
         for _ in range(num_mb):
             parent_batch = data_iterator.get_next(_BATCH_KEYS)
             # get_batch's non-DataIterator branch unpacks a (batch, meta) pair
@@ -135,7 +145,8 @@ def chunkflow_forward_backward_no_pipelining(
                 args.qkv_format,
                 args.allgather_cp,
             )
-            chunks, units = _plan(parent, chunk_size, policy)
+            chunks, units = _plan(parent, chunk_size, policy, group_offset)
+            group_offset = max((c.group for c in chunks if c.group is not None), default=group_offset - 1) + 1
             ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
 
             pending: dict[int, torch.Tensor] = {}
