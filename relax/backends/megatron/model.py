@@ -1173,8 +1173,7 @@ def train_one_step(
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
-    use_chunkflow_schedule = getattr(args, "use_chunkflow", False) and getattr(args, "chunkflow_schedule", False)
-    if use_chunkflow_schedule:
+    if getattr(args, "use_chunkflow", False):
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             raise NotImplementedError(
                 "chunkflow's pipelined schedule is not implemented yet; --use-chunkflow currently runs at "

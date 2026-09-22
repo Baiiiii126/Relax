@@ -2659,17 +2659,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--chunkflow-schedule",
-                action="store_true",
-                default=False,
-                help=(
-                    "Run chunks as the schedule's units of work (one model forward per chunk, pipeline-aware "
-                    "ordering) instead of chunking inside a single attention forward. Off by default: the "
-                    "in-forward path is numerically verified and this one is new, so they are kept separable "
-                    "-- a failure then points at exactly one of them."
-                ),
-            )
-            parser.add_argument(
                 "--chunkflow-pack-policy",
                 type=str,
                 default="staggered",
@@ -3030,13 +3019,6 @@ def _validate_chunkflow_args(args) -> None:
             "splits the very sequence chunkflow caches in its per-layer StateStore. "
             "Remove one of the two."
         )
-    if getattr(args, "chunkflow_schedule", False) and not getattr(args, "use_chunkflow", False):
-        raise ValueError(
-            "--chunkflow-schedule requires --use-chunkflow: on its own it would select the chunked schedule "
-            "without installing the chunked attention the schedule drives."
-        )
-    if getattr(args, "chunkflow_keep_last_k", 0) and not getattr(args, "chunkflow_schedule", False):
-        raise ValueError("--chunkflow-keep-last-k only means something with --chunkflow-schedule.")
     if getattr(args, "chunkflow_keep_last_k", 0):
         raise ValueError(
             "--chunkflow-keep-last-k is not implemented yet: the recompute path (Fp/Fr) has no executor, so a "

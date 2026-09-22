@@ -94,6 +94,16 @@ def chunkflow_forward_backward_no_pipelining(
         assert len(data_iterator) == 1, "chunkflow schedule requires a single iterator"
         data_iterator = data_iterator[0]
 
+    # Unlike the streaming schedules -- which get a StreamingTQIterator and pull
+    # until StopIteration -- the standard path hands us a DataIterator, which has
+    # no __iter__: micro-batches come from get_next() and the caller owns the count.
+    num_mb = num_microbatches
+    if isinstance(num_mb, (list, tuple)):
+        num_mb = num_mb[0]
+    elif torch.is_tensor(num_mb):
+        num_mb = int(num_mb.reshape(-1)[0])
+    num_mb = int(num_mb)
+
     from megatron.training.global_vars import get_args
 
     from relax.backends.megatron.data import get_batch
@@ -114,7 +124,8 @@ def chunkflow_forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     with no_sync_func():
-        for parent_batch in data_iterator:
+        for _ in range(num_mb):
+            parent_batch = data_iterator.get_next(_BATCH_KEYS)
             parent = get_batch(
                 iter([parent_batch]), _BATCH_KEYS, args.data_pad_size_multiplier, args.qkv_format, args.allgather_cp
             )
