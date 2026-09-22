@@ -1178,16 +1178,27 @@ def train_one_step(
         if pp_size > 1:
             if getattr(args, "chunkflow_pipeline", 0) != pp_size:
                 raise NotImplementedError(
-                    f"chunkflow at --pipeline-model-parallel-size {pp_size} needs --chunkflow-pipeline {pp_size} "
-                    "(the pipeline executor is not implemented yet)."
+                    f"chunkflow at --pipeline-model-parallel-size {pp_size} needs --chunkflow-pipeline {pp_size}."
                 )
-            raise NotImplementedError(
-                "chunkflow's pipeline executor is not implemented yet: the scheduler already produces per-stage "
-                "op orders (gen_state_aware_1f1b_ops), so the missing piece is driving them with p2p send/recv."
+            from relax.backends.megatron.chunkflow.pipeline_schedules import (
+                chunkflow_forward_backward_pipelining_without_interleaving,
             )
-        from relax.backends.megatron.chunkflow.schedules import chunkflow_forward_backward_no_pipelining
+            # UNVERIFIED: this executor has not run end to end. Enable with
+            # RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1 once it has been validated at
+            # PP=2; it is not wired into any default path.
+            import os
 
-        forward_backward_func = chunkflow_forward_backward_no_pipelining
+            if os.environ.get("RELAX_CHUNKFLOW_PIPELINE_UNTESTED") != "1":
+                raise NotImplementedError(
+                    "chunkflow's pipeline executor is a skeleton that has not been validated. Validate it at PP=2 "
+                    "first, then set RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1 to use it. The scheduler already produces "
+                    "per-stage op orders (gen_state_aware_1f1b_ops); the p2p driving is what is untested."
+                )
+            forward_backward_func = chunkflow_forward_backward_pipelining_without_interleaving
+        else:
+            from relax.backends.megatron.chunkflow.schedules import chunkflow_forward_backward_no_pipelining
+
+            forward_backward_func = chunkflow_forward_backward_no_pipelining
     elif use_streaming:
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size <= 1:
