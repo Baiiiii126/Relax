@@ -321,6 +321,10 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         current_microbatch=mb_idx,
                         is_last_stage=is_last,
                     )
+                    # A keep unit's output was pseudo-freed right after it was
+                    # sent; the recompute's is fresh, so free it the same way
+                    # before backward_step -- custom_backward asserts on it.
+                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
                 else:
                     input_tensor, output_tensor = in_flight.pop(unit_id)
                 input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
