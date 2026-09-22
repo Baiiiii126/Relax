@@ -46,9 +46,16 @@ NUM_EPOCH="${NUM_EPOCH:=2}"
 # 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
 CHUNK_SIZE="${CHUNK_SIZE:=512}"
 PACK_POLICY="${PACK_POLICY:=staggered}"
+# 0 = keep every chunk's activation (no recompute). >0 = recompute the earlier
+# ones of a group, keeping only this many. Only meaningful with CHUNK_SIZE > 0.
+KEEP_LAST_K="${KEEP_LAST_K:=0}"
 if [ "${CHUNK_SIZE}" -gt 0 ]; then
    CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE} --chunkflow-pack-policy "${PACK_POLICY}")
    ARM="chunk${CHUNK_SIZE}-${PACK_POLICY}"
+   if [ "${KEEP_LAST_K}" -gt 0 ]; then
+      CHUNKFLOW_ARGS+=(--chunkflow-keep-last-k ${KEEP_LAST_K})
+      ARM="${ARM}-k${KEEP_LAST_K}"
+   fi
 else
    CHUNKFLOW_ARGS=()
    ARM="baseline"
