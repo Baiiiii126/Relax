@@ -53,6 +53,10 @@ KEEP_LAST_K="${KEEP_LAST_K:=1}"
 if [ "${CHUNK_SIZE}" -gt 0 ]; then
    CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE} --chunkflow-pack-policy "${PACK_POLICY}")
    ARM="chunk${CHUNK_SIZE}-${PACK_POLICY}"
+   if [ "${PP_SIZE}" -gt 1 ]; then
+      CHUNKFLOW_ARGS+=(--chunkflow-pipeline ${PP_SIZE})
+      ARM="${ARM}-pp${PP_SIZE}"
+   fi
    if [ "${KEEP_LAST_K}" -gt 0 ]; then
       CHUNKFLOW_ARGS+=(--chunkflow-keep-last-k ${KEEP_LAST_K})
       ARM="${ARM}-k${KEEP_LAST_K}"
