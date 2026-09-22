@@ -3019,11 +3019,8 @@ def _validate_chunkflow_args(args) -> None:
             "splits the very sequence chunkflow caches in its per-layer StateStore. "
             "Remove one of the two."
         )
-    if getattr(args, "chunkflow_keep_last_k", 0):
-        raise ValueError(
-            "--chunkflow-keep-last-k is not implemented yet: the recompute path (Fp/Fr) has no executor, so a "
-            "value below the group size would silently be ignored. Leave it at 0."
-        )
+    if getattr(args, "chunkflow_keep_last_k", 0) < 0:
+        raise ValueError(f"--chunkflow-keep-last-k must be >= 0 (0 keeps every chunk), got {args.chunkflow_keep_last_k}")
 
 
 def _normalize_mtp_only_training_args(args) -> None:

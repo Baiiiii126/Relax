@@ -275,3 +275,59 @@ def test_unit_mode_leaves_no_state_behind_after_release():
     runtime = ChunkflowRuntime(16)
     assert runtime.num_stores() == 0
     runtime.assert_empty("a fresh runtime")
+
+
+def test_unit_mode_recompute_matches_keep_everything():
+    """Fp/Fr must give identical gradients to keeping every chunk's activation.
+
+    A group long enough to drop some chunks (keep_last_k=1 of 4) forwards the
+    early ones under no_grad, recomputes them before their own backward. The
+    gradients must equal the keep-everything path exactly -- the mechanism is an
+    exact re-derivation, so any difference is a bug, not noise.
+    """
+    torch.manual_seed(0)
+    total, h, d, chunk_size = 64, 2, 8, 16
+    q, k, v = _qkv(total, h, d)
+    dout = torch.randn(total, h * d) * 0.1
+
+    def run(keep_last_k):
+        from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
+        from relax.backends.megatron.chunkflow.scheduler import build_chunks, gen_state_aware_1f1b_ops
+        from relax.backends.megatron.chunkflow.units import build_micro_batches, gen_unit_ops
+
+        runtime = ChunkflowRuntime(chunk_size)
+        attn = _unit_attn(chunk_size)
+        attn.runtime = runtime
+        chunks = build_chunks([total], chunk_size=chunk_size, repack_tail=False)
+        units = build_micro_batches(chunks, "staggered")
+        ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
+
+        qq = q.detach().clone().requires_grad_(True)
+        kk = k.detach().clone().requires_grad_(True)
+        vv = v.detach().clone().requires_grad_(True)
+        _bounds = {u.unit_id: (u.chunks[0].segments[0].prefix, sum(s.length for c in u.chunks for s in c.segments)) for u in units}
+        def dout_for(uid):
+            s_, n_ = _bounds[uid]
+            return dout[s_ : s_ + n_]
+        pending = {}
+        for kind, uid in ops:
+            unit = units[uid]
+            if kind == "B":
+                pending.pop(uid).backward(dout_for(uid))
+                continue
+            n = sum(s.length for chunk in unit.chunks for s in chunk.segments)
+            # slice the unit's rows out of the parent
+            start = unit.chunks[0].segments[0].prefix
+            packed = SimpleNamespace(cu_seqlens_q_cpu=[0, n], **{UNIT_ATTR: unit, RECOMPUTE_ATTR: kind == "Fr"})
+            q_u, k_u, v_u = qq[start : start + n], kk[start : start + n], vv[start : start + n]
+            if kind == "Fp":
+                with torch.no_grad():
+                    attn(q_u, k_u, v_u, packed_seq_params=packed)
+            else:
+                pending[uid] = attn(q_u, k_u, v_u, packed_seq_params=packed)
+        return qq.grad, kk.grad, vv.grad
+
+    full = run(keep_last_k=1 << 30)
+    recomputed = run(keep_last_k=1)
+    for f, r in zip(full, recomputed):
+        torch.testing.assert_close(f, r, atol=1e-9, rtol=1e-9)

@@ -24,7 +24,7 @@ import torch
 from torch import nn
 
 from relax.backends.megatron.chunkflow.attention_ops import chunk_attention_forward
-from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
+from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from relax.backends.megatron.chunkflow.state_store import ChunkState, StateStore
 from relax.utils.logging_utils import get_logger
 
@@ -92,6 +92,7 @@ class ChunkedCoreAttention(nn.Module):
         from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
 
         unit = getattr(packed_seq_params, UNIT_ATTR, None)
+        recompute = getattr(packed_seq_params, RECOMPUTE_ATTR, False)
         cu = packed_seq_params.cu_seqlens_q_cpu
         meta = [(c.group, c.group_idx) for c in unit.chunks for _ in c.segments]
 
@@ -105,11 +106,18 @@ class ChunkedCoreAttention(nn.Module):
                 continue
 
             store = self.runtime.store(self.layer_number, group)
-            if _chunkflow_trace():
-                logger.info(f"[chunkflow-trace] put layer={self.layer_number} group={group} idx={group_idx} live={store.live_chunk_ids}")
-            leaf_k = k_own.detach().requires_grad_(True)
-            leaf_v = v_own.detach().requires_grad_(True)
-            store.put(group_idx, ChunkState({"k": leaf_k, "v": leaf_v}))
+            if recompute:
+                # An Fp pass already put this chunk's K/V in the store as a leaf.
+                # Recompute only rebuilds this chunk's graph; re-putting would
+                # trip the store's ascending invariant.
+                states = store.lookup(group_idx)
+                leaf_k, leaf_v = states[-1].tensors["k"], states[-1].tensors["v"]
+            else:
+                if _chunkflow_trace():
+                    logger.info(f"[chunkflow-trace] put layer={self.layer_number} group={group} idx={group_idx} live={store.live_chunk_ids}")
+                leaf_k = k_own.detach().requires_grad_(True)
+                leaf_v = v_own.detach().requires_grad_(True)
+                store.put(group_idx, ChunkState({"k": leaf_k, "v": leaf_v}))
             _fold_leaf_grad_into(k_own, leaf_k)
             _fold_leaf_grad_into(v_own, leaf_v)
 

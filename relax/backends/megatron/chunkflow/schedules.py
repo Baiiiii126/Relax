@@ -25,7 +25,7 @@ from typing import Iterator, List, Optional, Union
 import torch
 from megatron.core import parallel_state
 
-from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR, attach_runtime
+from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, attach_runtime
 from relax.backends.megatron.chunkflow.scheduler import build_chunks
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import build_micro_batches, gen_unit_ops
@@ -124,6 +124,8 @@ def chunkflow_forward_backward_no_pipelining(
     # No recompute yet, so every chunk of a group keeps its activation. A group
     # larger than this would need the Fp/Fr path.
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
+    # Only K chunks of each group keep their activation; the rest go through
+    # Fp (no graph) and Fr (recompute before backward).
     runtime = attach_runtime(model, chunk_size)
 
     config = model.config if hasattr(model, "config") else None
@@ -171,10 +173,22 @@ def chunkflow_forward_backward_no_pipelining(
                         runtime.release_group(group)
                     continue
 
-                # No-recompute path: nothing emits Fp/Fr, so every forward builds
-                # the graph its own backward will use.
                 batch = slice_parent_batch(parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args)
                 batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
+                if kind == "Fp":
+                    # Forward that keeps only K/V: the attention writes its leaf
+                    # into the store, but under no_grad nothing else (no
+                    # activations, no graph) survives to backward. That is the
+                    # whole memory win -- the first N-K chunks of a group do
+                    # this instead of holding activations.
+                    batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, False)
+                    with torch.no_grad():
+                        model(**_forward_kwargs(batch))
+                    continue
+
+                # F keeps the graph from this pass; Fr rebuilds it right before
+                # the unit's own backward. Both end with a loss to backward.
+                batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, kind == "Fr")
                 output = model(**_forward_kwargs(batch))
                 loss, num_tokens, log = loss_function(args, batch, 1, output)
                 total_num_tokens += num_tokens

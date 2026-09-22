@@ -30,6 +30,10 @@ logger = get_logger(__name__)
 
 RUNTIME_ATTR = "chunkflow_runtime"
 UNIT_ATTR = "chunkflow_unit"
+# Set on packed_seq_params for an Fr op: this chunk's K/V leaf already lives in
+# the store from its Fp pass, so the attention must reuse it instead of putting
+# again (which would trip the store's ascending invariant).
+RECOMPUTE_ATTR = "chunkflow_recompute"
 
 
 class ChunkflowRuntime:
