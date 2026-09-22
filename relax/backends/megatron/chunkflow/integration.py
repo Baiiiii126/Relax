@@ -210,7 +210,11 @@ def _fold_leaf_grad_into(live: torch.Tensor, leaf: torch.Tensor) -> None:
     def hook(grad: torch.Tensor) -> torch.Tensor:
         return grad if leaf.grad is None else grad + leaf.grad
 
-    live.register_hook(hook)
+    # An Fp forward runs under no_grad, so its k/v carry no gradient and cannot
+    # take a hook -- and they do not need one: the leaf holds the K/V and the
+    # gradient lands via the Fr pass's recomputed tensors, which do carry it.
+    if live.requires_grad:
+        live.register_hook(hook)
 
 
 def _attention_modules(model):
