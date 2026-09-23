@@ -158,13 +158,6 @@ class ChunkedCoreAttention(nn.Module):
                 "SBHD would need its own causal-mask handling before it is safe to enable."
             )
 
-        # GQA: widen K/V heads to match Q before chunking, so the store holds
-        # what attention actually consumes.
-        if key.shape[1] != query.shape[1]:
-            repeat = query.shape[1] // key.shape[1]
-            key = key.repeat_interleave(repeat, dim=1)
-            value = value.repeat_interleave(repeat, dim=1)
-
         if packed_seq_params is not None and getattr(packed_seq_params, UNIT_ATTR, None) is not None:
             padded_rows = query.shape[0]
             out = self._forward_unit(query, key, value, packed_seq_params).reshape(-1, query.shape[1] * query.shape[2])

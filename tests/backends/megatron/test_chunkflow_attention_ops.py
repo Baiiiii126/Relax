@@ -387,6 +387,41 @@ def test_unit_attention_backward_matches_per_sequence_sdpa():
     torch.testing.assert_close(v_.grad, vr.grad, atol=1e-9, rtol=1e-9)
 
 
+def test_unit_attention_matches_compact_gqa_forward_and_backward():
+    torch.manual_seed(0)
+    h, kv_h, d = 4, 2, 8
+    cu_q = torch.tensor([0, 10, 20], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 30, 44], dtype=torch.int32)
+    q0 = torch.randn(20, h, d, dtype=torch.float64)
+    k0 = torch.randn(44, kv_h, d, dtype=torch.float64)
+    v0 = torch.randn(44, kv_h, d, dtype=torch.float64)
+    dout = torch.randn(20, h, d, dtype=torch.float64)
+
+    q_, k_, v_ = (tensor.clone().requires_grad_(True) for tensor in (q0, k0, v0))
+    got = _unit_attention(q_, k_, v_, cu_q, cu_kv)
+    got.backward(dout)
+
+    qr, kr, vr = (tensor.clone().requires_grad_(True) for tensor in (q0, k0, v0))
+    outs = []
+    repeat = h // kv_h
+    for ql, kl, qo, ko in ((10, 30, 0, 0), (10, 14, 10, 30)):
+        out = torch.nn.functional.scaled_dot_product_attention(
+            qr[qo : qo + ql].permute(1, 0, 2).unsqueeze(0),
+            kr[ko : ko + kl].repeat_interleave(repeat, dim=1).permute(1, 0, 2).unsqueeze(0),
+            vr[ko : ko + kl].repeat_interleave(repeat, dim=1).permute(1, 0, 2).unsqueeze(0),
+            attn_mask=_offset_causal_mask(ql, kl),
+            scale=d**-0.5,
+        )
+        outs.append(out.squeeze(0).permute(1, 0, 2))
+    want = torch.cat(outs)
+    want.backward(dout)
+
+    torch.testing.assert_close(got, want, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(q_.grad, qr.grad, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(k_.grad, kr.grad, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(v_.grad, vr.grad, atol=1e-9, rtol=1e-9)
+
+
 def test_unit_attention_gradients_do_not_leak_across_sequences():
     """Gradient on one sequence's K/V must come only from that sequence's own
     queries -- the property that makes packing several sequences into one call

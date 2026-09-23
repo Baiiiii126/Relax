@@ -31,6 +31,7 @@ def _manual_attn_forward(
     """
     tq, h, _d = q.shape
     tk = k.shape[0]
+    k, v, _repeat = _expand_kv_heads(k, v, h)
     q_h = q.permute(1, 0, 2)  # [H, Tq, D]
     k_h = k.permute(1, 0, 2)  # [H, Tk, D]
     v_h = v.permute(1, 0, 2)  # [H, Tk, D]
@@ -61,8 +62,10 @@ def _manual_attn_backward(
     """Reference causal-attention backward, recomputing attention probabilities
     from the saved ``lse`` (no attention-probability matrix needs to survive
     from forward to backward — same trick real flash attention uses)."""
-    tq, _h, _d = q.shape
+    tq, h, _d = q.shape
     tk = k.shape[0]
+    kv_heads = k.shape[1]
+    k, v, repeat = _expand_kv_heads(k, v, h)
     q_h = q.permute(1, 0, 2)
     k_h = k.permute(1, 0, 2)
     v_h = v.permute(1, 0, 2)
@@ -85,7 +88,21 @@ def _manual_attn_backward(
     dq = dq_h.permute(1, 0, 2).contiguous()
     dk = dk_h.permute(1, 0, 2).contiguous()
     dv = dv_h.permute(1, 0, 2).contiguous()
+    if repeat > 1:
+        dk = dk.reshape(tk, kv_heads, repeat, _d).sum(dim=2)
+        dv = dv.reshape(tk, kv_heads, repeat, _d).sum(dim=2)
     return dq, dk, dv
+
+
+def _expand_kv_heads(k: torch.Tensor, v: torch.Tensor, query_heads: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Expand compact GQA K/V only for the plain-torch reference path."""
+    kv_heads = k.shape[1]
+    if kv_heads == query_heads:
+        return k, v, 1
+    if query_heads % kv_heads != 0:
+        raise ValueError(f"query heads ({query_heads}) must be divisible by KV heads ({kv_heads})")
+    repeat = query_heads // kv_heads
+    return k.repeat_interleave(repeat, dim=1), v.repeat_interleave(repeat, dim=1), repeat
 
 
 def _causal_mask(tq: int, tk: int, device: torch.device) -> torch.Tensor:

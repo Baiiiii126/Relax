@@ -81,6 +81,22 @@ def test_chunkflow_backward_matches_sdpa():
         torch.testing.assert_close(got.grad, want.grad, rtol=1e-9, atol=1e-9)
 
 
+def test_chunkflow_backward_matches_sdpa_with_gqa():
+    q, k, v = _qkv(t=8, h=4, d=4, kv_heads=2)
+    q_ref, k_ref, v_ref = (t.clone().requires_grad_(True) for t in (q, k, v))
+    q_chk, k_chk, v_chk = (t.clone().requires_grad_(True) for t in (q, k, v))
+
+    _sdpa_reference(
+        q_ref,
+        k_ref.repeat_interleave(2, dim=1),
+        v_ref.repeat_interleave(2, dim=1),
+    ).sum().backward()
+    _attn(chunk_size=3)(q_chk, k_chk, v_chk).sum().backward()
+
+    for got, want in ((q_chk, q_ref), (k_chk, k_ref), (v_chk, v_ref)):
+        torch.testing.assert_close(got.grad, want.grad, rtol=1e-9, atol=1e-9)
+
+
 def test_chunkflow_context_parallel_is_rejected():
     q, k, v = _qkv(t=4, h=2, d=4)
     with pytest.raises(NotImplementedError, match="context parallelism"):
@@ -144,7 +160,8 @@ def test_chunkflow_matches_flash_varlen_on_training_shapes():
     # autograd in bf16, where the oracle sums inside one kernel in fp32. That
     # is chunking's cost, not a bug: re-running this with chunk_size past the
     # sequence length makes dk/dv bit-exact (0.0), and dropping GQA leaves them
-    # unchanged (7.04e-03 / 5.59e-03), which rules out the head widening.
+    # unchanged (7.04e-03 / 5.59e-03), so the residual comes from per-chunk
+    # accumulation rather than compact GQA.
     rels = {
         name: ((got.float() - want.float()).abs().max() / want.float().abs().max()).item()
         for name, got, want in zip(("dq", "dk", "dv"), run(chunked), run(reference))
