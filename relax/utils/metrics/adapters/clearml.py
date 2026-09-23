@@ -96,7 +96,8 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
         )
         self._connect_git_metadata(args)
         logger.info(
-            f"Saving clearml log to project: {self.project_name}, experiment: {self.experiment_name}, tags: {self.tags}"
+            f"Saving clearml log to project: {self.project_name}, experiment: {self.experiment_name}, "
+            f"tags: {self.tags}, url: {self._task.get_output_log_web_page()}"
         )
 
     def _get_task_info(self, args):

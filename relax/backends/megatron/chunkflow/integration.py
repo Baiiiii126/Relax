@@ -12,7 +12,6 @@ attention. ``install(model, chunk_size)`` swaps every ``core_attention``;
 from __future__ import annotations
 
 import itertools
-import os
 
 import torch
 from torch import nn
@@ -26,10 +25,6 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 _ORIG_ATTR = "_chunkflow_original_core_attention"
-
-
-def _chunkflow_trace() -> bool:
-    return os.environ.get("RELAX_CHUNKFLOW_TRACE") == "1"
 
 
 def split_sizes(total: int, chunk_size: int) -> list[int]:
@@ -105,8 +100,6 @@ class ChunkedCoreAttention(nn.Module):
                 states = store.lookup(group_idx)
                 leaf_k, leaf_v = states[-1].tensors["k"], states[-1].tensors["v"]
             else:
-                if _chunkflow_trace():
-                    logger.info(f"[chunkflow-trace] put layer={self.layer_number} group={group} idx={group_idx} live={store.live_chunk_ids}")
                 leaf_k = k_own.detach().requires_grad_(True)
                 leaf_v = v_own.detach().requires_grad_(True)
                 store.put(group_idx, ChunkState({"k": leaf_k, "v": leaf_v}))
@@ -221,13 +214,6 @@ def install(model, chunk_size: int) -> int:
     from relax.backends.megatron.chunkflow import rope as chunkflow_rope
 
     chunkflow_rope.install()
-
-    if os.environ.get("RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION") == "1":
-        logger.warning(
-            "chunkflow: original core attention retained for single-unit alignment; "
-            "do not use this diagnostic mode with dependent chunks"
-        )
-        return 0
 
     # The unit path needs RoPE's unfused branch: it applies the position offset
     # chunkflow patches in, while Transformer Engine's fused_rope kernel takes

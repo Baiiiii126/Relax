@@ -42,10 +42,6 @@ from megatron.core.utils import get_model_config
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import classify_units, completed_groups, make_unit_bwd_order
-from relax.utils.logging_utils import get_logger
-
-
-logger = get_logger(__name__)
 
 
 def _no_loss_step_func(forward_step_func):
@@ -102,12 +98,6 @@ def _pipeline_schedule(units, chunks, keep_last_k, pp, stage):
     return fwd_seq, bwd_seq, need_fr, W
 
 
-def _trace(enabled: bool, mb_idx: int, msg: str) -> None:
-    if not enabled or parallel_state.get_data_parallel_rank() != 0:
-        return
-    logger.info(f"[chunkflow-trace] pp{parallel_state.get_pipeline_model_parallel_rank()} mb{mb_idx}: {msg}")
-
-
 def chunkflow_forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -140,8 +130,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     if config.overlap_p2p_comm:
         raise ValueError("chunkflow pipeline schedule does not support overlap_p2p_comm")
 
-    import os
-
     from megatron.training.global_vars import get_args
 
     from relax.backends.megatron.chunkflow.schedules import _BATCH_KEYS, _num_microbatches, _plan
@@ -151,7 +139,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     chunk_size = int(args.chunkflow_chunk_size)
     policy = getattr(args, "chunkflow_pack_policy", "staggered")
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
-    trace = os.environ.get("RELAX_CHUNKFLOW_TRACE") == "1"
     runtime = require_runtime(model)
 
     if p2p_communicator is None and pg_collection is None:
@@ -234,8 +221,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 units, chunks, keep_last_k, p2p_communicator.total_stages, p2p_communicator.current_stage
             )
             n = len(fwd_seq)
-            _trace(trace, mb_idx, f"fwd={fwd_seq} bwd={bwd_seq} W={W} n={n} need_fr={sorted(need_fr)}")
-
             def do_forward(unit_id, input_tensor, mb_idx):
                 """One unit's forward through this stage.
 

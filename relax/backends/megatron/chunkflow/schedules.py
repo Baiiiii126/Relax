@@ -23,10 +23,6 @@ from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR,
 from relax.backends.megatron.chunkflow.scheduler import build_chunks
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
-from relax.utils.logging_utils import get_logger
-
-
-logger = get_logger(__name__)
 
 # Keys ``forward_step`` would have asked ``get_batch`` for. Kept in sync with
 # model.py's list; a key absent from the rollout data comes back None.
@@ -138,17 +134,6 @@ def chunkflow_forward_backward_no_pipelining(
             )
             chunks, units = _plan(parent, chunk_size, policy)
             ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
-
-            import os as _os
-
-            if _os.environ.get("RELAX_CHUNKFLOW_TRACE") == "1":
-                from megatron.core import parallel_state as _mpu
-
-                if _mpu.get_data_parallel_rank() == 0:
-                    logger.info(
-                        f"[chunkflow-trace] microbatch: {len(chunks)} chunks, "
-                        f"groups={sorted({(c.group, c.group_idx) for c in chunks if c.group is not None})}, ops={ops}"
-                    )
 
             pending: dict[int, torch.Tensor] = {}
             for kind, unit_id in ops:
