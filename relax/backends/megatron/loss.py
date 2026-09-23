@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -10,6 +11,7 @@ from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
+from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
@@ -44,6 +46,9 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+
+
+logger = get_logger(__name__)
 
 
 def get_responses(
@@ -1485,16 +1490,18 @@ def loss_function(
     # normalizer is correct even when CP differs across micro-batches (dynamic CP).
     # Under static CP it equals the old full-sample count distributed across ranks,
     # so the final loss/grad/metric are unchanged after all-reduce.
-    num_tokens = get_cp_local_num_tokens(
-        batch["total_lengths"],
-        batch["response_lengths"],
-        batch["loss_masks"],
-        args.qkv_format,
-        batch.get("max_seq_lens", None),
-        batch.get("padded_total_lengths", None),
-        dynamic_cp_size=batch.get("dynamic_cp_size", None),
-        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
-    )
+    num_tokens = batch.get("__num_tokens_override__")
+    if num_tokens is None:
+        num_tokens = get_cp_local_num_tokens(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            args.qkv_format,
+            batch.get("max_seq_lens", None),
+            batch.get("padded_total_lengths", None),
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1543,6 +1550,20 @@ def loss_function(
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    if os.environ.get("RELAX_LOSS_ALIGNMENT_TRACE") == "1" and args.loss_type == "sft":
+        unit = getattr(batch.get("packed_seq_params"), "chunkflow_unit", None)
+        unit_id = getattr(unit, "unit_id", "baseline")
+        raw_loss = log.get("loss", loss.detach())
+        normalized_loss = raw_loss / num_tokens.clamp_min(1)
+        logger.info(
+            "[loss-alignment] unit=%s logits_shape=%s num_tokens=%.0f loss_sum=%.9f normalized_loss=%.9f",
+            unit_id,
+            tuple(logits.shape),
+            num_tokens.detach().float().item(),
+            raw_loss.detach().float().item(),
+            normalized_loss.detach().float().item(),
+        )
 
     # M2PO scalar metrics are global (not per-token). When calculate_per_token_loss=True
     # the framework divides all log values by num_tokens, so pre-multiply to cancel.

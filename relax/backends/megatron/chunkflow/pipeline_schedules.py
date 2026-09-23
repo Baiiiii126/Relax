@@ -39,9 +39,9 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.utils import get_model_config
 
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, attach_runtime
+from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
-from relax.backends.megatron.chunkflow.units import classify_units, make_unit_bwd_order
+from relax.backends.megatron.chunkflow.units import classify_units, completed_groups, make_unit_bwd_order
 from relax.utils.logging_utils import get_logger
 
 
@@ -152,7 +152,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     policy = getattr(args, "chunkflow_pack_policy", "staggered")
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
     trace = os.environ.get("RELAX_CHUNKFLOW_TRACE") == "1"
-    runtime = attach_runtime(model, chunk_size)
+    runtime = require_runtime(model)
 
     if p2p_communicator is None and pg_collection is None:
         from megatron.core.pipeline_parallel.schedules import ProcessGroupCollection
@@ -212,13 +212,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
     discarded: list = []
     fp_step_func = _no_loss_step_func(forward_step_func)
-
-    if trace:
-        import faulthandler
-
-        faulthandler.dump_traceback_later(
-            int(os.environ.get("RELAX_CHUNKFLOW_WATCHDOG_S", "120")), repeat=True, exit=True
-        )
+    first_forward = True
 
     def next_parent() -> dict:
         get_next = getattr(data_iterator, "get_next", None)
@@ -234,9 +228,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     with no_sync_func():
         for mb_idx in range(_num_microbatches(num_microbatches)):
             parent = next_parent()
-            chunks, units = _plan(parent, chunk_size, policy, runtime.next_group_offset(None))
-            used_max = max((c.group for c in chunks if c.group is not None), default=None)
-            runtime.next_group_offset(used_max)
+            chunks, units = _plan(parent, chunk_size, policy)
             by_id = {u.unit_id: u for u in units}
             fwd_seq, bwd_seq, need_fr, W = _pipeline_schedule(
                 units, chunks, keep_last_k, p2p_communicator.total_stages, p2p_communicator.current_stage
@@ -250,6 +242,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 Fp runs under no_grad (K/V only) and keeps the input for the
                 later recompute; F and Fr build a graph and take a loss.
                 """
+                nonlocal first_forward
                 unit = by_id[unit_id]
                 batch = slice_parent_batch(parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args)
                 batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
@@ -266,10 +259,11 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                             config,
                             cp_group_size=cp_size,
                             collect_non_loss_data=False,
-                            is_first_microbatch=(mb_idx == 0),
+                            is_first_microbatch=first_forward,
                             current_microbatch=mb_idx,
                             is_last_stage=is_last,
                         )
+                    first_forward = False
                     return output_tensor, input_tensor, None
                 output_tensor, num_tokens = forward_step(
                     forward_step_func,
@@ -281,10 +275,11 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                     config,
                     cp_group_size=cp_size,
                     collect_non_loss_data=False,
-                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, mb_idx == 0),
+                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, first_forward),
                     current_microbatch=mb_idx,
                     is_last_stage=is_last,
                 )
+                first_forward = False
                 return output_tensor, input_tensor, num_tokens
 
             # (input, output) of keep units still owing a backward, and the input
@@ -328,7 +323,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 else:
                     input_tensor, output_tensor = in_flight.pop(unit_id)
                 input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-                for group in by_id[unit_id].groups:
+                for group in completed_groups(by_id[unit_id]):
                     runtime.release_group(group)
                 return input_tensor_grad, fr_num_tokens
 
@@ -387,6 +382,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                     f"chunkflow pipeline: mb{mb_idx} ended with {len(in_flight)} forwarded and "
                     f"{len(fp_inputs)} unrecomputed unit(s) -- schedule bug"
                 )
+            runtime.assert_empty(f"chunkflow PP={p2p_communicator.total_stages} micro-batch {mb_idx}")
 
     if config.grad_sync_func is not None:
         config.grad_sync_func(model.parameters())

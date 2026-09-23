@@ -22,7 +22,7 @@ try:
 
     from relax.backends.megatron.chunkflow import rope as cf_rope
     from relax.backends.megatron.chunkflow.scheduler import build_chunks
-    from relax.backends.megatron.chunkflow.unit_batch import _rows_for_unit, slice_parent_batch
+    from relax.backends.megatron.chunkflow.unit_batch import _rope_offsets, _rows_for_unit, slice_parent_batch
     from relax.backends.megatron.chunkflow.units import build_micro_batches
 except Exception as exc:
     pytest.skip(f"relax.backends.megatron.chunkflow unavailable: {exc}", allow_module_level=True)
@@ -198,6 +198,18 @@ def test_summed_unit_loss_equals_the_parent_loss():
     torch.testing.assert_close(total, whole)
 
 
+def test_unit_token_normalizers_sum_to_the_parent_without_clamping_empty_chunks():
+    """Prompt-only chunks contribute zero, not one, to step normalization."""
+    lengths = [40]
+    parent = _parent(lengths)
+    units, _ = _units(lengths, 16)
+
+    counts = [slice_parent_batch(parent, unit, pad_token_id=PAD)["__num_tokens_override__"] for unit in units]
+
+    assert any(count.item() == 0 for count in counts), "fixture must include a fully masked prompt chunk"
+    torch.testing.assert_close(torch.stack(counts).sum(), parent["full_loss_masks"].sum())
+
+
 def test_rope_offset_is_applied_only_when_there_is_a_prefix():
     lengths = [40]
     parent = _parent(lengths)
@@ -244,3 +256,18 @@ def test_padding_is_applied_without_counting_toward_the_loss():
             assert (tokens[real:] == PAD).all()
             # The full mask is padded to match tokens; Response length stays real.
             assert batch["full_loss_masks"].shape == batch["tokens"].shape
+
+
+def test_rope_offsets_are_local_to_each_original_sequence():
+    units, _ = _units([40, 40], 16)
+    second_sequence_units = [unit for unit in units if unit.chunks[0].segments[0].seq_id == 1]
+
+    assert [_rope_offsets(unit) for unit in second_sequence_units] == [[0], [16], [32]]
+
+
+def test_lockstep_dependent_units_fail_closed_until_per_segment_rope_exists():
+    units, _ = _units([40, 40], 16, "lockstep")
+    merged = next(unit for unit in units if unit.is_dependent and len(unit.chunks) > 1)
+
+    with pytest.raises(NotImplementedError, match="per-segment RoPE offsets"):
+        _rope_offsets(merged)

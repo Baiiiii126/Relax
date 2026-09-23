@@ -20,6 +20,7 @@ import torch
 
 
 try:
+    from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime, require_runtime
     from relax.backends.megatron.chunkflow.state_store import ChunkState, StateStore, StateStoreError
 except Exception as exc:
     pytest.skip(f"relax.backends.megatron.chunkflow unavailable: {exc}", allow_module_level=True)
@@ -141,3 +142,17 @@ def test_ascending_put_then_descending_free_is_a_sawtooth():
     assert sizes_after_free[-1] == 0
     assert len(store) == 0
     assert sizes_after_put[-1] == peak  # peak occurs exactly when fully built, before any free
+
+
+def test_schedule_reuses_runtime_installed_below_model_wrappers():
+    class Wrapper:
+        def __init__(self, module):
+            self.module = module
+
+    bare = Wrapper(None)
+    runtime = ChunkflowRuntime(chunk_size=16)
+    bare.chunkflow_runtime = runtime
+    wrapped = Wrapper(Wrapper(bare))
+
+    assert require_runtime(wrapped) is runtime
+    assert not hasattr(wrapped, "chunkflow_runtime")

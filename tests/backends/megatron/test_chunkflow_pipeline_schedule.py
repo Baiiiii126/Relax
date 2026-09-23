@@ -161,8 +161,6 @@ def _schedule(lengths, pp, policy, k, stage):
 def test_pipeline_plan_never_deadlocks(lengths, pp, policy, k):
     chunks, units, (fwd_seq, bwd_seq, need_fr, W0) = _schedule(lengths, pp, policy, k, 0)
     n = len(fwd_seq)
-    if n < pp:
-        pytest.skip("fewer units than stages")
     calls = []
     for stage in range(pp):
         _, _, _, W = _schedule(lengths, pp, policy, k, stage)[2]

@@ -187,6 +187,16 @@ def make_unit_bwd_order(units: Sequence[Unit], fwd_order: Sequence[int]) -> list
     return out
 
 
+def completed_groups(unit: Unit) -> frozenset[int]:
+    """Groups whose final (lowest-index) backward is performed by ``unit``.
+
+    Dependent chunks backward in descending ``group_idx`` order. A group's
+    StateStore must therefore survive until its index-0 chunk has backwarded;
+    releasing it on the first (highest-index) backward breaks Fp/Fr recompute.
+    """
+    return frozenset(c.group for c in unit.chunks if c.is_dependent and c.group_idx == 0)
+
+
 def gen_unit_ops(
     units: Sequence[Unit],
     chunks: Sequence[Chunk],

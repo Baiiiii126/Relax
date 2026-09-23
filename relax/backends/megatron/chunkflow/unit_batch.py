@@ -40,6 +40,17 @@ def _rows_for_unit(parent_cu: Sequence[int], unit: Unit) -> list[tuple[int, int]
     return [_segment_rows(parent_cu, s) for seg in unit.chunks for s in seg.segments]
 
 
+def _rope_offsets(unit: Unit) -> list[int]:
+    """Return sequence-local RoPE offsets, rejecting unsupported packing."""
+    segments = [seg for chunk in unit.chunks for seg in chunk.segments]
+    if unit.is_dependent and len(segments) > 1:
+        raise NotImplementedError(
+            "chunkflow lockstep units with multiple dependent segments need per-segment RoPE offsets; "
+            "use --chunkflow-pack-policy staggered for numerically correct training"
+        )
+    return [seg.prefix for seg in segments]
+
+
 def slice_parent_batch(
     parent: dict,
     unit: Unit,
@@ -101,7 +112,11 @@ def slice_parent_batch(
         )
         full_mask = torch.cat([full_mask, torch.zeros(pad, dtype=unit_mask.dtype, device=unit_mask.device)])
 
-    offsets = [parent_cu[seg.seq_id] + seg.prefix for seg in segments]
+    # RoPE positions restart at zero for every packed sequence in the baseline.
+    # ``seg.prefix`` is therefore already the absolute position within its own
+    # sequence; adding the packed batch's row offset corrupts every sequence
+    # after the first one.
+    offsets = _rope_offsets(unit)
     packed = _build_packed_seq_params(unit_tokens, lengths, offsets)
 
     from relax.backends.megatron.data import PrepackedBatch
@@ -112,6 +127,12 @@ def slice_parent_batch(
             "unconcat_tokens": [unit_targets],
             "full_loss_masks": full_mask.unsqueeze(0),
             "loss_masks": [unit_mask],
+            # ``get_cp_local_num_tokens`` clamps every sample's count to at
+            # least one. A unit is only a slice of a sample, so applying that
+            # clamp per unit over-counts prompt-only chunks and changes the
+            # step's gradient normalization. Preserve the exact additive
+            # count for the ChunkFlow loss path instead.
+            "__num_tokens_override__": unit_mask.sum(),
             "total_lengths": [sum(lengths) + 1],
             "response_lengths": [sum(lengths)],
             "max_seq_lens": [max(lengths)],

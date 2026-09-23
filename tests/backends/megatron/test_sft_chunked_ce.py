@@ -579,6 +579,39 @@ def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configure
     assert captured_kwargs["use_reentrant"] is expected
 
 
+def test_loss_function_honors_chunkflow_token_count_override(monkeypatch):
+    def spy_checkpoint(_function, *args, **kwargs):
+        return torch.tensor(0.0), {"loss": torch.tensor(0.0)}
+
+    def unexpected_default_count(*args, **kwargs):
+        raise AssertionError("ChunkFlow's exact unit count must bypass per-sample clamp_min(1)")
+
+    monkeypatch.setattr(_loss_mod, "checkpoint", spy_checkpoint)
+    monkeypatch.setattr(_loss_mod, "get_cp_local_num_tokens", unexpected_default_count)
+    monkeypatch.setattr(_loss_mod, "get_sum_of_sample_mean", lambda *args, **kwargs: object())
+
+    args = Namespace(
+        loss_type="sft",
+        recompute_loss_function=True,
+        sft_chunked_logits=False,
+        qkv_format="thd",
+        calculate_per_token_loss=True,
+        allgather_cp=False,
+        global_batch_size=1,
+    )
+    batch = {
+        "total_lengths": [16],
+        "response_lengths": [16],
+        "loss_masks": [torch.zeros(16)],
+        "__num_tokens_override__": torch.tensor(0),
+    }
+
+    _, normalizer, log = _loss_mod.loss_function(args, batch, num_microbatches=1, logits=torch.ones(1))
+
+    assert normalizer.item() == 0
+    assert log["values"][0].item() == 0
+
+
 @pytest.mark.parametrize(
     ("loss_type", "chunked_flag", "expected"),
     [

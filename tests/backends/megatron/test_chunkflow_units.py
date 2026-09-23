@@ -29,6 +29,7 @@ try:
         Unit,
         build_micro_batches,
         classify_units,
+        completed_groups,
         expand_units,
         gen_unit_ops,
         make_unit_bwd_order,
@@ -80,6 +81,15 @@ def test_lockstep_merges_same_depth_chunks_across_groups():
         assert len({c.group for c in u.chunks}) == len(u.chunks)
 
     assert validate_units(units, chunks) == []
+
+
+def test_group_is_completed_only_by_its_lowest_chunk_backward():
+    chunks = _one_group()
+    units = build_micro_batches(chunks, "staggered")
+    dependent = [u for u in units if u.is_dependent]
+
+    assert all(not completed_groups(unit) for unit in dependent[1:])
+    assert completed_groups(dependent[0]) == dependent[0].groups
 
 
 def test_lockstep_puts_standalone_units_first():

@@ -282,8 +282,8 @@ def test_unit_mode_recompute_matches_keep_everything():
 
     A group long enough to drop some chunks (keep_last_k=1 of 4) forwards the
     early ones under no_grad, recomputes them before their own backward. The
-    gradients must equal the keep-everything path exactly -- the mechanism is an
-    exact re-derivation, so any difference is a bug, not noise.
+    gradients must equal the keep-everything path exactly -- the mechanism is
+    an exact re-derivation, so any difference is a bug, not noise.
     """
     torch.manual_seed(0)
     total, h, d, chunk_size = 64, 2, 8, 16
@@ -292,8 +292,8 @@ def test_unit_mode_recompute_matches_keep_everything():
 
     def run(keep_last_k):
         from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
-        from relax.backends.megatron.chunkflow.scheduler import build_chunks, gen_state_aware_1f1b_ops
-        from relax.backends.megatron.chunkflow.units import build_micro_batches, gen_unit_ops
+        from relax.backends.megatron.chunkflow.scheduler import build_chunks
+        from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 
         runtime = ChunkflowRuntime(chunk_size)
         attn = _unit_attn(chunk_size)
@@ -305,15 +305,22 @@ def test_unit_mode_recompute_matches_keep_everything():
         qq = q.detach().clone().requires_grad_(True)
         kk = k.detach().clone().requires_grad_(True)
         vv = v.detach().clone().requires_grad_(True)
-        _bounds = {u.unit_id: (u.chunks[0].segments[0].prefix, sum(s.length for c in u.chunks for s in c.segments)) for u in units}
+        _bounds = {
+            u.unit_id: (u.chunks[0].segments[0].prefix, sum(s.length for c in u.chunks for s in c.segments))
+            for u in units
+        }
+
         def dout_for(uid):
             s_, n_ = _bounds[uid]
             return dout[s_ : s_ + n_]
+
         pending = {}
         for kind, uid in ops:
             unit = units[uid]
             if kind == "B":
                 pending.pop(uid).backward(dout_for(uid))
+                for group in completed_groups(unit):
+                    runtime.release_group(group)
                 continue
             n = sum(s.length for chunk in unit.chunks for s in chunk.segments)
             # slice the unit's rows out of the parent
@@ -325,6 +332,7 @@ def test_unit_mode_recompute_matches_keep_everything():
                     attn(q_u, k_u, v_u, packed_seq_params=packed)
             else:
                 pending[uid] = attn(q_u, k_u, v_u, packed_seq_params=packed)
+        runtime.assert_empty("recompute test")
         return qq.grad, kk.grad, vv.grad
 
     full = run(keep_last_k=1 << 30)

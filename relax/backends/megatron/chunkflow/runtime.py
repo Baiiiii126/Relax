@@ -13,10 +13,7 @@ unit is executing travels on ``packed_seq_params``, not through a global.
 from __future__ import annotations
 
 from relax.backends.megatron.chunkflow.state_store import StateStore
-from relax.utils.logging_utils import get_logger
 
-
-logger = get_logger(__name__)
 
 RUNTIME_ATTR = "chunkflow_runtime"
 UNIT_ATTR = "chunkflow_unit"
@@ -32,25 +29,6 @@ class ChunkflowRuntime:
     def __init__(self, chunk_size: int) -> None:
         self.chunk_size = chunk_size
         self._stores: dict[tuple[int, int], StateStore] = {}
-        # Set by the schedule for the duration of one unit's forward; cleared
-        # right after so a stray read cannot silently use the wrong group.
-        self.current_unit = None
-        # Group ids must be unique for the runtime's whole lifetime, not just
-        # one schedule call -- the stores persist across calls, and resetting the
-        # counter per call reuses ids and collides with a store an earlier call
-        # left behind.
-        self._group_offset = 0
-
-    def next_group_offset(self, used_max: int | None) -> int:
-        """Advance the global group counter past ``used_max``; returns the value to start from next time.
-
-        ``used_max`` is the highest group id this micro-batch used (already
-        offset), or None when it had none. The returned value is what the next
-        micro-batch starts from, so ids are unique across schedule calls.
-        """
-        if used_max is not None:
-            self._group_offset = used_max + 1
-        return self._group_offset
 
     def store(self, layer_number: int, group_id: int) -> StateStore:
         """The store for one layer of one group, created on first use."""
@@ -120,3 +98,17 @@ def find_runtime(model) -> ChunkflowRuntime | None:
         model = getattr(model, "module", None)
         seen += 1
     return None
+
+
+def require_runtime(model) -> ChunkflowRuntime:
+    """Return the runtime installed before Megatron wrapped ``model``.
+
+    ``install()`` runs on the bare model, while pipeline schedules receive its
+    Float16/DDP wrapper. Attaching directly to the wrapper would create a second
+    runtime: attention would write one store while the schedule released the
+    other.
+    """
+    runtime = find_runtime(model)
+    if runtime is None:
+        raise RuntimeError("chunkflow runtime is missing; install ChunkFlow before selecting its schedule")
+    return runtime

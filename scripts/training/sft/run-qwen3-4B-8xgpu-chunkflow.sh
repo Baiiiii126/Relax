@@ -2,35 +2,11 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B SFT with a chunkflow toggle, 8xGPU single-node, TP2 x PP4.
+# Qwen3-4B SFT loss alignment, 4 GPUs, TP1 x PP4.
 #
-#   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh              # chunkflow
-#   CHUNK_SIZE=0 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh # baseline
-#
-# Same PP on both arms, or the comparison is "no bubbles vs bubbles" instead of
-# "chunkflow vs no chunkflow". PP defaults to 4 because that is the deepest
-# pipeline (and the most bubbles) this node can run, which is where chunkflow's
-# benefit is supposed to show.
-#
-# SFT is the right vehicle for checking chunked attention: the data is fixed, so
-# unlike RL (temperature-1 sampling) the two arms see identical tokens and the
-# loss curves should overlay to within bf16 noise. Any real divergence is
-# chunkflow's doing.
-#
-# CHUNK_SIZE defaults to 512 -- NOT 2048 -- and that matters. chunkflow splits
-# per sequence, so a chunk size above a sample's length leaves it as a single
-# chunk, making chunked attention a no-op: the curves would match trivially and
-# prove nothing. The default dataset is a deliberate length MIX (mean 1165
-# tokens, 308..2764, built by scripts/training/sft/tools/build_mixed_sft_data.py)
-# which at 512 splits 72% of samples into 2-6 chunks and leaves 28% untouched --
-# so a single run covers unchunked, lightly chunked and heavily chunked
-# sequences, including batches where only some sequences get split.
-#
-# If you point PROMPT_DATA at plain GSM8K (~195 tokens/sample), drop the chunk
-# size to ~128 for the same reason.
-
-set -ex
-set -o pipefail
+#   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh baseline
+#   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh chunkflow
+set -exo pipefail
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
@@ -42,32 +18,34 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 
-PROJECT_NAME="${PROJECT_NAME:=Relax/dev/chunkflow-sft}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-NUM_EPOCH="${NUM_EPOCH:=2}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=1}"
 
-# Pipeline depth: 8 GPUs = TP2 x PP x DP, so PP=4 is dp=1. Must be set here,
-# above the argparse block -- that block reads it to emit --chunkflow-pipeline.
-PP_SIZE="${PP_SIZE:=4}"
-# 0 = baseline arm (chunkflow off). >0 = tokens per chunk.
-CHUNK_SIZE="${CHUNK_SIZE:=512}"
-# How many chunks share one attention call. `lockstep` merges same-depth chunks
-# across sequences, which is the lever on chunkflow's call-count overhead; the
-# default `staggered` (one chunk per call) fills pipeline bubbles best.
+PP_SIZE=4
+MODE="${1:-chunkflow}"
+case "${MODE}" in
+   baseline)
+      CHUNK_SIZE=0
+      ;;
+   chunkflow)
+      # The fixed validation sample is currently 353 tokens. Keep the default
+      # below that length so this arm exercises real multi-chunk execution.
+      CHUNK_SIZE="${CHUNK_SIZE:-128}"
+      ;;
+   *)
+      echo "Usage: bash $0 {baseline|chunkflow}" >&2
+      exit 2
+      ;;
+esac
 PACK_POLICY="${PACK_POLICY:=staggered}"
-# 0 = keep every chunk's activation (no recompute). >0 = recompute the earlier
-# ones of a group, keeping only this many. Defaults ON (1) -- that is the whole
-# point of chunkflow's memory story; set to 0 only to compare against it.
-KEEP_LAST_K="${KEEP_LAST_K:=1}"
+KEEP_LAST_K="${KEEP_LAST_K:=0}"
 if [ "${CHUNK_SIZE}" -gt 0 ]; then
    CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE} --chunkflow-pack-policy "${PACK_POLICY}")
    ARM="chunk${CHUNK_SIZE}-${PACK_POLICY}"
-   if [ "${PP_SIZE}" -gt 1 ]; then
-      CHUNKFLOW_ARGS+=(--chunkflow-pipeline ${PP_SIZE})
-      ARM="${ARM}-pp${PP_SIZE}"
-   fi
+   CHUNKFLOW_ARGS+=(--chunkflow-pipeline ${PP_SIZE})
+   ARM="${ARM}-pp${PP_SIZE}"
    if [ "${KEEP_LAST_K}" -gt 0 ]; then
       CHUNKFLOW_ARGS+=(--chunkflow-keep-last-k ${KEEP_LAST_K})
       ARM="${ARM}-k${KEEP_LAST_K}"
@@ -77,27 +55,9 @@ else
    ARM="baseline"
 fi
 
-# ── ClearML ──────────────────────────────────────────────────────────────────
-# QS pods are ephemeral: /root is wiped every time a trial is recreated, so a
-# conf installed by hand on one pod is gone on the next. Keep the authoritative
-# copy on the shared mount (which survives) and install it here when missing --
-# otherwise MetricsService only logs "Failed to initialize ClearML adapter" and
-# the whole run finishes having uploaded nothing.
-CLEARML_CONF_SHARED="${CLEARML_CONF_SHARED:-${DATA_DIR}/../clearml.conf}"
-if [ ! -f "${HOME}/clearml.conf" ] && [ -f "${CLEARML_CONF_SHARED}" ]; then
-   install -m 600 "${CLEARML_CONF_SHARED}" "${HOME}/clearml.conf"
-   echo "ClearML: installed config from ${CLEARML_CONF_SHARED}"
-fi
-if [ ! -f "${HOME}/clearml.conf" ] && [ -z "${CLEARML_API_HOST:-}" ]; then
-   echo "ERROR: ClearML is not configured on this machine, so --use-clearml would" >&2
-   echo "upload nothing. Put a conf at \${HOME}/clearml.conf, or at" >&2
-   echo "${CLEARML_CONF_SHARED} for this script to install automatically." >&2
-   exit 1
-fi
+PROJECT_NAME="${PROJECT_NAME:-Relax/dev/chunkflow-loss-alignment}"
+EXP_NAME="${EXP_NAME:-qwen3-4b-sft-${ARM}}"
 
-# Fail here rather than deep inside transformers: a non-existent --hf-checkpoint
-# reaches ``cached_file`` as-is, which then treats the path as a Hub repo id and
-# dies with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'".
 if [ ! -e "${MODEL_DIR}/Qwen3-4B" ]; then
    echo "ERROR: ${MODEL_DIR}/Qwen3-4B does not exist. Set MODEL_DIR / DATA_DIR, e.g." >&2
    echo "  export MODEL_DIR=/mnt/tidal-nj01/usr/yuzhe1/baihaonan/models" >&2
@@ -113,65 +73,42 @@ fi
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-4B/
-   --ref-load ${MODEL_DIR}/Qwen3-4B/
    --megatron-to-hf-mode bridge
-   # No --save: this run only produces curves.
-   --num-epoch ${NUM_EPOCH}
+   --num-rollout ${NUM_ROLLOUT}
 )
 
-# ~974 samples / global-batch 32 * 2 epochs. --rollout-batch-size defaults to
-# global_batch_size // n_samples_per_prompt (= 32 here) and num_rollout is then
-# derived from the epoch count, so roughly 60 optimizer steps.
 SFT_ARGS=(
    --loss-type sft
    --prompt-data "${PROMPT_DATA}"
    --input-key question
    --label-key answer
-   --global-batch-size 32
+   --global-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 4096
    --sft-oversize-strategy skip
-   --balance-data
 )
 
-EVAL_ARGS=(
-   --eval-size 0.01
-   --eval-interval 50
-)
+export RELAX_CHUNKFLOW_PIPELINE_UNTESTED="${RELAX_CHUNKFLOW_PIPELINE_UNTESTED:=1}"
+export RELAX_LOSS_ALIGNMENT_TRACE="${RELAX_LOSS_ALIGNMENT_TRACE:=1}"
 
-# Trace is on so a hang shows where it stopped; the untested gate is set
-# automatically at PP>1 so the command line stays bare.
-export RELAX_CHUNKFLOW_TRACE="${RELAX_CHUNKFLOW_TRACE:=1}"
-if [ "${PP_SIZE}" -gt 1 ]; then
-   export RELAX_CHUNKFLOW_PIPELINE_UNTESTED="${RELAX_CHUNKFLOW_PIPELINE_UNTESTED:=1}"
-fi
-
-# Ray workers read their env from the runtime env, not this shell (same lesson
-# as ClearML), so these have to travel in RUNTIME_ENV_JSON or the actors never
-# see them. Must stay *after* the two exports above -- it reads them from the
-# environment, and running early silently copies nothing.
 export RUNTIME_ENV_JSON=$(python3 -c '
 import json, os
 env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 target = env.setdefault("env_vars", {})
-for name in ("RELAX_CHUNKFLOW_TRACE", "RELAX_CHUNKFLOW_PIPELINE_UNTESTED"):
-    value = os.environ.get(name)
-    if value:
-        target[name] = value
+target["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"] = os.environ["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"]
+target["RELAX_LOSS_ALIGNMENT_TRACE"] = os.environ["RELAX_LOSS_ALIGNMENT_TRACE"]
 print(json.dumps(env))
 ')
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
-   --sequence-parallel
+   --tensor-model-parallel-size 1
    --pipeline-model-parallel-size ${PP_SIZE}
-   # chunkflow's StateStore is local to one sequence, so CP must stay 1.
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
    --calculate-per-token-loss
-   --cross-entropy-loss-fusion
+   --no-rope-fusion
 )
 
 OPTIMIZER_ARGS=(
@@ -185,52 +122,38 @@ OPTIMIZER_ARGS=(
    --clip-grad 1.0
 )
 
-WANDB_ARGS=(
-   --use-clearml
-   --use-metrics-service
-   --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen3-4b-sft-chunkflow-${ARM}-gpu8-${now}
-)
-
 MISC_ARGS=(
+   --seed 1234
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-   --use-health-check
+)
+
+CLEARML_ARGS=(
+   --use-clearml
+   --tb-project-name "${PROJECT_NAME}"
+   --tb-experiment-name "${EXP_NAME}-${now}"
 )
 
 mkdir -p log
-LOG_FILE="log/qwen3-4b-sft-chunkflow-${ARM}-gpu8-${now}.log"
+LOG_FILE="log/qwen3-4b-sft-chunkflow-${ARM}-gpu4-${now}.log"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"sft": [1, 0], "actor": [1, 8]}' \
-   --max-staleness 0 \
-   --num-data-storage-units 1 \
+   --resource '{"sft": [1, 0], "actor": [1, 4]}' \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${SFT_ARGS[@]}" \
-    "${EVAL_ARGS[@]}" \
     "${OPTIMIZER_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
     "${PERF_ARGS[@]}" \
     "${CHUNKFLOW_ARGS[@]}" \
+    "${CLEARML_ARGS[@]}" \
     "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_FILE}"
 
-# A chunkflow arm whose patch never fired would look identical to the baseline
-# and read as a pass, so check the arm was actually chunked.
-if [ "${CHUNK_SIZE}" -gt 0 ] && ! grep -q "chunked attention installed" "${LOG_FILE}"; then
+if [ -z "${RAY_NO_WAIT:-}" ] && [ "${CHUNK_SIZE}" -gt 0 ] && ! grep -q "chunked attention installed" "${LOG_FILE}"; then
    echo "FAIL: chunkflow never installed -- this arm proves nothing." >&2
    exit 1
 fi
-
-# ClearML failures never fail the job, so confirm the curves actually went up.
-if ! grep -q "ClearML adapter initialized" "${LOG_FILE}"; then
-   echo "WARNING: ClearML adapter never initialized -- this run uploaded no curves." >&2
-   grep -m1 "Failed to initialize ClearML adapter" "${LOG_FILE}" >&2 || true
-   exit 1
-fi
-grep -m1 "Saving clearml log to project" "${LOG_FILE}" || true

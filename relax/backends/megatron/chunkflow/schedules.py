@@ -19,10 +19,10 @@ from typing import Iterator, List, Optional, Union
 import torch
 from megatron.core import parallel_state
 
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, attach_runtime
+from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
 from relax.backends.megatron.chunkflow.scheduler import build_chunks
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
-from relax.backends.megatron.chunkflow.units import build_micro_batches, gen_unit_ops
+from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 from relax.utils.logging_utils import get_logger
 
 
@@ -46,20 +46,11 @@ _BATCH_KEYS = (
 )
 
 
-def _plan(parent: dict, chunk_size: int, policy: str, group_offset: int):
-    """Chunks and execution units for one processed micro-batch.
-
-    ``build_chunks`` numbers a dependency group by the sequence's index in this
-    micro-batch, so group ids repeat from one micro-batch to the next -- and
-    the runtime's stores live on the model across all of them. Offset by micro-
-    batch so a group id is unique for the whole step, not just the batch.
-    """
+def _plan(parent: dict, chunk_size: int, policy: str):
+    """Build chunks and execution units for one processed micro-batch."""
     cu = parent["packed_seq_params"].cu_seqlens_q_cpu
     lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
     chunks = build_chunks(lengths, chunk_size=chunk_size, repack_tail=False)
-    for chunk in chunks:
-        if chunk.group is not None:
-            chunk.group += group_offset
     return chunks, build_micro_batches(chunks, policy)
 
 
@@ -125,7 +116,7 @@ def chunkflow_forward_backward_no_pipelining(
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
     # Only K chunks of each group keep their activation; the rest go through
     # Fp (no graph) and Fr (recompute before backward).
-    runtime = attach_runtime(model, chunk_size)
+    runtime = require_runtime(model)
 
     config = model.config if hasattr(model, "config") else None
     no_sync_func = getattr(config, "no_sync_func", None) or contextlib.nullcontext
@@ -145,9 +136,7 @@ def chunkflow_forward_backward_no_pipelining(
                 args.qkv_format,
                 args.allgather_cp,
             )
-            chunks, units = _plan(parent, chunk_size, policy, runtime.next_group_offset(None))
-            used_max = max((c.group for c in chunks if c.group is not None), default=None)
-            runtime.next_group_offset(used_max)
+            chunks, units = _plan(parent, chunk_size, policy)
             ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
 
             import os as _os
@@ -168,7 +157,7 @@ def chunkflow_forward_backward_no_pipelining(
                     loss = pending.pop(unit_id)
                     if not forward_only:
                         loss.backward()
-                    for group in unit.groups:
+                    for group in completed_groups(unit):
                         runtime.release_group(group)
                     continue
 
@@ -193,6 +182,8 @@ def chunkflow_forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 forward_data_store.append(log)
                 pending[unit_id] = loss
+
+            runtime.assert_empty("chunkflow PP=1 micro-batch")
 
     if getattr(config, "finalize_model_grads_func", None) is not None and not forward_only:
         from megatron.core.pipeline_parallel.schedules import ProcessGroupCollection
