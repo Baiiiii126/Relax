@@ -157,7 +157,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
 
 if [ -z "${RAY_NO_WAIT:-}" ] && [ "${CHUNK_SIZE}" -gt 0 ]; then
    if [ "${RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION}" = "1" ]; then
-      INSTALL_MARKER="original core attention selected for unit calls"
+      INSTALL_MARKER="original core attention retained"
    else
       INSTALL_MARKER="chunked attention installed"
    fi

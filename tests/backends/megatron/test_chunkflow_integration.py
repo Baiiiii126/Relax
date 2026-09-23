@@ -188,7 +188,24 @@ def test_chunkflow_install_swaps_and_uninstall_restores():
     assert model[0].core_attention is original
 
 
-def test_chunkflow_install_can_select_original_attention_for_unit_alignment(monkeypatch):
+def test_chunkflow_install_enables_rope_offset_patch(monkeypatch):
+    from relax.backends.megatron.chunkflow import rope as chunkflow_rope
+
+    class FakeAttn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_number = 1
+            self.config = SimpleNamespace(context_parallel_size=1)
+            self.core_attention = torch.nn.Identity()
+
+    calls = []
+    monkeypatch.setattr(chunkflow_rope, "install", lambda: calls.append(True))
+
+    assert install(torch.nn.Sequential(FakeAttn()), chunk_size=128) == 1
+    assert calls == [True]
+
+
+def test_chunkflow_install_can_retain_original_attention_for_single_unit_alignment(monkeypatch):
     class FakeAttn(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -200,54 +217,8 @@ def test_chunkflow_install_can_select_original_attention_for_unit_alignment(monk
     original = model[0].core_attention
     monkeypatch.setenv("RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION", "1")
 
-    assert install(model, chunk_size=4096) == 1
-    assert isinstance(model[0].core_attention, ChunkedCoreAttention)
-    assert model[0].core_attention._original_core_attention is original
-
-
-def test_original_attention_receives_accumulated_kv_for_dependent_units():
-    from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
-    from relax.backends.megatron.chunkflow.scheduler import build_chunks
-    from relax.backends.megatron.chunkflow.units import build_micro_batches
-
-    class RecordingAttention(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.calls = []
-
-        def forward(self, query, key, value, packed_seq_params=None, **_kwargs):
-            self.calls.append(
-                (
-                    packed_seq_params.cu_seqlens_q.cpu().tolist(),
-                    packed_seq_params.cu_seqlens_kv.cpu().tolist(),
-                    query.shape[0],
-                    key.shape[0],
-                    value.shape[0],
-                )
-            )
-            return query.reshape(query.shape[0], -1)
-
-    original = RecordingAttention()
-    attn = ChunkedCoreAttention(
-        config=SimpleNamespace(context_parallel_size=1),
-        layer_number=1,
-        chunk_size=4,
-        runtime=ChunkflowRuntime(4),
-        original_attention=original,
-    )
-    chunks = build_chunks([8], chunk_size=4, repack_tail=False)
-    units = build_micro_batches(chunks, "staggered")
-    q, k, v = _qkv(t=8, h=2, d=4)
-
-    for index, unit in enumerate(units):
-        packed = SimpleNamespace(cu_seqlens_q_cpu=[0, 4], **{UNIT_ATTR: unit})
-        start = index * 4
-        attn(q[start : start + 4], k[start : start + 4], v[start : start + 4], packed_seq_params=packed)
-
-    assert original.calls == [
-        ([0, 4], [0, 4], 4, 4, 4),
-        ([0, 4], [0, 8], 4, 8, 8),
-    ]
+    assert install(model, chunk_size=4096) == 0
+    assert model[0].core_attention is original
 
 
 # ---------------------------------------------------------------------------

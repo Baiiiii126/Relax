@@ -53,16 +53,7 @@ class ChunkedCoreAttention(nn.Module):
     is treated as one sequence.
     """
 
-    def __init__(
-        self,
-        config,
-        layer_number: int,
-        chunk_size: int,
-        softmax_scale=None,
-        runtime=None,
-        original_attention=None,
-        **kwargs,
-    ):
+    def __init__(self, config, layer_number: int, chunk_size: int, softmax_scale=None, runtime=None, **kwargs):
         super().__init__()
         del kwargs
         self.config = config
@@ -70,20 +61,8 @@ class ChunkedCoreAttention(nn.Module):
         self.chunk_size = chunk_size
         self.softmax_scale = softmax_scale
         self.runtime = runtime
-        # Keep this as a plain reference: the parent attention module already
-        # owns/registers the original module under ``_ORIG_ATTR`` for uninstall.
-        self.__dict__["_original_core_attention"] = original_attention
 
-    def _forward_unit(
-        self,
-        query,
-        key,
-        value,
-        packed_seq_params,
-        attention_mask=None,
-        attn_mask_type=None,
-        **kwargs,
-    ) -> torch.Tensor:
+    def _forward_unit(self, query, key, value, packed_seq_params) -> torch.Tensor:
         """One attention call for a whole unit, each sequence over its own K/V.
 
         A dependent sequence attends its group's earlier chunks plus its own; a
@@ -146,29 +125,6 @@ class ChunkedCoreAttention(nn.Module):
         query = query[: cu[-1]]
         cu_q = torch.tensor(cu, dtype=torch.int32, device=device)
         cu_kv = torch.tensor([0, *itertools.accumulate(t.shape[0] for t in ks)], dtype=torch.int32, device=device)
-        if self._original_core_attention is not None:
-            from megatron.core.packed_seq_params import PackedSeqParams
-
-            q_lengths = [end - start for start, end in zip(cu[:-1], cu[1:], strict=True)]
-            kv_lengths = [tensor.shape[0] for tensor in ks]
-            original_packed = PackedSeqParams(
-                cu_seqlens_q=cu_q,
-                cu_seqlens_kv=cu_kv,
-                cu_seqlens_q_padded=cu_q,
-                cu_seqlens_kv_padded=cu_kv,
-                max_seqlen_q=max(q_lengths),
-                max_seqlen_kv=max(kv_lengths),
-                qkv_format="thd",
-            )
-            return self._original_core_attention(
-                query,
-                torch.cat(ks, dim=0),
-                torch.cat(vs, dim=0),
-                attention_mask=attention_mask,
-                attn_mask_type=attn_mask_type,
-                packed_seq_params=original_packed,
-                **kwargs,
-            )
         scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1] ** -0.5
         out, _lse = UnitCacheAttention.apply(query, True, scale, cu_q, cu_kv, *ks, *vs)
         return out
@@ -188,6 +144,7 @@ class ChunkedCoreAttention(nn.Module):
         return torch.cat(outs, dim=0)
 
     def forward(self, query, key, value, attention_mask=None, attn_mask_type=None, packed_seq_params=None, **kwargs):
+        del attention_mask, attn_mask_type, kwargs
         cp_size = getattr(self.config, "context_parallel_size", 1) or 1
         if cp_size > 1:
             raise NotImplementedError(
@@ -203,31 +160,12 @@ class ChunkedCoreAttention(nn.Module):
 
         if packed_seq_params is not None and getattr(packed_seq_params, UNIT_ATTR, None) is not None:
             padded_rows = query.shape[0]
-            out = self._forward_unit(
-                query,
-                key,
-                value,
-                packed_seq_params,
-                attention_mask=attention_mask,
-                attn_mask_type=attn_mask_type,
-                **kwargs,
-            ).reshape(-1, query.shape[1] * query.shape[2])
+            out = self._forward_unit(query, key, value, packed_seq_params).reshape(-1, query.shape[1] * query.shape[2])
             # The unit batch is padded for alignment; the layer expects one
             # output row per input row, and the pad rows' values are never read.
             if out.shape[0] < padded_rows:
                 out = torch.nn.functional.pad(out, (0, 0, 0, padded_rows - out.shape[0]))
             return out
-
-        if self._original_core_attention is not None:
-            return self._original_core_attention(
-                query,
-                key,
-                value,
-                attention_mask=attention_mask,
-                attn_mask_type=attn_mask_type,
-                packed_seq_params=packed_seq_params,
-                **kwargs,
-            )
 
         cu = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
         if cu is None:
@@ -280,8 +218,16 @@ def install(model, chunk_size: int) -> int:
     from relax.backends.megatron.chunkflow.runtime import attach_runtime
 
     runtime = attach_runtime(model, chunk_size)
+    from relax.backends.megatron.chunkflow import rope as chunkflow_rope
 
-    use_original_attention = os.environ.get("RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION") == "1"
+    chunkflow_rope.install()
+
+    if os.environ.get("RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION") == "1":
+        logger.warning(
+            "chunkflow: original core attention retained for single-unit alignment; "
+            "do not use this diagnostic mode with dependent chunks"
+        )
+        return 0
 
     # The unit path needs RoPE's unfused branch: it applies the position offset
     # chunkflow patches in, while Transformer Engine's fused_rope kernel takes
@@ -301,7 +247,6 @@ def install(model, chunk_size: int) -> int:
             chunk_size=chunk_size,
             softmax_scale=getattr(original, "softmax_scale", None),
             runtime=runtime,
-            original_attention=original if use_original_attention else None,
         )
         n += 1
     if n:
@@ -310,14 +255,7 @@ def install(model, chunk_size: int) -> int:
             if cfg is not None and getattr(cfg, "apply_rope_fusion", False):
                 cfg.apply_rope_fusion = False
         logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
-    if use_original_attention:
-        logger.warning(
-            "chunkflow: original core attention selected for unit calls on %s layer(s); "
-            "this correctness backend may retain accumulated K/V",
-            n,
-        )
-    else:
-        logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
+    logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
     return n
 
 
