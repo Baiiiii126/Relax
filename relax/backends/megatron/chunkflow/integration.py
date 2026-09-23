@@ -12,6 +12,7 @@ attention. ``install(model, chunk_size)`` swaps every ``core_attention``;
 from __future__ import annotations
 
 import itertools
+import os
 
 import torch
 from torch import nn
@@ -28,8 +29,6 @@ _ORIG_ATTR = "_chunkflow_original_core_attention"
 
 
 def _chunkflow_trace() -> bool:
-    import os
-
     return os.environ.get("RELAX_CHUNKFLOW_TRACE") == "1"
 
 
@@ -226,6 +225,13 @@ def install(model, chunk_size: int) -> int:
     from relax.backends.megatron.chunkflow.runtime import attach_runtime
 
     runtime = attach_runtime(model, chunk_size)
+
+    if os.environ.get("RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION") == "1":
+        logger.warning(
+            "chunkflow: original core attention retained for single-unit alignment; "
+            "do not use this diagnostic mode with dependent chunks"
+        )
+        return 0
 
     # The unit path needs RoPE's unfused branch: it applies the position offset
     # chunkflow patches in, while Transformer Engine's fused_rope kernel takes

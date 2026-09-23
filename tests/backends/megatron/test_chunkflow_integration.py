@@ -171,6 +171,22 @@ def test_chunkflow_install_swaps_and_uninstall_restores():
     assert model[0].core_attention is original
 
 
+def test_chunkflow_install_can_retain_original_attention_for_single_unit_alignment(monkeypatch):
+    class FakeAttn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_number = 1
+            self.config = SimpleNamespace(context_parallel_size=1)
+            self.core_attention = torch.nn.Identity()
+
+    model = torch.nn.Sequential(FakeAttn())
+    original = model[0].core_attention
+    monkeypatch.setenv("RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION", "1")
+
+    assert install(model, chunk_size=4096) == 0
+    assert model[0].core_attention is original
+
+
 # ---------------------------------------------------------------------------
 # Unit mode: chunks driven one at a time, backward descending
 # ---------------------------------------------------------------------------

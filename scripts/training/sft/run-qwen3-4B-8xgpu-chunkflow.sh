@@ -90,6 +90,7 @@ SFT_ARGS=(
 
 export RELAX_CHUNKFLOW_PIPELINE_UNTESTED="${RELAX_CHUNKFLOW_PIPELINE_UNTESTED:=1}"
 export RELAX_LOSS_ALIGNMENT_TRACE="${RELAX_LOSS_ALIGNMENT_TRACE:=1}"
+export RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION="${RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION:=0}"
 
 export RUNTIME_ENV_JSON=$(python3 -c '
 import json, os
@@ -97,6 +98,7 @@ env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 target = env.setdefault("env_vars", {})
 target["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"] = os.environ["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"]
 target["RELAX_LOSS_ALIGNMENT_TRACE"] = os.environ["RELAX_LOSS_ALIGNMENT_TRACE"]
+target["RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION"] = os.environ["RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION"]
 print(json.dumps(env))
 ')
 
@@ -153,7 +155,14 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${CLEARML_ARGS[@]}" \
     "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_FILE}"
 
-if [ -z "${RAY_NO_WAIT:-}" ] && [ "${CHUNK_SIZE}" -gt 0 ] && ! grep -q "chunked attention installed" "${LOG_FILE}"; then
-   echo "FAIL: chunkflow never installed -- this arm proves nothing." >&2
-   exit 1
+if [ -z "${RAY_NO_WAIT:-}" ] && [ "${CHUNK_SIZE}" -gt 0 ]; then
+   if [ "${RELAX_CHUNKFLOW_USE_ORIGINAL_ATTENTION}" = "1" ]; then
+      INSTALL_MARKER="original core attention retained"
+   else
+      INSTALL_MARKER="chunked attention installed"
+   fi
+   if ! grep -q "${INSTALL_MARKER}" "${LOG_FILE}"; then
+      echo "FAIL: chunkflow never installed -- this arm proves nothing." >&2
+      exit 1
+   fi
 fi
