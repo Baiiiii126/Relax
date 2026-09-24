@@ -20,7 +20,7 @@ from typing import Any
 
 
 BUCKETS = (
-    ("short_512_2k", 512, 2_048),
+    ("short_0_2k", 0, 2_048),
     ("medium_2k_8k", 2_048, 8_192),
     ("long_8k_16k", 8_192, 16_384),
     # Leave 512 tokens below the 32K training limit as a safety margin.
@@ -46,11 +46,11 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", required=True, help="Local Qwen3-4B checkpoint/tokenizer directory")
     parser.add_argument("--output", required=True, help="Output parquet path")
-    parser.add_argument("--local-json", default=None, help="Local JSON/JSONL source for the 512-8K buckets")
+    parser.add_argument("--local-json", default=None, help="Local JSON/JSONL source for the 0-8K buckets")
     parser.add_argument(
         "--local-long-data",
         default=None,
-        help="Local JSON/JSONL/Parquet file or directory containing real samples for the 8K-32K buckets",
+        help="Local JSON/JSONL/Parquet file or directory containing real samples for the 2K-32K buckets",
     )
     parser.add_argument("--short-dataset", default="BAAI/Infinity-Instruct")
     parser.add_argument("--short-config", default=None)
@@ -59,8 +59,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--long-config", default=None)
     parser.add_argument("--long-revision", default="main")
     parser.add_argument("--split", default="train")
-    parser.add_argument("--short-count", type=int, default=375)
-    parser.add_argument("--medium-count", type=int, default=100)
+    parser.add_argument("--short-count", type=int, default=450)
+    parser.add_argument("--medium-count", type=int, default=25)
     parser.add_argument("--long-count", type=int, default=20)
     parser.add_argument("--tail-count", type=int, default=5)
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
@@ -322,7 +322,7 @@ def main() -> None:
     from transformers import AutoTokenizer
 
     targets = {
-        "short_512_2k": args.short_count,
+        "short_0_2k": args.short_count,
         "medium_2k_8k": args.medium_count,
         "long_8k_16k": args.long_count,
         "tail_16k_32k": args.tail_count,
@@ -344,7 +344,7 @@ def main() -> None:
             str(short_path),
             tokenizer,
             args.max_scan_per_source,
-            {"short_512_2k", "medium_2k_8k"},
+            {"short_0_2k", "medium_2k_8k"},
             args.min_cjk_ratio,
         )
         scanned_by_source = {str(short_path): short_scanned}
@@ -358,7 +358,7 @@ def main() -> None:
                 str(long_path),
                 tokenizer,
                 args.max_scan_per_source,
-                {"long_8k_16k", "tail_16k_32k"},
+                {"medium_2k_8k", "long_8k_16k", "tail_16k_32k"},
                 0.0,
             )
             scanned_by_source[str(long_path)] = long_scanned
@@ -374,7 +374,7 @@ def main() -> None:
                 args.short_config,
                 args.short_revision,
                 args.seed,
-                {"short_512_2k", "medium_2k_8k"},
+                {"short_0_2k", "medium_2k_8k"},
             ),
             (args.long_dataset, args.long_config, args.long_revision, args.seed + 1, set(targets)),
         )
