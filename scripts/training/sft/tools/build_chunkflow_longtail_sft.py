@@ -319,7 +319,6 @@ def main() -> None:
     args = _parse_args()
 
     from datasets import Dataset
-    from huggingface_hub import HfFolder
     from transformers import AutoTokenizer
 
     targets = {
@@ -365,8 +364,10 @@ def main() -> None:
             scanned_by_source[str(long_path)] = long_scanned
             revisions[str(long_path)] = _local_source_revision(long_path)
     else:
+        from huggingface_hub import get_token
+
         rows_by_bucket = {name: [] for name in targets}
-        hf_token = HfFolder.get_token()
+        hf_token = get_token()
         sources = (
             (
                 args.short_dataset,
