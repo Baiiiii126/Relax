@@ -22,6 +22,7 @@ EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1}"
+SEQ_LENGTH="${SEQ_LENGTH:-32768}"
 
 PP_SIZE=4
 MODE="${1:-chunkflow}"
@@ -64,10 +65,10 @@ if [ ! -e "${MODEL_DIR}/Qwen3-4B" ]; then
    echo "  export DATA_DIR=/mnt/tidal-nj01/usr/yuzhe1/baihaonan/data" >&2
    exit 1
 fi
-PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/gsm8k-mixed/train.parquet}"
+PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/chunkflow-longtail/train.parquet}"
 if [ ! -e "${PROMPT_DATA}" ]; then
    echo "ERROR: ${PROMPT_DATA} does not exist." >&2
-   echo "Build it with scripts/training/sft/tools/build_mixed_sft_data.py, or set PROMPT_DATA." >&2
+   echo "Build it with scripts/training/sft/tools/build_chunkflow_longtail_sft.py, or set PROMPT_DATA." >&2
    exit 1
 fi
 
@@ -84,7 +85,8 @@ SFT_ARGS=(
    --label-key answer
    --global-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
+   --seq-length ${SEQ_LENGTH}
+   --max-tokens-per-gpu ${SEQ_LENGTH}
    --sft-oversize-strategy skip
 )
 

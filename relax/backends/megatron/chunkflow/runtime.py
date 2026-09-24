@@ -13,6 +13,7 @@ unit is executing travels on ``packed_seq_params``, not through a global.
 from __future__ import annotations
 
 from relax.backends.megatron.chunkflow.state_store import StateStore
+from relax.backends.megatron.chunkflow.telemetry import PlanTelemetry, StepPlanTelemetry
 
 
 RUNTIME_ATTR = "chunkflow_runtime"
@@ -29,6 +30,37 @@ class ChunkflowRuntime:
     def __init__(self, chunk_size: int) -> None:
         self.chunk_size = chunk_size
         self._stores: dict[tuple[int, int], StateStore] = {}
+        self._live_group_ids: set[int] = set()
+        self._step_telemetry: StepPlanTelemetry | None = None
+        self._max_live_stores = 0
+        self._max_live_groups = 0
+
+    def begin_step(self) -> None:
+        """Start a fresh plan-telemetry window.
+
+        Overwriting stale counters here also makes a failed previous step
+        unable to contaminate the next successful step's metrics.
+        """
+        self._step_telemetry = StepPlanTelemetry()
+        self._max_live_stores = len(self._stores)
+        self._max_live_groups = len(self._live_group_ids)
+
+    def record_plan(self, plan: PlanTelemetry) -> None:
+        if self._step_telemetry is None:
+            self._step_telemetry = StepPlanTelemetry()
+        self._step_telemetry.add(plan)
+
+    def consume_step_metrics(self, pp_size: int) -> dict[str, int | float]:
+        """Return and clear the latest step's CPU-only telemetry."""
+        telemetry = self._step_telemetry
+        self._step_telemetry = None
+        if telemetry is None:
+            return {}
+        metrics = telemetry.to_metrics(pp_size)
+        if metrics:
+            metrics["pp_last_max_live_stores"] = self._max_live_stores
+            metrics["pp_last_max_live_groups"] = self._max_live_groups
+        return metrics
 
     def store(self, layer_number: int, group_id: int) -> StateStore:
         """The store for one layer of one group, created on first use."""
@@ -37,6 +69,9 @@ class ChunkflowRuntime:
         if store is None:
             store = StateStore()
             self._stores[key] = store
+            self._live_group_ids.add(group_id)
+            self._max_live_stores = max(self._max_live_stores, len(self._stores))
+            self._max_live_groups = max(self._max_live_groups, len(self._live_group_ids))
         return store
 
     def release_group(self, group_id: int) -> int:
@@ -47,10 +82,11 @@ class ChunkflowRuntime:
         keys = [k for k in self._stores if k[1] == group_id]
         for key in keys:
             del self._stores[key]
+        self._live_group_ids.discard(group_id)
         return len(keys)
 
     def live_groups(self) -> list[int]:
-        return sorted({group for _, group in self._stores})
+        return sorted(self._live_group_ids)
 
     def num_stores(self) -> int:
         return len(self._stores)

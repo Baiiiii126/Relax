@@ -40,6 +40,7 @@ from megatron.core.pipeline_parallel.schedules import (
 from megatron.core.utils import get_model_config
 
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
+from relax.backends.megatron.chunkflow.telemetry import summarize_plan
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import classify_units, completed_groups, make_unit_bwd_order
 
@@ -62,16 +63,14 @@ def _no_loss_step_func(forward_step_func):
     return step
 
 
-def _pipeline_schedule(units, chunks, keep_last_k, pp, stage):
-    """The per-stage plan: forward order, backward order, warmup depth.
+def _pipeline_plan(units, chunks, keep_last_k):
+    """The stage-independent forward/backward plan and dependency delay.
 
     ``fwd_seq`` runs standalones first -- they backward immediately -- then the
     dependent units by depth, so a group always forwards its earlier chunks
     first. ``bwd_seq`` is ``make_unit_bwd_order``'s dependency-valid order. The
-    warmup depth is the standard ``pp - stage - 1`` plus ``C``, a constant that
-    covers the first group's completion, so the steady phase always has a
-    backward ready; ``C`` is identical on every stage, so the offset between
-    neighbouring stages stays exactly 1.
+    ``C`` covers the first group's completion. It is stage-independent; the
+    caller adds the standard pipeline depth for its stage.
     """
     standalone = [u.unit_id for u in units if not u.is_dependent]
     dependent = sorted((u for u in units if u.is_dependent), key=lambda u: u.round)
@@ -94,6 +93,12 @@ def _pipeline_schedule(units, chunks, keep_last_k, pp, stage):
         return max(done_at[g] for g in unit.groups)
 
     C = max((ready(u) - i) for i, u in enumerate(bwd_seq)) if bwd_seq else 0
+    return fwd_seq, bwd_seq, need_fr, C
+
+
+def _pipeline_schedule(units, chunks, keep_last_k, pp, stage):
+    """The per-stage plan: forward order, backward order, warmup depth."""
+    fwd_seq, bwd_seq, need_fr, C = _pipeline_plan(units, chunks, keep_last_k)
     W = min(C + (pp - stage - 1), len(fwd_seq))
     return fwd_seq, bwd_seq, need_fr, W
 
@@ -140,6 +145,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     policy = getattr(args, "chunkflow_pack_policy", "staggered")
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
     runtime = require_runtime(model)
+    runtime.begin_step()
 
     if p2p_communicator is None and pg_collection is None:
         from megatron.core.pipeline_parallel.schedules import ProcessGroupCollection
@@ -217,10 +223,33 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
             parent = next_parent()
             chunks, units = _plan(parent, chunk_size, policy)
             by_id = {u.unit_id: u for u in units}
-            fwd_seq, bwd_seq, need_fr, W = _pipeline_schedule(
-                units, chunks, keep_last_k, p2p_communicator.total_stages, p2p_communicator.current_stage
+            fwd_seq, bwd_seq, need_fr, dependency_delay = _pipeline_plan(units, chunks, keep_last_k)
+            warmup_depths = [
+                min(
+                    dependency_delay + (p2p_communicator.total_stages - plan_stage - 1),
+                    len(fwd_seq),
+                )
+                for plan_stage in range(p2p_communicator.total_stages)
+            ]
+            cu_seqlens = parent["packed_seq_params"].cu_seqlens_q_cpu
+            seq_lengths = [cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)]
+            source_lengths = parent.get("total_lengths")
+            runtime.record_plan(
+                summarize_plan(
+                    seq_lengths,
+                    chunks,
+                    units,
+                    keep_last_k,
+                    p2p_communicator.total_stages,
+                    warmup_depths,
+                    source_rows=sum(
+                        int(length) for length in (seq_lengths if source_lengths is None else source_lengths)
+                    ),
+                )
             )
+            W = warmup_depths[p2p_communicator.current_stage]
             n = len(fwd_seq)
+
             def do_forward(unit_id, input_tensor, mb_idx):
                 """One unit's forward through this stage.
 

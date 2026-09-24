@@ -1180,13 +1180,14 @@ def train_one_step(
                 raise NotImplementedError(
                     f"chunkflow at --pipeline-model-parallel-size {pp_size} needs --chunkflow-pipeline {pp_size}."
                 )
-            from relax.backends.megatron.chunkflow.pipeline_schedules import (
-                chunkflow_forward_backward_pipelining_without_interleaving,
-            )
             # UNVERIFIED: this executor has not run end to end. Enable with
             # RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1 once it has been validated at
             # PP=2; it is not wired into any default path.
             import os
+
+            from relax.backends.megatron.chunkflow.pipeline_schedules import (
+                chunkflow_forward_backward_pipelining_without_interleaving,
+            )
 
             if os.environ.get("RELAX_CHUNKFLOW_PIPELINE_UNTESTED") != "1":
                 raise NotImplementedError(
@@ -1556,6 +1557,15 @@ def train(
                 f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
                 for key, val in loss_dict.items()
             }
+
+            if getattr(args, "use_chunkflow", False):
+                from relax.backends.megatron.chunkflow.runtime import find_runtime
+
+                runtime = find_runtime(model[0])
+                if runtime is not None:
+                    pp_size = mpu.get_pipeline_model_parallel_world_size()
+                    for key, value in runtime.consume_step_metrics(pp_size).items():
+                        log_dict[f"train/{role_tag}chunkflow/{key}"] = value
 
             log_dict[f"train/{role_tag}grad_norm"] = (
                 grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm

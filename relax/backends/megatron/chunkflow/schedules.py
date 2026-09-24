@@ -19,10 +19,13 @@ from typing import Iterator, List, Optional, Union
 import torch
 from megatron.core import parallel_state
 
+from relax.backends.megatron.chunkflow.pipeline_schedules import _pipeline_schedule
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
 from relax.backends.megatron.chunkflow.scheduler import build_chunks
+from relax.backends.megatron.chunkflow.telemetry import summarize_plan
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
+
 
 # Keys ``forward_step`` would have asked ``get_batch`` for. Kept in sync with
 # model.py's list; a key absent from the rollout data comes back None.
@@ -113,6 +116,7 @@ def chunkflow_forward_backward_no_pipelining(
     # Only K chunks of each group keep their activation; the rest go through
     # Fp (no graph) and Fr (recompute before backward).
     runtime = require_runtime(model)
+    runtime.begin_step()
 
     config = model.config if hasattr(model, "config") else None
     no_sync_func = getattr(config, "no_sync_func", None) or contextlib.nullcontext
@@ -133,6 +137,23 @@ def chunkflow_forward_backward_no_pipelining(
                 args.allgather_cp,
             )
             chunks, units = _plan(parent, chunk_size, policy)
+            warmup_depth = _pipeline_schedule(units, chunks, keep_last_k, pp=1, stage=0)[3]
+            cu_seqlens = parent["packed_seq_params"].cu_seqlens_q_cpu
+            seq_lengths = [cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)]
+            source_lengths = parent.get("total_lengths")
+            runtime.record_plan(
+                summarize_plan(
+                    seq_lengths,
+                    chunks,
+                    units,
+                    keep_last_k,
+                    1,
+                    [warmup_depth],
+                    source_rows=sum(
+                        int(length) for length in (seq_lengths if source_lengths is None else source_lengths)
+                    ),
+                )
+            )
             ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
 
             pending: dict[int, torch.Tensor] = {}
