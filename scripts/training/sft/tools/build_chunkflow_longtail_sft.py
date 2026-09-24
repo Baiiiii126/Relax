@@ -14,6 +14,7 @@ import hashlib
 import json
 import random
 from collections.abc import Iterable, Mapping
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +46,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", required=True, help="Local Qwen3-4B checkpoint/tokenizer directory")
     parser.add_argument("--output", required=True, help="Output parquet path")
-    parser.add_argument("--local-json", default=None, help="Local JSON/JSONL source; disables remote downloads")
+    parser.add_argument("--local-json", default=None, help="Local JSON/JSONL source for the 512-8K buckets")
+    parser.add_argument(
+        "--local-long-data",
+        default=None,
+        help="Local JSON/JSONL/Parquet file or directory containing real samples for the 8K-32K buckets",
+    )
     parser.add_argument("--short-dataset", default="BAAI/Infinity-Instruct")
     parser.add_argument("--short-config", default=None)
     parser.add_argument("--short-revision", default="main")
@@ -53,10 +59,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--long-config", default=None)
     parser.add_argument("--long-revision", default="main")
     parser.add_argument("--split", default="train")
-    parser.add_argument("--short-count", type=int, default=700)
-    parser.add_argument("--medium-count", type=int, default=200)
-    parser.add_argument("--long-count", type=int, default=80)
-    parser.add_argument("--tail-count", type=int, default=20)
+    parser.add_argument("--short-count", type=int, default=375)
+    parser.add_argument("--medium-count", type=int, default=100)
+    parser.add_argument("--long-count", type=int, default=20)
+    parser.add_argument("--tail-count", type=int, default=5)
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--max-scan-per-source", type=int, default=200_000)
     parser.add_argument("--min-cjk-ratio", type=float, default=0.05)
@@ -236,6 +242,42 @@ def _stream(
     return dataset.shuffle(seed=seed, buffer_size=buffer_size), resolved_revision or "local"
 
 
+def _local_data_files(path: Path) -> list[Path]:
+    if path.is_file():
+        files = [path]
+    elif path.is_dir():
+        files = sorted(file for file in path.rglob("*") if file.suffix.lower() in {".json", ".jsonl", ".parquet"})
+    else:
+        raise FileNotFoundError(f"local source does not exist: {path}")
+    if not files:
+        raise FileNotFoundError(f"no JSON, JSONL, or Parquet files found under: {path}")
+    return files
+
+
+def _local_stream(path: Path, seed: int) -> Iterable[dict]:
+    from datasets import load_dataset
+
+    streams = []
+    files = _local_data_files(path)
+    for index, suffix in enumerate((".json", ".jsonl", ".parquet")):
+        data_files = [str(file) for file in files if file.suffix.lower() == suffix]
+        if not data_files:
+            continue
+        loader = "parquet" if suffix == ".parquet" else "json"
+        streams.append(load_dataset(loader, data_files=data_files, split="train").shuffle(seed=seed + index))
+    return chain.from_iterable(streams)
+
+
+def _local_source_revision(path: Path) -> str:
+    digest = hashlib.sha256()
+    for file in _local_data_files(path):
+        digest.update(str(file.relative_to(path.parent if path.is_file() else path)).encode())
+        with file.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _collect(
     rows_by_bucket: dict[str, list[dict[str, Any]]],
     targets: Mapping[str, int],
@@ -276,7 +318,7 @@ def _collect(
 def main() -> None:
     args = _parse_args()
 
-    from datasets import Dataset, load_dataset
+    from datasets import Dataset
     from huggingface_hub import HfFolder
     from transformers import AutoTokenizer
 
@@ -287,38 +329,41 @@ def main() -> None:
         "tail_16k_32k": args.tail_count,
     }
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    if args.local_long_data and not args.local_json:
+        raise ValueError("--local-long-data requires --local-json so both short and long buckets use local real data")
     if args.synthetic_only:
         rows_by_bucket = _build_synthetic_rows(targets, tokenizer, args.seed)
         scanned_by_source = {"synthetic-chinese-v1": sum(targets.values())}
         revisions = {"synthetic-chinese-v1": "v1"}
     elif args.local_json:
-        local_path = Path(args.local_json).expanduser().resolve()
-        if not local_path.is_file():
-            raise FileNotFoundError(f"local source does not exist: {local_path}")
+        short_path = Path(args.local_json).expanduser().resolve()
         rows_by_bucket = {name: [] for name in targets}
-        local_stream = load_dataset("json", data_files=str(local_path), split="train").shuffle(seed=args.seed)
-        scanned = _collect(
+        short_scanned = _collect(
             rows_by_bucket,
             targets,
-            local_stream,
-            str(local_path),
+            _local_stream(short_path, args.seed),
+            str(short_path),
             tokenizer,
             args.max_scan_per_source,
-            set(targets),
+            {"short_512_2k", "medium_2k_8k"},
             args.min_cjk_ratio,
         )
-        missing_targets = {
-            name: target - len(rows_by_bucket[name])
-            for name, target in targets.items()
-            if len(rows_by_bucket[name]) < target
-        }
-        if missing_targets:
-            generated = _build_synthetic_rows(missing_targets, tokenizer, args.seed + 2)
-            for name, rows in generated.items():
-                rows_by_bucket[name].extend(rows)
-        source_sha256 = hashlib.sha256(local_path.read_bytes()).hexdigest()
-        scanned_by_source = {str(local_path): scanned, "synthetic-chinese-v1": sum(missing_targets.values())}
-        revisions = {str(local_path): source_sha256, "synthetic-chinese-v1": "v1"}
+        scanned_by_source = {str(short_path): short_scanned}
+        revisions = {str(short_path): _local_source_revision(short_path)}
+        if args.local_long_data:
+            long_path = Path(args.local_long_data).expanduser().resolve()
+            long_scanned = _collect(
+                rows_by_bucket,
+                targets,
+                _local_stream(long_path, args.seed + 1),
+                str(long_path),
+                tokenizer,
+                args.max_scan_per_source,
+                {"long_8k_16k", "tail_16k_32k"},
+                0.0,
+            )
+            scanned_by_source[str(long_path)] = long_scanned
+            revisions[str(long_path)] = _local_source_revision(long_path)
     else:
         rows_by_bucket = {name: [] for name in targets}
         hf_token = HfFolder.get_token()
