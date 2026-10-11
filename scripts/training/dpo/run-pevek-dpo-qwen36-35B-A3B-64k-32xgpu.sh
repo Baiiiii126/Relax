@@ -73,10 +73,8 @@ CKPT_ARGS=(
    # DPO 需要冻结的 reference policy 算 ref logprob; --ref-load 复用现成的
    # ActorFwd / ROLES.reference 机制 (relax/components/actor_fwd.py).
    --ref-load "${HF_CHECKPOINT}"
-   --load "${EXP_DIR}/checkpoints/${EXP_NAME}"
-   --save "${EXP_DIR}/checkpoints/${EXP_NAME}"
-   --save-interval 50
-   --max-actor-ckpt-to-keep 2
+   # 对齐实验不读/不存 checkpoint: 旧的同名 checkpoint 会让
+   # OptimizerParamScheduler 的 total-iterations 断言失败 (同 8 卡对齐脚本).
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
 )
