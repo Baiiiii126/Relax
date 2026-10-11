@@ -10,7 +10,7 @@
 #   目标是"每步 64k token": GBS=76 × ~840 tok/对 ≈ 63.8k.
 #
 # Usage:
-#   bash examples/algorithms/run-pevek-dpo-qwen36-35B-A3B-64k-32xgpu.sh
+#   RAY_ADDRESS=<ray-head> bash scripts/training/dpo/run-pevek-dpo-qwen36-35B-A3B-64k-32xgpu.sh
 
 set -ex
 set -o pipefail
