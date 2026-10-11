@@ -31,7 +31,9 @@ echo "当前时间: $now"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
+    # Use a normalized path: an unnormalized ".../scripts/training/dpo/../../entrypoint/local.sh"
+    # accidentally matches ray-job.sh's "*/scripts/training/*.sh" run-script glob.
+    source "$(cd -- "${SCRIPT_DIR}/../../entrypoint" && pwd)/local.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
 
