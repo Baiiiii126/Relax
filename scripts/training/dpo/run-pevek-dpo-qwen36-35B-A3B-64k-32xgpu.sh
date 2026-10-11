@@ -31,7 +31,7 @@ echo "当前时间: $now"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
+    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
 
