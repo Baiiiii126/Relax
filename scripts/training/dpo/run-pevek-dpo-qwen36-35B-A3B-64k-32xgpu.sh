@@ -2,12 +2,12 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.6-35B-A3B 32xGPU DPO (Direct Preference Optimization) 64k 长序列训练脚本.
+# Qwen3.6-35B-A3B 32xGPU DPO on UltraFeedback (Relax side of the swift 对齐实验).
 # 目标集群: pevek. Ray 集群由外部管理 —— 不要 kill ray 或新建集群.
 #
 # 拓扑 (32 GPU): TP1 / PP2 / CP16 / EP8, DP = 32 / (1*2*16) = 1
-#   40 层 -> 每 PP stage 20 层. 偏好目标按"对"处理, 一对最长 ~120.6k token,
-#   经 CP16 切分后每 rank ~7.5k (vocab 248320 的 fp32 logits 太大, CP 必须够大).
+#   40 层 -> 每 PP stage 20 层. 数据集 UltraFeedback, 短句对,
+#   目标是"每步 64k token": GBS=76 × ~840 tok/对 ≈ 63.8k.
 #
 # Usage:
 #   bash examples/algorithms/run-pevek-dpo-qwen36-35B-A3B-64k-32xgpu.sh
@@ -39,7 +39,7 @@ source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
 # 路径
 # ---------------------------------------------------------------------------
 PROJECT_NAME="${PROJECT_NAME:-Relax/dpo/qwen3.6-35B-A3B}"
-EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-dpo-64k-32xgpu}"
+EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-dpo-uf64ktok-32xgpu}"
 EXP_DIR="${EXP_DIR:-/mnt/tidalfs-bdsz01/dataset/pevek/baihaonan}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}/model}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}/data}"
@@ -84,7 +84,7 @@ CKPT_ARGS=(
 # ---------------------------------------------------------------------------
 # 由 scripts/data/prepare_longreward_preferences.py 从 LongReward-10k 生成,
 # 走 Relax 的显式偏好 schema (prompt / chosen / rejected), 故 --input-key prompt.
-PREFERENCE_DATA="${DATA_DIR}/dpo/preference-64k.jsonl"
+PREFERENCE_DATA="${DATA_DIR}/ultrafeedback/ultrafeedback_train.jsonl"
 if [ ! -r "${PREFERENCE_DATA}" ]; then
     echo "偏好数据不存在: ${PREFERENCE_DATA}" >&2
     echo "先运行: python3 scripts/data/prepare_longreward_preferences.py \\" >&2
@@ -105,8 +105,11 @@ DPO_ARGS=(
    --dpo-beta 0.1
    --prompt-data "${PREFERENCE_DATA}"
    --input-key prompt
-   # 单分支最长 ~60.4k token, 上限取 64k; 回答最长 ~1.4k, 给 4k 足够.
-   --preference-max-length 65536
+   # 精度对齐: 两侧都按文件顺序取前 N 行, 关闭 shuffle (镜像 swift --dataset_shuffle false).
+   --no-dataset-shuffle
+   --seed 42
+   # UltraFeedback 短句对 (最长 ~5.2k), 8192 足够不截断.
+   --preference-max-length 8192
    --preference-max-completion-length 4096
 )
 
@@ -126,18 +129,18 @@ PERF_ARGS=(
    # 离线目标必须显式声明 resource: sft producer 是 CPU-only, actor 占满 32 卡.
    --resource '{"sft":[1,0],"actor":[1,32]}'
    # 每步的偏好"对"数 (一对 = chosen+rejected); DP=2, 每 rank 4 对.
-   --global-batch-size 8
-   # 正式跑 1 个 epoch (9872 对 / batch 8 ≈ 1234 步).
+   --global-batch-size 64
+   # 正式跑 1 个 epoch (4096 对 / batch 64 = 64 步).
    --num-epoch 1
 
-   # 64k 长序列: seq-length 65536, 经 CP16 切分后每 rank ~4k.
-   --seq-length 65536
+   # UltraFeedback 短句对 (平均 ~840 tok/对); 每步 76 对 ≈ 64k token.
+   --seq-length 8192
    --micro-batch-size 1
    --use-dynamic-batch-size
    # 偏好目标按"对"计: 一对 = chosen + rejected, prompt 计两次.
    # --max-tokens-per-gpu 是"每 rank"预算, microbatch 总预算 = 该值 * CP16.
    # 8192 * 16 = 131072 >= 最大的一对 (120.6k) → 没有样本被判 oversize.
-   --max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 4096
 
    --recompute-granularity full
    --recompute-method uniform
