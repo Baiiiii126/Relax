@@ -1047,7 +1047,12 @@ def _get_preference_data_iterator(
             raise ValueError(f"dynamic_global_batch_size values must be identical, got {dynamic_count}")
         dynamic_count = normalized.pop()
     expected_global_pairs = int(args.global_batch_size) if dynamic_count is None else int(dynamic_count)
-    capacity = int(max_tokens_per_gpu or args.max_tokens_per_gpu)
+    # `--max-tokens-per-gpu` is a per-rank budget, so the packed microbatch total
+    # is that budget times the context-parallel degree (same convention as the
+    # non-preference path via `_get_micro_batch_token_capacity`). Using the raw
+    # value made every real pair look oversize and yielded one-pair microbatches.
+    cp_size = max(1, mpu.get_context_parallel_world_size())
+    capacity = _get_micro_batch_token_capacity(args, int(max_tokens_per_gpu or args.max_tokens_per_gpu), cp_size)
     pair_bins = pack_preference_pair_indices(pair_costs, pair_ids, capacity=capacity)
     control_values = [None] * dp_size
     dist.all_gather_object(

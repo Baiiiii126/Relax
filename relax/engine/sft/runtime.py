@@ -111,9 +111,17 @@ def validate_preference_args(args: Namespace) -> None:
         "pipeline_model_parallel_size": int(getattr(args, "pipeline_model_parallel_size", 1) or 1),
         "context_parallel_size": int(getattr(args, "context_parallel_size", 1) or 1),
     }
-    invalid = {name: size for name, size in topology.items() if size != 1}
+    # DPO supports context and pipeline parallelism: the per-branch log-prob sums
+    # are all-reduced across the CP group (see `_preference_branch_sums` in
+    # backends/megatron/loss.py) and the loss is computed on the last PP stage.
+    # Tensor parallelism is not wired yet because the pair identity fields are
+    # indexed per branch. RM keeps the original TP=CP=PP=1 restriction.
+    unsupported = {"tensor_model_parallel_size"}
+    if is_rm_mode(args):
+        unsupported |= {"pipeline_model_parallel_size", "context_parallel_size"}
+    invalid = {name: size for name, size in topology.items() if size != 1 and name in unsupported}
     if invalid:
-        raise ValueError(f"preference objectives v1 require TP=CP=PP=1, got {invalid}")
+        raise ValueError(f"preference objectives do not support this parallelism, got {invalid}")
     if getattr(args, "dynamic_context_parallel", False):
         raise ValueError("preference objectives v1 do not support dynamic context parallelism")
     if getattr(args, "qkv_format", "thd") != "thd":

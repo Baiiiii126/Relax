@@ -210,7 +210,14 @@ def validate_args(args):
 
     # Megatron-Bridge requires --calculate-per-token-loss when context parallelism is enabled.
     # See https://github.com/NVIDIA-NeMo/Megatron-Bridge
-    if args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False):
+    # Preference objectives (DPO/RM) compute their own pair-summed loss and reject
+    # --calculate-per-token-loss, so they are exempt: CP correctness is handled by
+    # `_preference_branch_sums` in backends/megatron/loss.py.
+    from relax.engine.sft.runtime import is_preference_mode
+
+    if (args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False)) and not is_preference_mode(
+        args
+    ):
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )

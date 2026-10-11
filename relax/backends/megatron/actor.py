@@ -809,10 +809,16 @@ class MegatronTrainRayActor(TrainRayActor):
         return is_dpo_mode(self.args) and not self.args.dpo_reference_free
 
     def _assert_dp_reference_digest_equal(self, digest: str) -> None:
-        digests = [None] * dist.get_world_size(group=get_gloo_group())
-        dist.all_gather_object(digests, digest, group=get_gloo_group())
+        # Only ranks holding the same parameter shard must agree. Tensor /
+        # pipeline / expert parallelism give each rank a different slice, and
+        # the per-rank digest is context-parallel-rank dependent, so the
+        # comparison is scoped to the pure data-parallel replica group (same
+        # TP/PP/CP/EP coordinate) instead of the whole world.
+        group = mpu.get_data_parallel_group_gloo(with_context_parallel=False)
+        digests = [None] * dist.get_world_size(group=group)
+        dist.all_gather_object(digests, digest, group=group)
         if len(set(digests)) != 1:
-            raise RuntimeError(f"DPO frozen-reference parameter digests differ across ranks: {digests}")
+            raise RuntimeError(f"DPO frozen-reference parameter digests differ across DP ranks: {digests}")
 
     def _assert_dpo_reference_identity(self, actual: DPOReferenceIdentity) -> None:
         expected = self._expected_dpo_reference_identity
