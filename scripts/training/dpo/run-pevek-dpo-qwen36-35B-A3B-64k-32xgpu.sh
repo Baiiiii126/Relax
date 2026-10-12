@@ -3,14 +3,15 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
 # Qwen3.6-35B-A3B 32xGPU DPO on UltraFeedback (Relax side of the swift 对齐实验).
-# 目标集群: pevek. Ray 集群由外部管理 —— 不要 kill ray 或新建集群.
+# 目标集群: pevek. 支持 PyTorchJob/SPMD 自建 Ray 集群或连接已有 Ray 集群.
 #
 # 拓扑 (32 GPU): TP1 / PP2 / CP16 / EP8, DP = 32 / (1*2*16) = 1
 #   40 层 -> 每 PP stage 20 层. 数据集 UltraFeedback, 短句对,
 #   目标是"每步 64k token": GBS=76 × ~840 tok/对 ≈ 63.8k.
 #
-# Usage:
-#   RAY_ADDRESS=<ray-head> bash scripts/training/dpo/run-pevek-dpo-qwen36-35B-A3B-64k-32xgpu.sh
+# Usage (run as the command of every PyTorchJob pod):
+#   bash scripts/entrypoint/spmd-multinode.sh \
+#     scripts/training/dpo/run-pevek-dpo-qwen36-35B-A3B-64k-32xgpu.sh
 
 set -ex
 set -o pipefail
@@ -51,9 +52,15 @@ mkdir -p "${EXP_DIR}/logs"
 # ---------------------------------------------------------------------------
 # 集群与 ClearML
 # ---------------------------------------------------------------------------
-# Ray head 地址由 pevek 集群提供, 按实际环境覆盖.
-export RAY_ADDRESS="${RAY_ADDRESS:?RAY_ADDRESS 未设置: 请指向 pevek 集群的 Ray head}"
-export RAY_NO_WAIT="${RAY_NO_WAIT:-1}"
+# PyTorchJob/SPMD 模式使用本任务刚启动的 Ray head；外部 Ray 模式仍必须显式传入地址.
+if [ "${RELAX_ENTRYPOINT_MODE:-}" = "spmd-multinode" ]; then
+    export RAY_ADDRESS="${RAY_ADDRESS:-http://${HOST_IP:-${MASTER_ADDR:-127.0.0.1}}:8265}"
+    # Keep the PyTorchJob master alive until the Ray job finishes.
+    unset RAY_NO_WAIT
+else
+    export RAY_ADDRESS="${RAY_ADDRESS:?RAY_ADDRESS 未设置: 请指向 pevek 集群的 Ray head}"
+    export RAY_NO_WAIT="${RAY_NO_WAIT:-1}"
+fi
 
 # MetricsService 可能落在别的节点, 必须用共享路径下的 clearml.conf.
 export CLEARML_CONFIG_FILE="${CLEARML_CONFIG_FILE:-${EXP_DIR}/clearml.conf}"
