@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.6-35B-A3B DPO on 32 GPUs with TP1/PP2/CP2/DP8/EP8.
 # Usage: bash scripts/entrypoint/spmd-multinode.sh \
-#   scripts/training/dpo/run-pevek-dpo-qwen36-35B-A3B-dpo-32xgpu.sh
+#   scripts/training/dpo/run-qwen36-35B-A3B-dpo-32xgpu.sh
 
 set -ex
 set -o pipefail
