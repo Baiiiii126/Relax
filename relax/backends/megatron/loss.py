@@ -1305,7 +1305,7 @@ def _preference_branch_sums(
 ) -> torch.Tensor:
     """Reconstruct differentiable full-sequence branch sums across CP ranks."""
     cp_size = mpu.get_context_parallel_world_size()
-    if cp_size == 1:
+    if cp_size <= 1:
         return masked_sequence_sums(token_values, batch["loss_masks"], device)
 
     max_seq_lens = batch.get("max_seq_lens", None)
