@@ -24,10 +24,13 @@ def test_qwen36_8gpu_dpo_topologies_support_cp_pp_comparison():
     assert "--tensor-model-parallel-size 1" in script
     assert '--pipeline-model-parallel-size "${PP_SIZE}"' in script
     assert '--context-parallel-size "${CP_SIZE}"' in script
-    assert "--expert-model-parallel-size 2" in script
+    assert '--expert-model-parallel-size "${EP_SIZE}"' in script
     assert 'PP_SIZE="${PP_SIZE:-2}"' in script
     assert 'CP_SIZE="${CP_SIZE:-2}"' in script
-    assert "qwen36-35b-a3b-dpo-8xgpu-pp${PP_SIZE}-cp${CP_SIZE}-ep2" in script
+    assert "DP_SIZE=$((ACTOR_WORLD_SIZE / (PP_SIZE * CP_SIZE)))" in script
+    assert "EP_SIZE=$((ACTOR_WORLD_SIZE / PP_SIZE))" in script
+    assert "qwen36-35b-a3b-dpo-8xgpu-pp${PP_SIZE}-cp${CP_SIZE}-dp${DP_SIZE}-ep${EP_SIZE}" in script
+    assert 'NUM_ROLLOUT="${NUM_ROLLOUT:-50}"' in script
 
 
 def test_qwen36_32gpu_dpo_topology_supports_ep8():

@@ -17,8 +17,19 @@ source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
 
 PP_SIZE="${PP_SIZE:-2}"
 CP_SIZE="${CP_SIZE:-2}"
+ACTOR_WORLD_SIZE=8
+if ! [[ "${PP_SIZE}" =~ ^[1-9][0-9]*$ && "${CP_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PP_SIZE and CP_SIZE must be positive integers" >&2
+    exit 1
+fi
+if (( ACTOR_WORLD_SIZE % (PP_SIZE * CP_SIZE) != 0 )); then
+    echo "PP_SIZE * CP_SIZE must divide ${ACTOR_WORLD_SIZE}" >&2
+    exit 1
+fi
+DP_SIZE=$((ACTOR_WORLD_SIZE / (PP_SIZE * CP_SIZE)))
+EP_SIZE=$((ACTOR_WORLD_SIZE / PP_SIZE))
 PROJECT_NAME="${PROJECT_NAME:-Relax/dpo/qwen3.6-35B-A3B}"
-EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-dpo-8xgpu-pp${PP_SIZE}-cp${CP_SIZE}-ep2}"
+EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-dpo-8xgpu-pp${PP_SIZE}-cp${CP_SIZE}-dp${DP_SIZE}-ep${EP_SIZE}}"
 : "${MODEL_DIR:?Set MODEL_DIR to the model root}"
 : "${DATA_DIR:?Set DATA_DIR to the dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
@@ -27,7 +38,7 @@ HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_DIR}/Qwen3.6-35B-A3B}"
 PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/ultrafeedback/ultrafeedback_train.parquet}"
 EVAL_PROMPT_DATA="${EVAL_PROMPT_DATA:-${DATA_DIR}/ultrafeedback/ultrafeedback_eval.parquet}"
 CHECKPOINT_DIR="${SAVE_DIR}/${EXP_NAME}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
 SEQ_LENGTH="${SEQ_LENGTH:-2048}"
 
 CKPT_ARGS=(
@@ -85,7 +96,7 @@ PERF_ARGS=(
    --tensor-model-parallel-size 1
    --pipeline-model-parallel-size "${PP_SIZE}"
    --context-parallel-size "${CP_SIZE}"
-   --expert-model-parallel-size 2
+   --expert-model-parallel-size "${EP_SIZE}"
    --expert-tensor-parallel-size 1
    --recompute-granularity full
    --recompute-method uniform
