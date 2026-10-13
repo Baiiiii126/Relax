@@ -824,6 +824,9 @@ class MegatronTrainRayActor(TrainRayActor):
             parameter_sha256 = canonical_shard_manifest_sha256(shards)
         except ValueError as exc:
             raise RuntimeError(f"DPO frozen-reference shard validation failed: {exc}") from exc
+        # Schema 1/2 sidecars were written by Gloo group rank 0 and contain
+        # only that rank's local shard digest, not the global manifest.
+        self._dpo_reference_rank0_sha256 = shards[0][1]
         return DPOReferenceIdentity(
             schema_version=REFERENCE_IDENTITY_SCHEMA_VERSION,
             parameter_sha256=parameter_sha256,
@@ -833,10 +836,13 @@ class MegatronTrainRayActor(TrainRayActor):
         expected = self._expected_dpo_reference_identity
         if expected is None:
             return
-        if expected.parameter_sha256 != actual.parameter_sha256:
+        actual_digest = actual.parameter_sha256
+        if expected.schema_version < 3:
+            actual_digest = self._dpo_reference_rank0_sha256
+        if expected.parameter_sha256 != actual_digest:
             raise RuntimeError(
                 "DPO frozen-reference identity mismatch: "
-                f"expected parameter_sha256={expected.parameter_sha256}, actual={actual.parameter_sha256}"
+                f"expected parameter_sha256={expected.parameter_sha256}, actual={actual_digest}"
             )
 
     def _rebuild_dpo_reference(self, path: str) -> None:

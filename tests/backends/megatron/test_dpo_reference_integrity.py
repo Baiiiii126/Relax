@@ -127,8 +127,21 @@ def reference_actor_methods():
     return type("ReferenceActor", (), {name: namespace[name] for name in method_names}), namespace
 
 
-def test_actor_builds_reference_identity_from_global_shards(reference_actor_methods):
-    actor_type, namespace = reference_actor_methods
+@pytest.mark.parametrize("schema_version", [None, 1, 2, 3])
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_actor_builds_reference_identity_from_global_shards(schema_version, mismatch):
+    # Identity validation needs no checkpoint loader or GPU backend.
+    source = Path(__file__).resolve().parents[3] / "relax/backends/megatron/actor.py"
+    actor = next(
+        node
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "MegatronTrainRayActor"
+    )
+    names = {"_build_dpo_reference_identity", "_assert_dpo_reference_identity"}
+    methods = [node for node in actor.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    namespace = {"DPOReferenceIdentity": DPOReferenceIdentity}
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), namespace)
+    actor_type = type("ReferenceIdentityActor", (), {name: namespace[name] for name in names})
     gloo_group = object()
     shards = [
         ((0, 1, 2, 3), "a" * 64),
@@ -137,7 +150,7 @@ def test_actor_builds_reference_identity_from_global_shards(reference_actor_meth
     ]
 
     def all_gather_object(output, value, *, group):
-        assert value == shards[0]
+        assert value == shards[-1]
         assert group is gloo_group
         output[:] = shards
 
@@ -147,18 +160,39 @@ def test_actor_builds_reference_identity_from_global_shards(reference_actor_meth
         get_gloo_group=lambda: gloo_group,
         mpu=types.SimpleNamespace(
             get_tensor_model_parallel_rank=lambda: 0,
-            get_pipeline_model_parallel_rank=lambda: 1,
+            get_pipeline_model_parallel_rank=lambda: 0,
             get_expert_model_parallel_rank=lambda: 2,
             get_expert_tensor_parallel_rank=lambda: 3,
         ),
         dist=types.SimpleNamespace(get_world_size=lambda *, group: len(shards), all_gather_object=all_gather_object),
     )
 
-    identity = actor_type()._build_dpo_reference_identity("a" * 64)
+    instance = actor_type()
+    identity = instance._build_dpo_reference_identity("b" * 64)
     assert identity == DPOReferenceIdentity(
         REFERENCE_IDENTITY_SCHEMA_VERSION,
         canonical_shard_manifest_sha256(shards),
     )
+    instance._expected_dpo_reference_identity = None
+    if schema_version is not None:
+        expected_digest = "a" * 64 if schema_version < 3 else identity.parameter_sha256
+        if mismatch:
+            # Legacy identity must match the writer, not another valid shard;
+            # the current format must also detect changes outside rank 0.
+            expected_digest = (
+                "b" * 64
+                if schema_version < 3
+                else canonical_shard_manifest_sha256([*shards[:-1], (shards[-1][0], "c" * 64)])
+            )
+        instance._expected_dpo_reference_identity = DPOReferenceIdentity(schema_version, expected_digest)
+    if mismatch and schema_version is not None:
+        with pytest.raises(RuntimeError, match="frozen-reference identity mismatch"):
+            instance._assert_dpo_reference_identity(identity)
+    else:
+        instance._assert_dpo_reference_identity(identity)
+    # Successful legacy validation still produces the current global format
+    # for the next checkpoint, rather than perpetuating rank-local sidecars.
+    assert identity.schema_version == REFERENCE_IDENTITY_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize(
@@ -237,9 +271,12 @@ def test_reference_rebuild_preserves_actor_and_optimizer(
         sidecar = tmp_path / "relax_dpo_reference.json"
         sidecar.write_text(json.dumps(payload), encoding="utf-8")
         instance._expected_dpo_reference_identity = read_reference_identity(sidecar)
-    instance._build_dpo_reference_identity = lambda digest: DPOReferenceIdentity(
-        REFERENCE_IDENTITY_SCHEMA_VERSION, digest
-    )
+
+    def build_identity(digest):
+        instance._dpo_reference_rank0_sha256 = digest
+        return DPOReferenceIdentity(REFERENCE_IDENTITY_SCHEMA_VERSION, digest)
+
+    instance._build_dpo_reference_identity = build_identity
 
     def load_reference(model, loaded_optimizer, scheduler, **kwargs):
         assert model is instance.model
