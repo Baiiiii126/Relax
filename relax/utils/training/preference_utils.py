@@ -30,14 +30,7 @@ def masked_sequence_sums(
     *,
     require_supervised: bool = True,
 ) -> torch.Tensor:
-    """Sum each branch against its already aligned mask, preserving gradients
-    and dtype.
-
-    ``require_supervised=False`` is used by the context-parallel DPO path: a
-    single CP rank can own none of a branch's completion tokens (the mask is
-    all zeros), which is legitimate because the per-rank partial sums are
-    all-reduced into the full-sequence sum by the caller.
-    """
+    """Sum each branch against its aligned mask while preserving gradients."""
     if len(values) != len(masks):
         raise ValueError("preference token values/masks are not branch aligned")
     sums = []

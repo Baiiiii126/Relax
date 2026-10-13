@@ -135,7 +135,9 @@ from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .reference_integrity import (
+    REFERENCE_IDENTITY_SCHEMA_VERSION,
     DPOReferenceIdentity,
+    canonical_shard_manifest_sha256,
     canonical_tensor_sha256,
     read_reference_identity,
     reference_identity_path,
@@ -808,17 +810,24 @@ class MegatronTrainRayActor(TrainRayActor):
     def _is_standard_dpo(self) -> bool:
         return is_dpo_mode(self.args) and not self.args.dpo_reference_free
 
-    def _assert_dp_reference_digest_equal(self, digest: str) -> None:
-        # Only ranks holding the same parameter shard must agree. Tensor /
-        # pipeline / expert parallelism give each rank a different slice, and
-        # the per-rank digest is context-parallel-rank dependent, so the
-        # comparison is scoped to the pure data-parallel replica group (same
-        # TP/PP/CP/EP coordinate) instead of the whole world.
-        group = mpu.get_data_parallel_group_gloo(with_context_parallel=False)
-        digests = [None] * dist.get_world_size(group=group)
-        dist.all_gather_object(digests, digest, group=group)
-        if len(set(digests)) != 1:
-            raise RuntimeError(f"DPO frozen-reference parameter digests differ across DP ranks: {digests}")
+    def _build_dpo_reference_identity(self, shard_digest: str) -> DPOReferenceIdentity:
+        coordinate = (
+            mpu.get_tensor_model_parallel_rank(),
+            mpu.get_pipeline_model_parallel_rank(),
+            mpu.get_expert_model_parallel_rank(),
+            mpu.get_expert_tensor_parallel_rank(),
+        )
+        group = get_gloo_group()
+        shards: list[Any] = [None] * dist.get_world_size(group=group)
+        dist.all_gather_object(shards, (coordinate, shard_digest), group=group)
+        try:
+            parameter_sha256 = canonical_shard_manifest_sha256(shards)
+        except ValueError as exc:
+            raise RuntimeError(f"DPO frozen-reference shard validation failed: {exc}") from exc
+        return DPOReferenceIdentity(
+            schema_version=REFERENCE_IDENTITY_SCHEMA_VERSION,
+            parameter_sha256=parameter_sha256,
+        )
 
     def _assert_dpo_reference_identity(self, actual: DPOReferenceIdentity) -> None:
         expected = self._expected_dpo_reference_identity
@@ -879,7 +888,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 checkpointing_context={},
                 skip_load_to_model_and_opt=False,
             )
-            candidate_sha256 = canonical_tensor_sha256(
+            shard_digest = canonical_tensor_sha256(
                 named_params_and_buffers(
                     self.args,
                     self.model,
@@ -887,11 +896,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     translate_gpu_to_cpu=True,
                 )
             )
-            self._assert_dp_reference_digest_equal(candidate_sha256)
-            candidate = DPOReferenceIdentity(
-                schema_version=2,
-                parameter_sha256=candidate_sha256,
-            )
+            candidate = self._build_dpo_reference_identity(shard_digest)
             self._assert_dpo_reference_identity(candidate)
             self.weights_backuper.backup("ref")
             self._dpo_reference_identity = candidate

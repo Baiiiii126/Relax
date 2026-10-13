@@ -1,20 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Convert the LongReward-10k long-context preference set into Relax's DPO
-format.
-
-Source rows are ``{"idx", "context", "query", "answer", "win_response",
-"lose_response"}`` (long-context QA: the ``context`` carries tens of thousands
-of tokens). They are rewritten into the explicit preference schema consumed by
-``relax/engine/sft/dataset/preference.py``::
-
-    {"prompt": [{"role": "user", "content": <context + query>}],
-     "chosen": {"role": "assistant", "content": <win_response>},
-     "rejected": {"role": "assistant", "content": <lose_response>},
-     "metadata": {...}}
-
-Run with ``--input-key prompt`` on the training side.
-"""
+"""Convert LongReward-10k rows to Relax's DPO preference schema."""
 
 import argparse
 import json

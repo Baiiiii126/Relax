@@ -38,6 +38,7 @@ from relax.utils.training.preference_utils import (
     dpo_rewards,
     masked_sequence_sums,
     preference_accuracy,
+    require_tensor_condition,
     reward_model_pair_loss,
     select_packed_sequence_scores,
 )
@@ -1290,21 +1291,19 @@ def sft_loss_function(
     )
 
 
+def _all_reduce_forward_only(value: torch.Tensor, group: Any) -> torch.Tensor:
+    reduced = value.detach().clone()
+    dist.all_reduce(reduced, group=group)
+    return reduced + (value - value.detach())
+
+
 def _preference_branch_sums(
     args: Namespace,
     batch: RolloutBatch,
     token_values: Sequence[torch.Tensor],
     device: torch.device,
 ) -> torch.Tensor:
-    """Sum per-branch log-probabilities over each branch's full sequence.
-
-    With context parallelism each rank owns a disjoint slice of every branch, so
-    the aligned mask is sliced into the CP log-prob layout, summed locally, and
-    all-reduced (SUM) across the CP group. The DPO objective applies a
-    non-linear ``log sigmoid`` to the pair margin, so the full-sequence sums must
-    be reconstructed *before* the objective — a per-rank partial sum cannot be
-    corrected by the gradient all-reduce alone.
-    """
+    """Reconstruct differentiable full-sequence branch sums across CP ranks."""
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size == 1:
         return masked_sequence_sums(token_values, batch["loss_masks"], device)
@@ -1328,10 +1327,16 @@ def _preference_branch_sums(
             zip(batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True)
         )
     ]
-    # A CP rank may own none of a branch's completion tokens; its partial sum is
-    # legitimately zero and the all-reduce below recovers the full-sequence sum.
+    supervised = torch.stack(
+        [torch.as_tensor(mask, device=device).to(dtype=torch.bool).any().to(dtype=torch.int32) for mask in local_masks]
+    )
+    dist.all_reduce(supervised, group=mpu.get_context_parallel_group())
+    require_tensor_condition(
+        (supervised > 0).all(),
+        "preference branch completion mask must contain at least one supervised token",
+    )
     local_sums = masked_sequence_sums(token_values, local_masks, device, require_supervised=False)
-    return dist.nn.all_reduce(local_sums, group=mpu.get_context_parallel_group())
+    return _all_reduce_forward_only(local_sums, mpu.get_context_parallel_group())
 
 
 def dpo_loss_function(
@@ -1410,8 +1415,6 @@ def dpo_loss_function(
         metrics["dpo/ref_logps_rejected"] = reference_rejected.detach().sum()
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size > 1:
-        # Every CP rank reconstructs the same full-sequence sums, so the DP*CP
-        # metric all-reduce would count each metric `cp_size` times; pre-divide.
         metrics = {key: value / cp_size for key, value in metrics.items()}
     return loss, metrics
 

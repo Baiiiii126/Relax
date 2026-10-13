@@ -111,11 +111,6 @@ def validate_preference_args(args: Namespace) -> None:
         "pipeline_model_parallel_size": int(getattr(args, "pipeline_model_parallel_size", 1) or 1),
         "context_parallel_size": int(getattr(args, "context_parallel_size", 1) or 1),
     }
-    # DPO supports context and pipeline parallelism: the per-branch log-prob sums
-    # are all-reduced across the CP group (see `_preference_branch_sums` in
-    # backends/megatron/loss.py) and the loss is computed on the last PP stage.
-    # Tensor parallelism is not wired yet because the pair identity fields are
-    # indexed per branch. RM keeps the original TP=CP=PP=1 restriction.
     unsupported = {"tensor_model_parallel_size"}
     if is_rm_mode(args):
         unsupported |= {"pipeline_model_parallel_size", "context_parallel_size"}
