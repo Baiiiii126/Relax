@@ -47,11 +47,11 @@ def test_qwen36_32gpu_dpo_topology_supports_ep8():
     script = (DPO_DIR / "run-qwen36-35B-A3B-dpo-32xgpu.sh").read_text(encoding="utf-8")
     assert "--tensor-model-parallel-size 1" in script
     assert "--pipeline-model-parallel-size 2" in script
-    assert "--context-parallel-size 2" in script
+    assert "--context-parallel-size 16" in script
     assert "--expert-model-parallel-size 8" in script
-    assert "--max-tokens-per-gpu 8192" in script
-    assert "--sequence-parallel" not in script
-    assert "TP1/PP2/CP2/DP8/EP8" in script
+    assert "--max-tokens-per-gpu 4096" in script
+    assert "--sequence-parallel" in script
+    assert "TP1 / PP2 / CP16 / EP8" in script
 
 
 def test_qwen36_32gpu_dpo_propagates_worker_environment():

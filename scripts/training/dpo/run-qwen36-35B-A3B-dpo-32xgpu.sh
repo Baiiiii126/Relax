@@ -14,6 +14,8 @@
 set -ex
 set -o pipefail
 
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 
@@ -45,6 +47,23 @@ RAY_ADDRESS="${RAY_ADDRESS:-http://${HOST_IP:-127.0.0.1}:8265}"
 # MetricsService 可能落在别的节点, 必须用共享路径下的 clearml.conf.
 export CLEARML_CONFIG_FILE="${CLEARML_CONFIG_FILE:-${EXP_DIR}/clearml.conf}"
 export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}CLEARML_CONFIG_FILE"
+
+RUNTIME_ENV_JSON="$(python3 -c '
+import json, os
+runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
+env = runtime.setdefault("env_vars", {})
+names = {
+    name.strip()
+    for source in (env.get("RELAX_PROPAGATE_ENV_VARS", ""), os.environ.get("RELAX_PROPAGATE_ENV_VARS", ""))
+    for name in source.split(",")
+    if name.strip()
+}
+names.update(("PYTORCH_CUDA_ALLOC_CONF", "CLEARML_CONFIG_FILE"))
+env.update({name: os.environ[name] for name in ("PYTORCH_CUDA_ALLOC_CONF", "CLEARML_CONFIG_FILE")})
+env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(sorted(names))
+print(json.dumps(runtime))
+')"
+export RUNTIME_ENV_JSON
 
 # ---------------------------------------------------------------------------
 # 模型 / checkpoint
@@ -92,6 +111,7 @@ DPO_ARGS=(
    # UltraFeedback 短句对 (最长 ~5.2k), 8192 足够不截断.
    --preference-max-length 8192
    --preference-max-completion-length 4096
+   --use-gloo-process-groups
 )
 
 # ---------------------------------------------------------------------------
