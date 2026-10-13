@@ -19,6 +19,17 @@ def test_qwen36_dpo_scripts_have_required_runtime_flags():
         assert '--save "${CHECKPOINT_DIR}"' in script
 
 
+def test_qwen36_8gpu_dpo_topologies_support_cp_pp_comparison():
+    script = (DPO_DIR / "run-qwen36-35B-A3B-dpo-8xgpu.sh").read_text(encoding="utf-8")
+    assert "--tensor-model-parallel-size 1" in script
+    assert '--pipeline-model-parallel-size "${PP_SIZE}"' in script
+    assert '--context-parallel-size "${CP_SIZE}"' in script
+    assert "--expert-model-parallel-size 2" in script
+    assert 'PP_SIZE="${PP_SIZE:-2}"' in script
+    assert 'CP_SIZE="${CP_SIZE:-2}"' in script
+    assert "qwen36-35b-a3b-dpo-8xgpu-pp${PP_SIZE}-cp${CP_SIZE}-ep2" in script
+
+
 def test_qwen36_32gpu_dpo_topology_supports_ep8():
     script = (DPO_DIR / "run-qwen36-35B-A3B-dpo-32xgpu.sh").read_text(encoding="utf-8")
     assert "--tensor-model-parallel-size 1" in script

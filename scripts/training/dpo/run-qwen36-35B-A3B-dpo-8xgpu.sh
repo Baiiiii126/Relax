@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.6-35B-A3B DPO on one 8-GPU node with TP1/PP1/CP1/DP8/EP8.
+# Qwen3.6-35B-A3B DPO on one 8-GPU node.
+# Use PP_SIZE=1 CP_SIZE=1 for baseline or PP_SIZE=2 CP_SIZE=2 for CP/PP.
 
 set -ex
 set -o pipefail
@@ -14,8 +15,10 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
 
+PP_SIZE="${PP_SIZE:-2}"
+CP_SIZE="${CP_SIZE:-2}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/dpo/qwen3.6-35B-A3B}"
-EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-dpo-8xgpu}"
+EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-dpo-8xgpu-pp${PP_SIZE}-cp${CP_SIZE}-ep2}"
 : "${MODEL_DIR:?Set MODEL_DIR to the model root}"
 : "${DATA_DIR:?Set DATA_DIR to the dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
@@ -80,9 +83,9 @@ OPTIMIZER_ARGS=(
 
 PERF_ARGS=(
    --tensor-model-parallel-size 1
-   --pipeline-model-parallel-size 1
-   --context-parallel-size 1
-   --expert-model-parallel-size 8
+   --pipeline-model-parallel-size "${PP_SIZE}"
+   --context-parallel-size "${CP_SIZE}"
+   --expert-model-parallel-size 2
    --expert-tensor-parallel-size 1
    --recompute-granularity full
    --recompute-method uniform
