@@ -25,12 +25,22 @@ def test_qwen36_8gpu_dpo_topologies_support_cp_pp_comparison():
     assert '--pipeline-model-parallel-size "${PP_SIZE}"' in script
     assert '--context-parallel-size "${CP_SIZE}"' in script
     assert '--expert-model-parallel-size "${EP_SIZE}"' in script
-    assert 'PP_SIZE="${PP_SIZE:-2}"' in script
-    assert 'CP_SIZE="${CP_SIZE:-2}"' in script
+    assert 'PARALLEL_CASE="${PARALLEL_CASE:?Set PARALLEL_CASE to baseline, cp, or pp}"' in script
+    assert "baseline)\n        PP_SIZE=1\n        CP_SIZE=1" in script
+    assert "cp)\n        PP_SIZE=1\n        CP_SIZE=2" in script
+    assert "pp)\n        PP_SIZE=2\n        CP_SIZE=1" in script
+    assert "ACTOR_WORLD_SIZE=8" in script
+    assert "EP_SIZE=4" in script
     assert "DP_SIZE=$((ACTOR_WORLD_SIZE / (PP_SIZE * CP_SIZE)))" in script
-    assert "EP_SIZE=$((ACTOR_WORLD_SIZE / PP_SIZE))" in script
-    assert "qwen36-35b-a3b-dpo-8xgpu-pp${PP_SIZE}-cp${CP_SIZE}-dp${DP_SIZE}-ep${EP_SIZE}" in script
+    assert ': "${EXP_NAME:?Set a fresh EXP_NAME for every comparison run}"' in script
+    assert 'if [ -e "${CHECKPOINT_DIR}" ]; then' in script
     assert 'NUM_ROLLOUT="${NUM_ROLLOUT:-50}"' in script
+    assert 'PACKED_TOKEN_CAPACITY="${PACKED_TOKEN_CAPACITY:-4096}"' in script
+    assert '--max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"' in script
+    assert '--save-interval "${SAVE_INTERVAL:-100}"' in script
+    assert '--resource "{\\"sft\\":[1,0],\\"actor\\":[1,${ACTOR_WORLD_SIZE}]}"' in script
+    assert "--eval-prompt-data" not in script
+    assert "--eval-interval" not in script
 
 
 def test_qwen36_32gpu_dpo_topology_supports_ep8():
