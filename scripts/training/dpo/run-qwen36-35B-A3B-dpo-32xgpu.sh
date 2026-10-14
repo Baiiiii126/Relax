@@ -189,6 +189,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS}" \
    -- python3 -m relax.entrypoints.train \
    --colocate \
    --use-health-check \
+   --selective-offload \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${DPO_ARGS[@]}" \
