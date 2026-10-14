@@ -5,7 +5,7 @@
 Four questions, one command, two log files, no GPU and no ClearML:
 
   1. theory  -- bubble ratio the schedule should save
-  2. actual  -- wall-clock ratio the step actually got
+  2. actual  -- actor-train ratio the step actually got
   3. align   -- actual / theory
   4. gap     -- which logged cost multiplier accounts for the shortfall
 
@@ -13,8 +13,10 @@ Nothing is recomputed here. The chunkflow arm already logs the whole theory
 side per step -- ``train/chunkflow/num_microbatches``, ``num_units``, the two
 ``equal_unit_fill_drain_*_proxy`` values, and the cost multipliers -- inside its
 ``step <id>: {...}`` stdout line. Every arm logs ``perf/step_time`` in its
-``perf <id>: {...}`` line. So an A/B pair of ordinary runs is enough; the
-standalone theory calculator is only needed to *predict* before running.
+``perf <id>: {...}`` line. The default uses ``perf/actor_train_time`` to isolate
+the scheduler; ``--metric step_time`` reports the end-to-end ratio instead. So
+an A/B pair of ordinary runs is enough; the standalone theory calculator is
+only needed to *predict* before running.
 
     python scripts/training/sft/tools/chunkflow_align.py \
         --baseline baseline.log --chunkflow chunkflow.log
@@ -28,9 +30,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import random
 import re
 from pathlib import Path
 from typing import Any, Iterator
+
 
 # Suffix-matched so the tool works for actor (``train/chunkflow/...``) and for
 # any role-prefixed variant (``train/critic-chunkflow/...``) alike.
@@ -43,10 +47,11 @@ CHUNKFLOW_KEYS = {
     "tok_recomp": "chunkflow/token_forward_recompute_multiplier",
     "attn_recomp": "chunkflow/attention_forward_recompute_multiplier",
     "launch": "chunkflow/launch_amplification",
+    "logical_attn": "chunkflow/logical_attention_pairs",
+    "kernel_rect": "chunkflow/kernel_rect_pairs",
+    "p2p_messages": "chunkflow/p2p_messages",
+    "p2p_rows": "chunkflow/p2p_row_transfers",
 }
-# Not a multiplier (units per micro-batch), listed for context only.
-NON_MULTIPLIER = {"launch"}
-MULTIPLIERS = ("frag", "tok_recomp", "attn_recomp")
 
 
 def _pick(row: dict[str, Any], suffix: str) -> float | None:
@@ -73,13 +78,11 @@ def _iter_dicts(text: str, label: str) -> Iterator[tuple[int, dict[str, Any]]]:
             continue
 
 
-def _step_times(path: Path) -> dict[int, float]:
-    times: dict[int, float] = {}
+def _perf_rows(path: Path) -> dict[int, dict[str, Any]]:
+    rows: dict[int, dict[str, Any]] = {}
     for index, row in _iter_dicts(path.read_text(errors="replace"), "perf"):
-        value = _pick(row, "perf/step_time")
-        if value is not None:
-            times[index] = value
-    return times
+        rows[index] = row
+    return rows
 
 
 def _theory(path: Path) -> dict[int, dict[str, float]]:
@@ -91,18 +94,28 @@ def _theory(path: Path) -> dict[int, dict[str, float]]:
     return out
 
 
-def _pair(baseline: Path, chunkflow: Path) -> list[dict[str, float]]:
-    t_base = _step_times(baseline)
-    t_cf = _step_times(chunkflow)
+def _pair(baseline: Path, chunkflow: Path, metric: str) -> list[dict[str, float]]:
+    perf_base = _perf_rows(baseline)
+    perf_cf = _perf_rows(chunkflow)
     theory = _theory(chunkflow)
 
     rows = []
-    for index in sorted(set(t_base) & set(t_cf) & set(theory)):
+    for index in sorted(set(perf_base) & set(perf_cf) & set(theory)):
         t = theory[index]
-        if not t_base[index] or not t_cf[index] or not t["bubble_cf"]:
+        t_base = _pick(perf_base[index], f"perf/{metric}")
+        t_cf = _pick(perf_cf[index], f"perf/{metric}")
+        if not t_base or not t_cf or not t["bubble_cf"]:
             continue
+        tokens_base = _pick(perf_base[index], "perf/actor_train_tokens")
+        tokens_cf = _pick(perf_cf[index], "perf/actor_train_tokens")
+        if tokens_base is not None and tokens_cf is not None and tokens_base != tokens_cf:
+            raise ValueError(
+                f"step {index}: paired arms processed different token counts "
+                f"({tokens_base:g} != {tokens_cf:g}); inputs are not comparable"
+            )
         theory_x = t["bubble_base"] / t["bubble_cf"]
-        actual_x = t_base[index] / t_cf[index]
+        actual_x = t_base / t_cf
+        logical_attn = t.get("logical_attn", 0.0)
         rows.append(
             {
                 "step": index,
@@ -112,39 +125,96 @@ def _pair(baseline: Path, chunkflow: Path) -> list[dict[str, float]]:
                 "actual_x": actual_x,
                 "align": actual_x / theory_x,
                 "gap": theory_x / actual_x,
-                **{name: t.get(name, 1.0) for name in MULTIPLIERS},
+                "base_time": t_base,
+                "cf_time": t_cf,
+                "tokens": tokens_base or 0.0,
+                "frag": t.get("frag", 1.0),
+                "tok_recomp": t.get("tok_recomp", 1.0),
+                "attn_recomp": t.get("attn_recomp", 1.0),
+                "rect_attn": t.get("kernel_rect", 0.0) / logical_attn if logical_attn else 0.0,
                 "launch": t.get("launch", 1.0),
+                "p2p_messages": t.get("p2p_messages", 0.0),
+                "p2p_rows": t.get("p2p_rows", 0.0),
             }
         )
     return rows
 
 
-_HEAD = ("step", "M", "U", "theory_x", "actual_x", "align", "gap", "frag", "tok_recomp", "attn_recomp", "launch")
-_FMT = ("{:>4}", "{:>3}", "{:>4}", "{:>8.3f}", "{:>8.3f}", "{:>6.3f}", "{:>6.3f}",
-        "{:>6.3f}", "{:>10.3f}", "{:>11.3f}", "{:>7.1f}")
+_HEAD = (
+    "step",
+    "M",
+    "U",
+    "theory_x",
+    "actual_x",
+    "align",
+    "frag",
+    "tok_recomp",
+    "attn_recomp",
+    "rect_attn",
+    "launch",
+)
+_FMT = (
+    "{:>4}",
+    "{:>3}",
+    "{:>4}",
+    "{:>8.3f}",
+    "{:>8.3f}",
+    "{:>6.3f}",
+    "{:>6.3f}",
+    "{:>10.3f}",
+    "{:>11.3f}",
+    "{:>9.3f}",
+    "{:>7.1f}",
+)
 
 
 def _mean(rows: list[dict[str, float]], key: str) -> float:
     return sum(row[key] for row in rows) / len(rows)
 
 
+def _aggregate_speedup(rows: list[dict[str, float]]) -> float:
+    """Ratio of total paired wall times, the primary A/B estimator."""
+    return sum(row["base_time"] for row in rows) / sum(row["cf_time"] for row in rows)
+
+
+def _bootstrap_ci(rows: list[dict[str, float]], samples: int, seed: int) -> tuple[float, float] | None:
+    """Paired bootstrap confidence interval for the aggregate speedup."""
+    if samples <= 0 or len(rows) < 2:
+        return None
+    rng = random.Random(seed)
+    estimates = []
+    for _ in range(samples):
+        draw = [rows[rng.randrange(len(rows))] for _ in rows]
+        estimates.append(_aggregate_speedup(draw))
+    estimates.sort()
+    return estimates[int(0.025 * (samples - 1))], estimates[int(0.975 * (samples - 1))]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--baseline", type=Path, required=True, help="baseline arm log (CHUNK_SIZE=0)")
     parser.add_argument("--chunkflow", type=Path, required=True, help="chunkflow arm log (CHUNK_SIZE>0)")
+    parser.add_argument(
+        "--metric",
+        choices=["actor_train_time", "step_time"],
+        default="actor_train_time",
+        help="A/B timing metric; actor_train_time isolates the scheduler (default)",
+    )
     parser.add_argument("--drop-first", type=int, default=0, help="steps to drop as warmup before averaging")
+    parser.add_argument("--bootstrap-samples", type=int, default=10_000, help="paired bootstrap resamples for 95%% CI")
+    parser.add_argument("--seed", type=int, default=1234, help="bootstrap seed")
     args = parser.parse_args()
 
-    rows = _pair(args.baseline, args.chunkflow)
+    rows = _pair(args.baseline, args.chunkflow, args.metric)
     if args.drop_first:
-        rows = rows[args.drop_first:]
+        rows = rows[args.drop_first :]
     if not rows:
         raise SystemExit(
             "no paired steps: check that both logs come from the same data/seed/parallel layout "
             "and that the chunkflow arm actually ran with --use-chunkflow"
         )
 
-    header = " ".join(f"{name:>{width}}" for name, width in zip(_HEAD, (4, 3, 4, 8, 8, 6, 6, 6, 10, 11, 7)))
+    header = " ".join(f"{name:>{width}}" for name, width in zip(_HEAD, (4, 3, 4, 8, 8, 6, 6, 10, 11, 9, 7)))
     print(header)
     print("-" * len(header))
     for row in rows:
@@ -154,20 +224,20 @@ def main() -> None:
     print(" ".join(mean_cells))
 
     theory_x = _mean(rows, "theory_x")
-    actual_x = _mean(rows, "actual_x")
-    gap = theory_x / actual_x
-    product = 1.0
-    for name in MULTIPLIERS:
-        product *= _mean(rows, name)
+    actual_x = _aggregate_speedup(rows)
+    ci = _bootstrap_ci(rows, args.bootstrap_samples, args.seed)
 
     print()
-    print(f"theory_x = {theory_x:.3f}   actual_x = {actual_x:.3f}   align = {actual_x / theory_x:.3f}")
-    print(f"gap = {gap:.3f}  (the schedule promised {theory_x:.2f}x, the step delivered {actual_x:.2f}x)")
-    print(f"logged multipliers: frag {_mean(rows, 'frag'):.3f} | tok_recomp {_mean(rows, 'tok_recomp'):.3f} | "
-          f"attn_recomp {_mean(rows, 'attn_recomp'):.3f}  ->  product {product:.3f}")
-    print(f"residual after multipliers = {gap / product:.3f}"
-          "  (≈1 means the logged costs explain the gap; >1 points at unmodeled cost, "
-          "primarily launch_amplification and p2p)")
+    ci_text = "" if ci is None else f"   bootstrap_95%_ci=[{ci[0]:.3f}, {ci[1]:.3f}]"
+    print(f"metric = perf/{args.metric}   paired_steps = {len(rows)}")
+    print(f"mean_theory_x = {theory_x:.3f}   aggregate_actual_x = {actual_x:.3f}{ci_text}")
+    print(f"alignment = {actual_x / theory_x:.3f}   gap = {theory_x / actual_x:.3f}")
+    print(
+        f"cost proxies (reported separately, not multiplied): frag {_mean(rows, 'frag'):.3f} | "
+        f"tok_recomp {_mean(rows, 'tok_recomp'):.3f} | attn_recomp {_mean(rows, 'attn_recomp'):.3f} | "
+        f"rect_attn {_mean(rows, 'rect_attn'):.3f} | launch {_mean(rows, 'launch'):.1f} | "
+        f"p2p_messages {_mean(rows, 'p2p_messages'):.0f}"
+    )
 
 
 if __name__ == "__main__":

@@ -60,24 +60,21 @@ removed. Continue validation in Relax:
 5. Restore TP, sequence parallel, dynamic batching, bf16, and fused kernels one
    at a time. PP=4 is held constant in both arms throughout.
 
-Run the three forward-isolation arms with the same script:
+Run the two deterministic arms with the same script:
 
 ```bash
 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh baseline
-bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh control
 bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh chunkflow
 ```
 
-If `control` differs from `baseline`, inspect input identity, the replaced
-attention kernel, and unit loss slicing. If only `chunkflow` differs, inspect
-prefix RoPE and q-short/kv-long causal attention.
+If `chunkflow` differs from `baseline`, inspect input identity, prefix RoPE,
+q-short/kv-long causal attention, and unit loss slicing.
 
 ## Current launch verdict
 
-UNSAFE until the code fixes pass unit tests and a clean PP=4 golden-sample run.
-The existing 4B script now isolates PP (`TP=CP=EP=DP=1`, `PP=4`), uses a
-global batch of one so the required dynamic batching cannot pack multiple
-samples, fixes both arms to 60 steps, disables fused RoPE in both arms, and
-keeps `staggered` with `keep_last_k=0`. Relax currently forces Megatron training
-to bf16 in its argument defaults; changing that requires a separately approved
-argument-parser change.
+UNSAFE until the code fixes pass unit tests and a clean GPU golden-sample run.
+The 4B script defaults to the final 8-card topology (`TP=2`, `PP=4`, `DP=1`),
+but accepts `TP_SIZE=2 PP_SIZE=2` for a 4-card correctness smoke. Both arms
+disable fused RoPE and keep `staggered` with `keep_last_k=0`. Relax currently
+forces Megatron training to bf16 in its argument defaults; changing that
+requires a separately approved argument-parser change.

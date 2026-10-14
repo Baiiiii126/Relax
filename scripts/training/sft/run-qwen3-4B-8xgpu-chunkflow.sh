@@ -2,7 +2,7 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B SFT loss alignment, 4 GPUs, TP1 x PP4.
+# Qwen3-4B SFT ChunkFlow benefit A/B, 8 GPUs, TP2 x PP4 x DP1.
 #
 #   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh baseline
 #   bash scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh chunkflow
@@ -25,21 +25,27 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=1}"
 SEQ_LENGTH="${SEQ_LENGTH:-32768}"
 # Micro-batch count M is a property of the data: the samples in one step are
 # first-fit packed into bins of MAX_TOKENS_PER_GPU (see
-# relax/utils/data/data.py:get_first_fit_partitions). Raise GBS for more samples
+# relax/utils/data/data.py:get_minimum_num_micro_batch_size). Raise GBS for more samples
 # per step; lower MAX_TOKENS_PER_GPU for more, smaller micro-batches. Defaults
 # reproduce the original single-sample behaviour (M = 1).
 GBS="${GBS:-1}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${SEQ_LENGTH}}"
 
-PP_SIZE=4
+TP_SIZE="${TP_SIZE:-2}"
+PP_SIZE="${PP_SIZE:-4}"
+if [ $((36 % PP_SIZE)) -ne 0 ]; then
+   echo "ERROR: PP_SIZE=${PP_SIZE} must divide Qwen3-4B's 36 layers" >&2
+   exit 2
+fi
+NUM_GPUS=$((TP_SIZE * PP_SIZE))
 MODE="${1:-chunkflow}"
 case "${MODE}" in
    baseline)
       CHUNK_SIZE=0
       ;;
    chunkflow)
-      # The fixed validation sample is currently 353 tokens. Keep the default
-      # below that length so this arm exercises real multi-chunk execution.
+      # Keep this below the benchmark dataset's 16K-32K sequences so this arm
+      # exercises real multi-chunk execution.
       CHUNK_SIZE="${CHUNK_SIZE:-128}"
       ;;
    *)
@@ -63,7 +69,7 @@ else
    ARM="baseline"
 fi
 
-PROJECT_NAME="${PROJECT_NAME:-Relax/dev/chunkflow-loss-alignment}"
+PROJECT_NAME="${PROJECT_NAME:-Relax/dev/chunkflow-benefit}"
 EXP_NAME="${EXP_NAME:-qwen3-4b-sft-${ARM}}"
 
 if [ ! -e "${MODEL_DIR}/Qwen3-4B" ]; then
@@ -107,8 +113,13 @@ target["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"] = os.environ["RELAX_CHUNKFLOW_PIPELI
 print(json.dumps(env))
 ')
 
+TP_ARGS=(--tensor-model-parallel-size ${TP_SIZE})
+if [ "${TP_SIZE}" -gt 1 ]; then
+   TP_ARGS+=(--sequence-parallel)
+fi
+
 PERF_ARGS=(
-   --tensor-model-parallel-size 1
+   "${TP_ARGS[@]}"
    --pipeline-model-parallel-size ${PP_SIZE}
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -145,12 +156,14 @@ CLEARML_ARGS=(
 )
 
 mkdir -p log
-LOG_FILE="log/qwen3-4b-sft-chunkflow-${ARM}-gpu4-${now}.log"
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+LOG_FILE="log/${EXP_NAME}-gpu${NUM_GPUS}-${now}.log"
+RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
+echo "LOG_FILE=${LOG_FILE}"
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD_ADDRESS}" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"sft": [1, 0], "actor": [1, 4]}' \
+   --resource "{\"sft\": [1, 0], \"actor\": [1, ${NUM_GPUS}]}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${SFT_ARGS[@]}" \

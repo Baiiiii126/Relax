@@ -13,16 +13,21 @@
 #
 # Env:
 #   MODEL_DIR / DATA_DIR   required by the run script (see it for defaults)
-#   POINTS                 override the matrix; "gbs:capacity:steps:chunk,chunk,..."
+#   DATA_PROFILE           tail (default), longtail, or smoke
+#   POINTS                 override the selected matrix; "gbs:capacity:steps:chunk,chunk,..."
 #   NUM_ROLLOUT            NOT used here -- each point sets its own step count
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 RUN_SCRIPT="${SCRIPT_DIR}/../run-qwen3-4B-8xgpu-chunkflow.sh"
-ENTRYPOINT="${SCRIPT_DIR}/../../entrypoint/ray-job.sh"
+ENTRYPOINT="${SCRIPT_DIR}/../../../entrypoint/ray-job.sh"
 
 if [ ! -f "${RUN_SCRIPT}" ]; then
    echo "ERROR: ${RUN_SCRIPT} not found" >&2
+   exit 1
+fi
+if [ ! -f "${ENTRYPOINT}" ]; then
+   echo "ERROR: ${ENTRYPOINT} not found" >&2
    exit 1
 fi
 
@@ -33,13 +38,36 @@ fi
 #            so --num-rollout IS the step count. 1 is useless for perf, use >= 5.
 #   chunks   chunk sizes; 0 = baseline arm, always run first
 #
-# Default matrix: capacity pinned at SEQ_LENGTH (32768) so M moves only with gbs.
-#   gbs=1   -> M=1   (the case ChunkFlow targets; theory_x up to ~3.8 at PP=4)
-#   gbs=100 -> M=5
-#   gbs=500 -> M=30  (near/past the sqrt(U) crossover)
-POINTS="${POINTS:-1:32768:20:0,512,1024,2048,4096 100:32768:10:0,1024 500:32768:5:0,1024}"
+# Capacity stays at SEQ_LENGTH (32768). M is always read from telemetry; the
+# values below deliberately avoid assuming an M from GBS alone.
+DATA_PROFILE="${DATA_PROFILE:-tail}"
+case "${DATA_PROFILE}" in
+   tail)
+      # 16K-32K controlled samples: expose the maximum scheduling signal first.
+      DEFAULT_POINTS="1:32768:35:0,512,1024,2048,4096 4:32768:20:0,1024 16:32768:10:0,1024"
+      ;;
+   longtail)
+      # Realistic 0-32K mix: validate whether the gain survives ordinary data.
+      DEFAULT_POINTS="1:32768:35:0,1024 32:32768:20:0,1024 100:32768:10:0,1024"
+      ;;
+   smoke)
+      DEFAULT_POINTS="1:32768:3:0,1024"
+      ;;
+   *)
+      echo "ERROR: DATA_PROFILE must be tail, longtail, or smoke; got '${DATA_PROFILE}'" >&2
+      exit 2
+      ;;
+esac
+POINTS="${POINTS:-${DEFAULT_POINTS}}"
 
 DRY_RUN="${DRY_RUN:-}"
+
+# Every arm must finish before the next one starts. ray-job.sh performs
+# pre-flight cleanup, so an asynchronous sweep would stop its preceding arm.
+if [ -z "${DRY_RUN}" ] && [ -n "${RAY_NO_WAIT:-}" ]; then
+   echo "ERROR: unset RAY_NO_WAIT for a sweep; A/B arms must run sequentially" >&2
+   exit 2
+fi
 
 run_one() {
    local gbs="$1" capacity="$2" steps="$3" chunk="$4"

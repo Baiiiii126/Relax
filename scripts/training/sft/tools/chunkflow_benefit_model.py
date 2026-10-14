@@ -138,12 +138,12 @@ def _assert_packer_matches(total_lengths: Sequence[int], max_tokens_per_gpu: int
     optional deps) are not the mirror's problem and are skipped.
     """
     try:
-        from relax.utils.data.data import get_first_fit_partitions
+        from relax.utils.data.data import get_minimum_num_micro_batch_size
     except Exception:
         return
-    if get_first_fit_partitions(list(total_lengths), max_tokens_per_gpu) != local:
+    if get_minimum_num_micro_batch_size(list(total_lengths), max_tokens_per_gpu) != len(local):
         raise RuntimeError(
-            "_first_fit_partitions disagrees with relax.utils.data.data.get_first_fit_partitions; "
+            "_first_fit_partitions disagrees with relax.utils.data.data.get_minimum_num_micro_batch_size; "
             "the upstream packer changed -- resync this mirror before trusting M."
         )
 
@@ -399,8 +399,10 @@ def main() -> None:
         pool = sorted(pool, reverse=True)
     elif args.sort == "asc":
         pool = sorted(pool)
-    print(f"length pool: {len(pool)} samples, min={min(pool)}, max={max(pool)}, "
-          f"mean={sum(pool) / len(pool):.0f}  (pp={args.pp_size}, policy={args.policy})")
+    print(
+        f"length pool: {len(pool)} samples, min={min(pool)}, max={max(pool)}, "
+        f"mean={sum(pool) / len(pool):.0f}  (pp={args.pp_size}, policy={args.policy})"
+    )
     print()
 
     rows: list[dict[str, Any]] = []
@@ -453,8 +455,15 @@ def main() -> None:
             print(f"  gbs={gbs} capacity={capacity}: {count} oversized bin(s)", file=sys.stderr)
 
     if args.json is not None:
-        args.json.write_text(json.dumps({"config": vars(args) | {"lengths": None, "json": None}, "rows": rows},
-                                        ensure_ascii=False, indent=2, default=str) + "\n")
+        args.json.write_text(
+            json.dumps(
+                {"config": vars(args) | {"lengths": None, "json": None}, "rows": rows},
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+            + "\n"
+        )
         print(f"\nwrote {args.json}")
 
 

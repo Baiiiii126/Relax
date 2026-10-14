@@ -80,13 +80,13 @@ T_pred ≈ T_compute · frag · tok_recomp · [1 + a·(rect_attn − 1)] · (1 +
 - **`DP` 必须 = 1。** telemetry 只从 `pp=last / tp=0 / dp=0` 这一个 rank 记录（`model.py:1548-1552`），而**实际执行的 `M` 是 DP 维度的 MAX**（`data.py:934-938`）。`DP>1` 时 telemetry 里的 `M` 会小于真实 `M` → 理论收益被系统性高估，理论/实测直接对不齐。
 - **`PP` 必须整除层数。** Qwen3-4B 是 **36 层**（`scripts/models/qwen3-4B.sh`），故 `PP ∈ {1,2,3,4,6,9,12,18,36}` —— **`PP=8` 非法**（36/8=4.5）。
 
-8 卡机器上的三种摆法：
+8 卡机器上的摆法：
 
 | 方案 | 用卡 | DP | 说明 |
 | --- | --- | --- | --- |
-| **`PP=4`，`DP=1`（推荐）** | 4 | 1 | 已验证配置，`M` 口径干净。8 卡机器上只占 4 卡。 |
+| `PP=2` × `TP=2`，`DP=1` | 4 | 1 | 仅用于先做 PP correctness smoke，不是最终 8 卡性能结果。 |
 | `PP=6`，`DP=1`（可选） | 6 | 1 | `P` 更大 → 气泡更大 → 信号更强；但 PP=6 未经 chunkflow 验证。 |
-| `PP=4` × `TP=2`，`DP=1` | 8 | 1 | 用满 8 卡且保住 `DP=1`；但 TP 引入第二条通信轴、放大每 unit 的固定开销，只作**稳健性复核**，不作主结果。 |
+| **`PP=4` × `TP=2`，`DP=1`（主实验）** | 8 | 1 | 用满 8 卡且保住 `DP=1`；TP 的通信开销计入真实收益。 |
 
 > **不要**用 `PP=4 × DP=2`：`M` 被 DP-MAX 放大而 telemetry 只记 rank0，是本次实验最隐蔽的坑。
 
@@ -95,13 +95,13 @@ T_pred ≈ T_compute · frag · tok_recomp · [1 + a·(rect_attn − 1)] · (1 +
 | 项 | 值 |
 | --- | --- |
 | 模型 | Qwen3-4B（`--hf-checkpoint`） |
-| 并行 | `PP=4`，`TP=CP=EP=DP=1` |
-| 数据 | 长尾 SFT 数据（`build_chunkflow_longtail_sft.py` 产出，默认 500 条） |
+| 并行 | `PP=4`，`TP=2`，`CP=EP=DP=1` |
+| 数据 | 先跑 16K-32K tail-only 受控集，再跑 0-32K 真实长尾集 |
 | 其它 | `--seed 1234`、`--attention-backend flash`、`--no-rope-fusion`、`--calculate-per-token-loss` |
 
 ### 2.3 变量（两个旋钮）
 
-**`M` 由数据装箱决定，不是固定算式**（`relax/utils/data/data.py:116` `get_first_fit_partitions`，调用点 `relax/backends/megatron/data.py:921-944`）。两臂拿到**同一个 `M`**（`model.py:1219-1228` 单次 `forward_backward_func(num_microbatches=M)`）。
+**`M` 由数据装箱决定，不是固定算式**（`relax/utils/data/data.py:116` `get_minimum_num_micro_batch_size`，调用点 `relax/backends/megatron/data.py:921-944`）。两臂拿到**同一个 `M`**（`model.py:1219-1228` 单次 `forward_backward_func(num_microbatches=M)`）。
 
 - **`GBS`（主旋钮）**：每步样本数。`M ≤ GBS`，所以 `M=30` 需要 `GBS ≥ 30`。硬约束 `GBS ≤ 数据集大小`（`bootstrap.py:69`）。
 - **`MAX_TOKENS_PER_GPU`（次旋钮）**：装箱容量。调小 → 每 microbatch 装更少样本 → `M` 变大。
@@ -109,19 +109,22 @@ T_pred ≈ T_compute · frag · tok_recomp · [1 + a·(rect_attn − 1)] · (1 +
 - **`CHUNK_SIZE`**：`0` = baseline 臂（走标准 Megatron 调度）；`>0` = chunkflow 臂。
 - **可选对照**：`PACK_POLICY ∈ {staggered(主), lockstep}`。
 
-本方案**固定 `MAX_TOKENS_PER_GPU=SEQ_LENGTH=32768`**，只动 `GBS`，让 `M` 干净地单变量变化：
+本方案**固定 `MAX_TOKENS_PER_GPU=SEQ_LENGTH=32768`**，用不同 `GBS` 扫描。`M` 必须以运行时
+`train/chunkflow/num_microbatches` 为准，不能只由 `GBS` 猜测。
 
 | `GBS` | `M` | 说明 |
 | --- | --- | --- |
 | 1 | 1 | ChunkFlow 的目标场景；PP=4 下理论收益最大 |
-| 100 | 5 | 收益衰减区 |
-| 500 | 30 | 已越过 `√U` 判据的交叉点 |
+| 4 | 由 telemetry 确认 | 收益衰减区 |
+| 16 | 由 telemetry 确认 | 接近交叉区 |
 
 ### 2.4 步数（关键，别踩）
 
 `run-qwen3-4B-8xgpu-chunkflow.sh` 默认 `NUM_ROLLOUT=1`，而 SFT 每个 rollout 恰好是 **1 个 optimizer step**（`data.py:849-852`）—— 也就是说**默认配置只跑 1 步，测不出任何性能**（无预热、单样本）。
 
-`NUM_ROLLOUT=N` 就是 N 个 optimizer step（每步消费 `GBS` 个样本，数据集跨 epoch 循环）。建议：`GBS=1` 用 `N=20`，`GBS=100` 用 `N=10`，`GBS=500` 用 `N=5`（步越大越慢）。取**后 70% 的 step** 求均值，丢掉前几步的预热。
+`NUM_ROLLOUT=N` 就是 N 个 optimizer step（每步消费 `GBS` 个样本，数据集跨 epoch 循环）。默认
+tail-only 矩阵分别使用 35 / 20 / 10 步；正式统计用 `--drop-first 5` 丢掉预热，并保留至少 30 个
+测量 step 的主结果。大 GBS 点用于趋势复核，不与主结果共享置信度声明。
 
 ### 2.5 矩阵与跑法
 
@@ -136,13 +139,13 @@ MODEL_DIR=/path/to/models DATA_DIR=/path/to/data \
   bash scripts/training/sft/tools/run_chunkflow_benefit_sweep.sh
 ```
 
-默认矩阵（9 个 run，`POINTS` 可覆盖）：
+默认 tail-only 矩阵（8 个 run，`POINTS` 可覆盖）：
 
 | `GBS` | `M` | steps | `CHUNK_SIZE` |
 | --- | --- | --- | --- |
-| 1 | 1 | 20 | 0(baseline), 512, 1024, 2048, 4096 |
-| 100 | 5 | 10 | 0(baseline), 1024 |
-| 500 | 30 | 5 | 0(baseline), 1024 |
+| 1 | 由 telemetry 确认 | 35 | 0(baseline), 512, 1024, 2048, 4096 |
+| 4 | 由 telemetry 确认 | 20 | 0(baseline), 1024 |
+| 16 | 由 telemetry 确认 | 10 | 0(baseline), 1024 |
 
 单个点也可以手跑：
 
@@ -161,8 +164,8 @@ GBS=1 MAX_TOKENS_PER_GPU=32768 NUM_ROLLOUT=20 CHUNK_SIZE=512 \
 
 | 键 | 用途 |
 | --- | --- |
-| `perf/step_time` | 实测收益的主指标 |
-| `perf/actor_train_time` | 去掉 wait 后的纯训练时间 |
+| `perf/actor_train_time` | 调度收益主指标：纯训练时间 |
+| `perf/step_time` | 端到端次指标，包含 train wait |
 | `perf/actor_train_tflops` / `perf/mfu/actor_train` | 算力利用率 |
 | `perf/step_token_per_s` | 吞吐 |
 | `perf/wait_time_ratio` | 排除 rollout/wait 干扰 |
@@ -172,7 +175,7 @@ GBS=1 MAX_TOKENS_PER_GPU=32768 NUM_ROLLOUT=20 CHUNK_SIZE=512 \
 **理论**（chunkflow 臂，`train/chunkflow/*`，`model.py:1568`）：重点键见 §1.3 的表，外加
 `num_microbatches`、`num_units`、`equal_unit_fill_drain_{baseline,chunkflow,delta}_proxy`。
 
-> **按 step 采集，不要只看均值。** 两臂用同一份数据、同一顺序、同一 `seed`，所以第 `i` 步在两臂里是**同一批样本** —— 逐 step 配对（`step_time` 与 `equal_unit_fill_drain_*` 同一个 step index）比取平均更干净，也能看出 `U` 随样本长度的散布。
+> **按 step 采集，不要只看均值。** 两臂用同一份数据、同一顺序、同一 `seed`，所以第 `i` 步在两臂里是**同一批样本** —— 逐 step 配对（`actor_train_time` 与 `equal_unit_fill_drain_*` 同一个 step index）比取平均更干净，也能看出 `U` 随样本长度的散布。
 
 ## 4. 对齐与归因方法
 
@@ -182,7 +185,7 @@ GBS=1 MAX_TOKENS_PER_GPU=32768 NUM_ROLLOUT=20 CHUNK_SIZE=512 \
 
 2. **理论 vs 实测 speedup 散点**
    逐 step 配对（见 §3 的提示）：`x = theory_x`（来自 `train/chunkflow/equal_unit_fill_drain_*`），
-   `y = step_time_baseline / step_time_chunkflow`（同一步 index）。
+   `y = actor_train_time_baseline / actor_train_time_chunkflow`（同一步 index）。
    `y = x` 线即「完全对齐」。按 `M` 着色，看偏差是否随 `M` 系统性放大。
 
 3. **Level-2 修正 + 残差归因**
@@ -234,6 +237,22 @@ DRY_RUN=1 bash scripts/training/sft/tools/run_chunkflow_benefit_sweep.sh   # 先
 MODEL_DIR=... DATA_DIR=... bash scripts/training/sft/tools/run_chunkflow_benefit_sweep.sh
 ```
 
+`DATA_PROFILE=tail` 是默认主实验；`DATA_PROFILE=longtail` 跑真实分布泛化；
+`DATA_PROFILE=smoke` 只做三步接线检查。sweep 必须同步串行执行，不能设置 `RAY_NO_WAIT=1`。
+PP executor 尚未完成 GPU 端到端验证，因此正式实验前先用
+`TP_SIZE=2 PP_SIZE=2 DATA_PROFILE=smoke` 做 4 卡 loss / grad-norm correctness smoke；通过后再使用默认
+`TP_SIZE=2 PP_SIZE=4` 跑 8 卡性能矩阵。
+
+### 5.3 `chunkflow_align.py` —— 实测收益与置信区间
+
+```bash
+python3 scripts/training/sft/tools/chunkflow_align.py \
+  --baseline baseline.log --chunkflow chunkflow.log --drop-first 5
+```
+
+默认以 `perf/actor_train_time` 计算 `sum(T_baseline) / sum(T_chunkflow)`，并给出配对 bootstrap 95% CI。
+如需端到端口径，追加 `--metric step_time`。成本代理分别报告，不直接相乘，避免重复计价。
+
 单点失败不会中断整轮（末尾汇总失败数并以非零码退出）。
 
 ## 6. QS 提交
@@ -243,22 +262,39 @@ QS 侧只需要配三样，其余都在仓库脚本里：
 | 项 | 值 |
 | --- | --- |
 | 镜像 | 含 Relax + Megatron + SGLang 的训练镜像 |
-| 资源 | `{"sft": [1, 0], "actor": [1, 4]}`（脚本内已定，**4 卡**；原因见 §2.1） |
+| 资源 | `{"sft": [1, 0], "actor": [1, 8]}`（脚本内已定，**8 卡**；原因见 §2.1） |
 | 环境 | `MODEL_DIR`（含 `Qwen3-4B/`）、`DATA_DIR`（含 `chunkflow-longtail/train.parquet`） |
 
-**第一步，生成数据**（只需一次）：
+**第一步，生成受控长序列数据**（主实验，只需一次）：
+
+```bash
+python3 scripts/training/sft/tools/build_chunkflow_longtail_sft.py \
+  --tokenizer "${MODEL_DIR}/Qwen3-4B" \
+  --output "${DATA_DIR}/chunkflow-tail/train.parquet" \
+  --synthetic-only --short-count 0 --medium-count 0 --long-count 0 --tail-count 64
+```
+
+它稳定生成 64 条 16K-32K 样本，适合先验证调度收益上界，不受下载和样本分布漂移影响。
+
+**第二步，生成真实长尾泛化集**（Infinity-Instruct + LongWriter-6k）：
 
 ```bash
 python3 scripts/training/sft/tools/build_chunkflow_longtail_sft.py \
   --tokenizer "${MODEL_DIR}/Qwen3-4B" \
   --output "${DATA_DIR}/chunkflow-longtail/train.parquet"
-# 无网络时用 --synthetic-only 离线生成同样的桶分布
 ```
 
-**第二步，跑扫描**：
+构造器会把源 revision、输出 SHA256 和桶统计写到同目录 `.stats.json`。不要用 `--allow-partial`，
+否则尾桶不足会静默改变实验分布；无网络时可追加 `--synthetic-only` 作为可复现替代。
+
+**第三步，跑扫描**：
 
 ```bash
-MODEL_DIR=... DATA_DIR=... bash scripts/training/sft/tools/run_chunkflow_benefit_sweep.sh
+MODEL_DIR=... DATA_DIR=... PROMPT_DATA=${DATA_DIR}/chunkflow-tail/train.parquet \
+  DATA_PROFILE=tail bash scripts/training/sft/tools/run_chunkflow_benefit_sweep.sh
+
+MODEL_DIR=... DATA_DIR=... PROMPT_DATA=${DATA_DIR}/chunkflow-longtail/train.parquet \
+  DATA_PROFILE=longtail bash scripts/training/sft/tools/run_chunkflow_benefit_sweep.sh
 ```
 
 先 `DRY_RUN=1` 干跑确认命令与资源占用，再正式提交。**不硬编码任何集群路径或密钥。**
@@ -268,7 +304,7 @@ MODEL_DIR=... DATA_DIR=... bash scripts/training/sft/tools/run_chunkflow_benefit
 - 本地跑计算器，产出理论曲线与分解表（秒级，无 GPU）。
 - `pytest tests/backends/megatron/test_chunkflow_telemetry.py` —— 确认指标口径与代码一致。
 - 自洽性：`M=1` 时 `bubble_base` 应恰为 `P`；`M→∞` 时 `theory_x→1`；`M > √U` 时 `theory_x < 1`。
-- 计算器内置校验：`_first_fit_partitions` 与 `relax.utils.data.data.get_first_fit_partitions` 在 relax 可导入时逐点比对，不一致直接报错（防止 M 口径漂移）。
+- 计算器内置校验：`_first_fit_partitions` 与 `relax.utils.data.data.get_minimum_num_micro_batch_size` 在 relax 可导入时逐点比对，不一致直接报错（防止 M 口径漂移）。
 
 ## 8. 一个顺带的重要观察
 
