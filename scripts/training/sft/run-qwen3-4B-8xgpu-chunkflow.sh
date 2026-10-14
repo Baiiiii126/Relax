@@ -23,6 +23,13 @@ MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1}"
 SEQ_LENGTH="${SEQ_LENGTH:-32768}"
+# Micro-batch count M is a property of the data: the samples in one step are
+# first-fit packed into bins of MAX_TOKENS_PER_GPU (see
+# relax/utils/data/data.py:get_first_fit_partitions). Raise GBS for more samples
+# per step; lower MAX_TOKENS_PER_GPU for more, smaller micro-batches. Defaults
+# reproduce the original single-sample behaviour (M = 1).
+GBS="${GBS:-1}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${SEQ_LENGTH}}"
 
 PP_SIZE=4
 MODE="${1:-chunkflow}"
@@ -83,10 +90,10 @@ SFT_ARGS=(
    --prompt-data "${PROMPT_DATA}"
    --input-key question
    --label-key answer
-   --global-batch-size 1
+   --global-batch-size ${GBS}
    --use-dynamic-batch-size
    --seq-length ${SEQ_LENGTH}
-   --max-tokens-per-gpu ${SEQ_LENGTH}
+   --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU}
    --sft-oversize-strategy skip
 )
 
