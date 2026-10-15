@@ -9,23 +9,25 @@ delta}_proxy`` -- and also prices what chunkflow pays for the smaller bubble
 that telemetry on CPU, on a sequence-length distribution, so the theory side of
 an A/B run can be computed before -- or without -- a GPU.
 
-It reuses ``relax/backends/megatron/chunkflow/{scheduler,units,telemetry}.py``
-directly (all pure Python, no torch) so a number printed here and the
-``train/chunkflow/<key>`` metric a real run logs are the same quantity computed
-the same way.
+It reuses the runtime's pure-Python scheduler, unit planner, telemetry, and
+balanced partitioner. For text-only CP=1 runs it also mirrors get_batch's
+per-parent TP-aligned padding. Use logged ``train/chunkflow/<key>`` metrics for
+the final A/B comparison, since input lengths and training configuration must
+still match the prediction.
 
 How the model maps onto one optimizer step::
 
-    step samples --first-fit--> micro-batches (M of them, capacity =
-    max_tokens_per_gpu) --build_chunks(chunk_size)--> chunks
+    step samples --first-fit count--> M --balanced partitions--> parents
+    --TP-aligned padding--> --build_chunks(chunk_size)--> chunks
     --build_micro_batches(policy)--> execution units (U total)
 
     baseline bubble  = 1 + (pp - 1) / M      # standard 1F1B, M items
-    chunkflow bubble = 1 + (pp - 1) / U      # weighted by padded rows
-    theory speedup   = baseline / chunkflow
+    chunkflow bubble = 1 + (pp - 1) * sum(R_i / u_i) / sum(R_i)
+                       # R_i: padded rows, u_i: units in parent i
+    theory proxy     = baseline / chunkflow
 
-The bubble saving is an upper bound: it assumes a unit's duration is
-proportional to its token rows. ``launch_amplification`` (units per
+The bubble ratio is a scheduling proxy, not a strict speedup bound: it assumes
+a unit's duration is proportional to its token rows. ``launch_amplification`` (units per
 micro-batch), the rectified-attention ratio and the recompute multipliers are
 printed next to it precisely so the gap to a *measured* speedup can be
 attributed.
@@ -96,10 +98,18 @@ def _load_chunkflow(repo_root: Path) -> types.SimpleNamespace:
         spec.loader.exec_module(module)
         return module
 
+    balance_path = repo_root / "relax" / "utils" / "data" / "seqlen_balancing.py"
+    balance_spec = importlib.util.spec_from_file_location("chunkflow_seqlen_balancing", balance_path)
+    if balance_spec is None or balance_spec.loader is None:
+        raise SystemExit(f"cannot load {balance_path}")
+    balancing = importlib.util.module_from_spec(balance_spec)
+    balance_spec.loader.exec_module(balancing)
+
     return types.SimpleNamespace(
         scheduler=load("scheduler"),
         units=load("units"),
         telemetry=load("telemetry"),
+        balancing=balancing,
     )
 
 
@@ -239,6 +249,8 @@ def step_metrics(
     policy: str,
     keep_last_k: int,
     cf,
+    tp_size: int = 2,
+    pad_multiplier: int = 128,
 ) -> dict[str, Any]:
     """Aggregate plan telemetry for one optimizer step at ``chunk_size``.
 
@@ -247,13 +259,13 @@ def step_metrics(
     baseline fill/drain proxy is meaningful and the chunkflow side is left
     equal to it (speedup 1.0 by construction).
     """
-    partitions = _first_fit_partitions(samples, max_tokens_per_gpu)
-    _assert_packer_matches(samples, max_tokens_per_gpu, partitions)
+    first_fit = _first_fit_partitions(samples, max_tokens_per_gpu)
+    _assert_packer_matches(samples, max_tokens_per_gpu, first_fit)
+    micro_batches = len(first_fit)
 
     if chunk_size <= 0:
         # The baseline arm does not run chunkflow at all: plain 1F1B over M
         # micro-batches, one pipeline pass. Only its fill/drain matters.
-        micro_batches = len(partitions)
         bubble = 1.0 + (pp_size - 1) / micro_batches
         return {
             "num_microbatches": micro_batches,
@@ -271,8 +283,14 @@ def step_metrics(
 
     effective_keep = keep_last_k or NO_RECOMPUTE
     step = cf.telemetry.StepPlanTelemetry()
+    partitions = cf.balancing.get_seqlen_balanced_partitions(list(samples), micro_batches, equal_size=False)
+    pad_size = tp_size * pad_multiplier
     for members in partitions:
-        lengths = [int(samples[i]) for i in members]
+        source_lengths = [int(samples[i]) for i in members]
+        lengths = list(source_lengths)
+        pad = (-sum(lengths)) % pad_size
+        if pad:
+            lengths.append(pad)
         chunks = cf.scheduler.build_chunks(lengths, chunk_size=chunk_size, repack_tail=False)
         units = cf.units.build_micro_batches(chunks, policy)
         delay = _dependency_delay(units, chunks, effective_keep, cf.units)
@@ -285,7 +303,7 @@ def step_metrics(
                 effective_keep,
                 pp_size,
                 warmup,
-                source_rows=sum(lengths),
+                source_rows=sum(source_lengths),
             )
         )
 
@@ -335,6 +353,8 @@ def _parse_args() -> argparse.Namespace:
     source.add_argument("--lengths", type=Path, help="JSON int array or JSONL rows with a token length")
 
     parser.add_argument("--pp-size", type=int, default=4, help="Pipeline stages (default: 4)")
+    parser.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size for CP=1 packing (default: 2)")
+    parser.add_argument("--pad-multiplier", type=int, default=128, help="Data padding multiplier (default: 128)")
     parser.add_argument("--gbs", type=_int_list, default=[64], help="Samples per step to sweep")
     parser.add_argument(
         "--chunk-sizes", type=_int_list, default=[512, 1024, 2048, 4096], help="Chunk sizes; 0 = baseline"
@@ -390,6 +410,8 @@ def main() -> None:
     args = _parse_args()
     if not args.synthetic and args.lengths is None:
         raise SystemExit("pick a distribution: --synthetic or --lengths <file>")
+    if args.tp_size < 1 or args.pad_multiplier < 1:
+        raise SystemExit("--tp-size and --pad-multiplier must be positive")
 
     repo_root = args.repo_root or Path(__file__).resolve().parents[4]
     cf = _load_chunkflow(repo_root)
@@ -425,6 +447,8 @@ def main() -> None:
                     args.policy,
                     args.keep_last_k,
                     cf,
+                    tp_size=args.tp_size,
+                    pad_multiplier=args.pad_multiplier,
                 )
                 rows.append(
                     {
@@ -446,7 +470,7 @@ def main() -> None:
     _print_table(rows)
     print()
     print("M         = micro-batches per step (from --gbs and --max-tokens-per-gpu; see the capacity column)")
-    print("theory_x  = baseline_bubble / chunkflow_bubble (upper bound on step speedup)")
+    print("theory_x  = baseline_bubble / chunkflow_bubble (idealized scheduling proxy)")
     print("rect_attn = kernel_rect_pairs / logical_attention_pairs (chunked attention FLOPs inflation)")
     if oversized:
         print()

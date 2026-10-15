@@ -47,6 +47,29 @@ def test_aggregate_speedup_uses_ratio_of_total_paired_times(tmp_path: Path):
 
     assert len(rows) == 2
     assert chunkflow_align._aggregate_speedup(rows) == pytest.approx((10.0 + 8.0) / (4.0 + 4.0))
+    assert chunkflow_align._aggregate_theory(rows) == pytest.approx(
+        (10.0 + 8.0) / (10.0 * 1.15 / 4.0 + 8.0 * 1.17 / 4.0)
+    )
+    assert rows[0]["excess_time"] == pytest.approx(4.0 - 10.0 * 1.15 / 4.0)
+
+
+def test_theory_aggregate_weights_steps_by_baseline_time():
+    rows = [
+        {"base_time": 100.0, "ideal_cf_time": 25.0},
+        {"base_time": 1.0, "ideal_cf_time": 1.0},
+    ]
+
+    assert chunkflow_align._aggregate_theory(rows) == pytest.approx(101.0 / 26.0)
+
+
+def test_perf_parser_keeps_training_metric_when_other_perf_row_shares_step(tmp_path: Path):
+    log = tmp_path / "mixed.log"
+    log.write_text(
+        "perf 0: {'perf/actor_train_time': 10.0, 'perf/actor_train_tokens': 100}\n"
+        "perf 0: {'perf/rollout_time': 2.0}\n"
+    )
+
+    assert chunkflow_align._perf_rows(log, "actor_train_time")[0]["perf/actor_train_time"] == 10.0
 
 
 def test_pair_rejects_different_token_counts(tmp_path: Path):

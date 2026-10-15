@@ -27,33 +27,33 @@ for mb_idx in range(_num_microbatches(num_microbatches)):
 
 ### 1.2 气泡公式
 
-记 `M` = 一个 step 的 microbatch 数，`U` = 一个 step 拆出的 execution unit 总数，`P` = 流水线级数（`PP`）。
+记 `M` = 一个 step 的 microbatch 数，`U` = 一个 step 拆出的 execution unit 总数，`P` = 流水线级数（`PP`）。第 `i` 个 parent microbatch 有 `u_i` 个 unit、`R_i` 行填充后的 unit tokens。
 
 | 调度 | 一次 step 的结构 | 气泡因子 |
 | --- | --- | --- |
 | baseline（标准 Megatron 1F1B） | 一次流水线过 `M` 个 microbatch | `1 + (P-1)/M` |
-| chunkflow | `M` 次流水线，共 `U` 个 unit | `≈ 1 + (P-1)·M/U` |
+| chunkflow | `M` 次流水线，共 `U` 个 unit | `1 + (P-1)·Σ(R_i/u_i)/ΣR_i` |
 
 （两式分别对应 `telemetry.py:141` 与 `telemetry.py:142-144`；`telemetry.py:178-180` 输出的
 `equal_unit_fill_drain_{baseline,chunkflow,delta}_proxy` 就是它们。）
 
-**理论收益**
+**气泡代理比值**
 
 ```
-theory_x = [1 + (P-1)/M] / [1 + (P-1)·M/U]
+theory_x = [1 + (P-1)/M] / [1 + (P-1)·Σ(R_i/u_i)/ΣR_i]
 ```
 
-**判据**：`theory_x > 1  ⟺  M² < U  ⟺  M < √U`
+当 `P>1` 时，**代理收益的精确判据**是 `Σ(R_i/u_i)/ΣR_i < 1/M`。只有各 unit 的填充行数近似相同，即 `R_i ∝ u_i` 时，才能简化为 `theory_x > 1 ⇔ M² < U ⇔ M < √U`。`P=1` 时两个气泡代理恒为 1。
 
-这个判据很关键：收益对 `M` 是**二次敏感**的。
+简化判据说明在等 unit 成本模型下，收益对 `M` 是**二次敏感**的；正式实验应以逐 step telemetry 的实际代理值判断。
 
-- `M=1`（一个长序列，即 ChunkFlow 的目标场景）：baseline 气泡 100%，`theory_x ≈ P/(1+(P-1)/U)`。
-- `M` 增大到 `√U` 附近：收益归零。
-- `M > √U`：**ChunkFlow 反而更慢**（每次流水线重启的成本压过省下的气泡）。
+- `M=1`（一个长序列，即 ChunkFlow 的目标场景）：baseline 气泡因子为 `P`，`theory_x ≈ P/(1+(P-1)/U)`。`P=4` 时，相对无气泡理想执行时间的附加气泡为 300%。
+- 等 unit 成本时，`M` 增大到 `√U` 附近：代理收益归零。
+- 等 unit 成本且 `M > √U` 时，气泡代理预测 ChunkFlow 更慢；实际速度还取决于计算、通信与内存成本。
 
-### 1.3 理论收益是**上界**
+### 1.3 气泡代理不是实际速度上界
 
-`theory_x` 只算气泡，它隐含假设「一个 unit 的耗时 ∝ 它的 token 行数」。真实运行还要付：
+`theory_x` 只算理想化的 fill/drain，隐含各 unit 和各 stage 耗时可由 token 行数近似。它是实验对齐的参照值，不是实际 step speedup 的数学上界；分块可能改变算子效率或负载平衡。真实运行还要付：
 
 | 成本 | telemetry 键 | 含义 |
 | --- | --- | --- |
@@ -63,10 +63,12 @@ theory_x = [1 + (P-1)/M] / [1 + (P-1)·M/U]
 | 算子启动 | `launch_amplification` | `num_units / num_microbatches`，每 unit 的固定开销 |
 | 点对点通信 | `p2p_messages` / `p2p_row_transfers` | 更多、更小的 p2p 消息 |
 
+`pipeline_schedules.py` 的依赖延迟 `C` 会增加 warmup 深度。单条长序列拆为 `U` 个依赖 unit 时，`C=U-1`，早期 stage 会先完成全部前向再开始反向。这在等耗时模型中不必然改变 fill/drain 比值，但会改变激活峰值与实际耗时分布；现有气泡代理没有刻画这部分。
+
 **Level-2 修正预测**（把这些已建模的成本乘进去）：
 
 ```
-T_pred ≈ T_compute · frag · tok_recomp · [1 + a·(rect_attn − 1)] · (1 + (P-1)·M/U)  +  β · N_units
+T_pred ≈ T_compute · frag · tok_recomp · [1 + a·(rect_attn − 1)] · B_cf  +  β · N_units
 ```
 
 其中 `a` = 注意力占算力的比例，`β` = 每个 unit 的固定开销（kernel launch + p2p 握手）—— 这两项 telemetry 给不出，**需要用 A/B 实测数据拟合**。拟合后剩下的残差就是「模型还没解释的部分」。
@@ -180,8 +182,8 @@ GBS=1 MAX_TOKENS_PER_GPU=32768 NUM_ROLLOUT=20 CHUNK_SIZE=512 \
 ## 4. 对齐与归因方法
 
 1. **先验证气泡模型本身**（不涉及 chunkflow）
-   用 baseline 臂跨 `M` 的实测 `step_time` 拟合 `T(M) = T_compute·(1 + (P-1)/M)`。
-   实测点应落在曲线上；偏离说明有气泡之外的固定成本 —— 这一步是整套归因的地基。
+   固定同一批样本和总 token 数，仅改变装箱容量以得到不同 `M`，用 baseline 臂的 `actor_train_time` 检查 `T(M) ≈ T_compute·(1 + (P-1)/M)`。
+   跨 `GBS` 的运行不能直接用同一个 `T_compute` 拟合，因为总工作量也随之变化。装箱变化本身也会改变 kernel 形状，因此偏离曲线只能提示额外成本，不能单独证明气泡模型错误。
 
 2. **理论 vs 实测 speedup 散点**
    逐 step 配对（见 §3 的提示）：`x = theory_x`（来自 `train/chunkflow/equal_unit_fill_drain_*`），
@@ -194,7 +196,7 @@ GBS=1 MAX_TOKENS_PER_GPU=32768 NUM_ROLLOUT=20 CHUNK_SIZE=512 \
 
 4. **判读产出**
    ① 理论收益是否可达；② 瓶颈是 frag / recompute / launch / rect-attn 中的哪一项；
-   ③ 给定数据分布下推荐的 `CHUNK_SIZE` 与可用 `M` 上限（即 `√U` 判据的实测验证）。
+   ③ 给定数据分布下推荐的 `CHUNK_SIZE`，以及加权气泡代理和实测收益各自的 `M` 交叉区。
 
 ## 5. 工具：理论计算器 + 扫描驱动
 
@@ -202,7 +204,8 @@ GBS=1 MAX_TOKENS_PER_GPU=32768 NUM_ROLLOUT=20 CHUNK_SIZE=512 \
 
 ### 5.1 `chunkflow_benefit_model.py` —— 理论收益 + 成本分解
 
-纯 Python，复用 chunkflow 自己的 `scheduler` / `units` / `telemetry`，**不需要 torch**，Mac 上即可跑。它算出的量与真实运行记录的 `train/chunkflow/*` 是同一个量、同一套算法。
+纯 Python，复用 chunkflow 自己的 `scheduler` / `units` / `telemetry`，**不需要 torch**，Mac 上即可跑。计算器用 first-fit 决定 `M`，再按训练逻辑进行长度均衡分组；文本 `CP=1` 场景还会按 `TP × data_pad_size_multiplier` 补齐每个 parent。输入长度与配置仍需匹配真实运行，正式对齐以运行日志的 `train/chunkflow/*` 为准。
+计算器默认 `--tp-size 2 --pad-multiplier 128`，与主实验脚本一致；更改训练配置时同步覆盖这两个参数。
 
 ```bash
 # 长序列场景（ChunkFlow 的目标）：一条 ~28K 样本，PP=4
@@ -219,12 +222,12 @@ python3 scripts/training/sft/tools/chunkflow_benefit_model.py \
 
 | GBS | M | chunk | U | bubble_base | bubble_cf | theory_x | launch |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 1 | 512 | 56 | 4.000 | 1.054 | **3.797** | 56.0 |
-| 4 | 4 | 512 | 197 | 1.750 | 1.061 | 1.650 | 49.2 |
-| 16 | 11 | 512 | 537 | 1.273 | 1.061 | 1.199 | 48.8 |
-| 64 | 17 | 2048 | 284 | 1.176 | 1.179 | 0.998 | 16.7 |
+| 1 | 1 | 512 | 57 | 4.000 | 1.053 | **3.800** | 57.0 |
+| 4 | 4 | 512 | 201 | 1.750 | 1.060 | 1.651 | 50.2 |
+| 16 | 11 | 512 | 548 | 1.273 | 1.060 | 1.200 | 49.8 |
+| 64 | 17 | 2048 | 288 | 1.176 | 1.177 | 0.999 | 16.9 |
 
-读法：`M=1` 且序列够长时理论收益最大（≈3.8x）；`M` 涨到 `√U` 附近（此处 `U=284`，`√U≈17`）收益归零，与 §1.2 判据一致。
+读法：`M=1` 且序列够长时气泡代理比值最大（≈3.8x）；最后一行 `M=17`、`U=288` 的代理比值接近 1。`√U≈17` 在这里是等 unit 成本的近似解释，准确结果以加权代理为准。
 
 > 注意 `launch` 列同步涨到几十倍 —— 这正是理论收益会被吃掉的地方，也是 Level-2 要量化的东西。
 
@@ -250,8 +253,9 @@ python3 scripts/training/sft/tools/chunkflow_align.py \
   --baseline baseline.log --chunkflow chunkflow.log --drop-first 5
 ```
 
-默认以 `perf/actor_train_time` 计算 `sum(T_baseline) / sum(T_chunkflow)`，并给出配对 bootstrap 95% CI。
+默认以 `perf/actor_train_time` 计算 `sum(T_baseline) / sum(T_chunkflow)`，并给出配对 bootstrap 95% CI。理论汇总也按总时间口径计算：`sum(T_baseline) / sum(T_baseline/theory_x)`；报告两者之差对应的额外秒数。
 如需端到端口径，追加 `--metric step_time`。成本代理分别报告，不直接相乘，避免重复计价。
+单对 A/B 只能提出开销假设；要确认差异原因，需要比较不同 `CHUNK_SIZE` 的成对运行，观察额外秒数与 launch、padding、矩形注意力等代理如何一起变化。
 
 单点失败不会中断整轮（末尾汇总失败数并以非零码退出）。
 
@@ -274,7 +278,7 @@ python3 scripts/training/sft/tools/build_chunkflow_longtail_sft.py \
   --synthetic-only --short-count 0 --medium-count 0 --long-count 0 --tail-count 64
 ```
 
-它稳定生成 64 条 16K-32K 样本，适合先验证调度收益上界，不受下载和样本分布漂移影响。
+它稳定生成 64 条 16K-32K 样本，适合先验证理想化调度代理是否对应实测收益，不受下载和样本分布漂移影响。
 
 **第二步，生成真实长尾泛化集**（Infinity-Instruct + LongWriter-6k）：
 
@@ -303,14 +307,14 @@ MODEL_DIR=... DATA_DIR=... PROMPT_DATA=${DATA_DIR}/chunkflow-longtail/train.parq
 
 - 本地跑计算器，产出理论曲线与分解表（秒级，无 GPU）。
 - `pytest tests/backends/megatron/test_chunkflow_telemetry.py` —— 确认指标口径与代码一致。
-- 自洽性：`M=1` 时 `bubble_base` 应恰为 `P`；`M→∞` 时 `theory_x→1`；`M > √U` 时 `theory_x < 1`。
+- 自洽性：`M=1` 时 `bubble_base` 应恰为 `P`；`P=1` 时两个气泡代理都为 1；`P>1` 时用 §1.2 的加权判据检查代理收益方向。固定每个 parent 的 unit 数并让 `M` 增大，`theory_x` 不一定趋近 1。
 - 计算器内置校验：`_first_fit_partitions` 与 `relax.utils.data.data.get_minimum_num_micro_batch_size` 在 relax 可导入时逐点比对，不一致直接报错（防止 M 口径漂移）。
 
 ## 8. 一个顺带的重要观察
 
-§1.1 的结构性事实（每个 microbatch 重启一次流水线）意味着 ChunkFlow 当前把气泡成本乘了 `M`。如果改成**让所有 microbatch 的 unit 汇入同一条流水线**（一次 fill/drain，`M` 从公式里消失），理论收益就不再受 `√U` 判据限制。
+§1.1 的结构性事实（每个 microbatch 重启一次流水线）意味着 ChunkFlow 当前要为 `M` 个 parent 分别支付 fill/drain。如果改成**让所有 microbatch 的 unit 汇入同一条流水线**（一次 fill/drain），等 unit 成本模型里的 `M²<U` 限制就会消失。
 
-这**不在本方案范围内**（本方案只做「现状收益是否对齐」的验证），但它是本实验最可能指向的下一步。建议在 §4 的判读里明确记录：实测收益随 `M` 的衰减是否与 `√U` 判据吻合 —— 若吻合，即为该优化方向的直接证据。
+这**不在本方案范围内**（本方案只做「现状收益是否对齐」的验证），但它是本实验可能指向的下一步。建议在 §4 的判读里记录实测收益随 `M` 的衰减，并与逐 step 加权气泡代理比较。
 
 ## 附录：关键代码位置
 
