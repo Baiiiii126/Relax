@@ -149,6 +149,7 @@ def chunkflow_forward_backward_no_pipelining(
                     keep_last_k,
                     1,
                     [warmup_depth],
+                    include_schedule=runtime.schedule_analysis,
                     source_rows=sum(
                         int(length) for length in (seq_lengths if source_lengths is None else source_lengths)
                     ),

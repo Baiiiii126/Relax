@@ -108,6 +108,7 @@ def _load_chunkflow(repo_root: Path) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         scheduler=load("scheduler"),
         units=load("units"),
+        schedule_model=load("schedule_model"),
         telemetry=load("telemetry"),
         balancing=balancing,
     )
@@ -251,6 +252,7 @@ def step_metrics(
     cf,
     tp_size: int = 2,
     pad_multiplier: int = 128,
+    timeline_path: Path | None = None,
 ) -> dict[str, Any]:
     """Aggregate plan telemetry for one optimizer step at ``chunk_size``.
 
@@ -279,6 +281,7 @@ def step_metrics(
             "launch_amplification": 1.0,
             "logical_attention_pairs": 0,
             "kernel_rect_pairs": 0,
+            "schedule_model_speedup": 1.0,
         }
 
     effective_keep = keep_last_k or NO_RECOMPUTE
@@ -303,11 +306,47 @@ def step_metrics(
                 effective_keep,
                 pp_size,
                 warmup,
+                include_schedule=True,
                 source_rows=sum(source_lengths),
             )
         )
 
-    return step.to_metrics(pp_size)
+    metrics = step.to_metrics(pp_size, simulate_schedule=True)
+    if timeline_path is not None:
+        prediction = cf.schedule_model.predict_step(step.plans, pp_size)
+        timeline_path.parent.mkdir(parents=True, exist_ok=True)
+        timeline_path.with_suffix(".json").write_text(json.dumps(prediction, indent=2))
+        timeline_path.with_suffix(".svg").write_text(_timeline_svg(prediction, pp_size))
+    return metrics
+
+
+def _timeline_svg(prediction: dict[str, Any], pp_size: int) -> str:
+    height = 120 + 2 * (pp_size + 1) * 32
+    scale = 1000 / max(prediction["baseline"]["makespan"], prediction["chunkflow"]["makespan"])
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="{height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<g font-family="sans-serif" font-size="12">',
+        '<text x="30" y="25">Row-weighted blocking PP model: F=1, B=2, Fr=1; network latency=0</text>',
+    ]
+    colors = {"F": "#3b82f6", "Fp": "#60a5fa", "Fr": "#f59e0b", "B": "#22c55e"}
+    for i, name in enumerate(("baseline", "chunkflow")):
+        y = 60 + i * (pp_size + 1) * 32
+        makespan = prediction[name]["makespan"]
+        parts.append(f'<text x="30" y="{y}">{name}: makespan={makespan:.3f} relative units</text>')
+        for stage in range(pp_size):
+            parts.append(f'<text x="30" y="{y + 26 + stage * 32}">stage {stage}</text>')
+        for event in prediction[name]["timeline"]:
+            x = 120 + event["start"] * scale
+            top = y + 8 + event["stage"] * 32
+            width = (event["end"] - event["start"]) * scale
+            label = f"{event['kind']} p{event['parent']}/u{event['unit']}"
+            parts.append(
+                f'<rect x="{x:.2f}" y="{top}" width="{width:.2f}" height="25" '
+                f'fill="{colors[event["kind"]]}" stroke="white" stroke-width="0.5">'
+                f"<title>{label}: {event['start']:.3f} to {event['end']:.3f}</title></rect>"
+            )
+    return "\n".join(parts + ["</g></svg>"])
 
 
 def _oversized_bins(samples: Sequence[int], capacity: int) -> int:
@@ -331,6 +370,7 @@ def _derived(metrics: dict[str, Any]) -> dict[str, Any]:
     return {
         "theory_x": base / chunk if chunk else 0.0,
         "rect_attn": rect / logical if logical else 0.0,
+        "schedule_x": metrics["schedule_model_speedup"],
     }
 
 
@@ -378,6 +418,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--repo-root", type=Path, default=None, help="Relax checkout root (default: inferred)")
     parser.add_argument("--json", type=Path, default=None, help="Also write the full table as JSON")
+    parser.add_argument("--timeline-dir", type=Path, help="Write baseline/CF timeline SVG and JSON for each CF point")
     return parser.parse_args()
 
 
@@ -390,6 +431,7 @@ _COLUMNS = (
     ("bubble_base", 11, "{:>11.3f}"),
     ("bubble_cf", 9, "{:>9.3f}"),
     ("theory_x", 8, "{:>8.3f}"),
+    ("schedule_x", 10, "{:>10.3f}"),
     ("frag", 6, "{:>6.3f}"),
     ("tok_recomp", 10, "{:>10.3f}"),
     ("attn_recomp", 11, "{:>11.3f}"),
@@ -449,6 +491,11 @@ def main() -> None:
                     cf,
                     tp_size=args.tp_size,
                     pad_multiplier=args.pad_multiplier,
+                    timeline_path=(
+                        args.timeline_dir / f"gbs{gbs}-cap{capacity}-chunk{chunk_size}"
+                        if args.timeline_dir is not None and chunk_size > 0
+                        else None
+                    ),
                 )
                 rows.append(
                     {
@@ -471,6 +518,7 @@ def main() -> None:
     print()
     print("M         = micro-batches per step (from --gbs and --max-tokens-per-gpu; see the capacity column)")
     print("theory_x  = baseline_bubble / chunkflow_bubble (idealized scheduling proxy)")
+    print("schedule_x = baseline / CF makespan from row-weighted blocking PP timeline (F=1, B=2, network=0)")
     print("rect_attn = kernel_rect_pairs / logical_attention_pairs (chunked attention FLOPs inflation)")
     if oversized:
         print()

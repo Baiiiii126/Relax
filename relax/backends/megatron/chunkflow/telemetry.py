@@ -10,9 +10,11 @@ the schedule that they are meant to explain.
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from relax.backends.megatron.chunkflow.schedule_model import ModelPlan, make_model_plan, predict_step
 from relax.backends.megatron.chunkflow.scheduler import Chunk
 from relax.backends.megatron.chunkflow.units import Unit, classify_units
 
@@ -43,6 +45,7 @@ class PlanTelemetry:
     warmup_max: int
     p2p_messages: int
     p2p_row_transfers: int
+    model_plan: ModelPlan | None = None
 
 
 def summarize_plan(
@@ -53,6 +56,7 @@ def summarize_plan(
     pp_size: int,
     warmup_depths: Sequence[int],
     source_rows: int | None = None,
+    include_schedule: bool = False,
 ) -> PlanTelemetry:
     """Summarize one plan without inspecting tensors or changing the plan."""
     if pp_size < 1:
@@ -113,6 +117,7 @@ def summarize_plan(
         warmup_max=max(warmup_depths, default=0),
         p2p_messages=2 * p2p_links * num_units,
         p2p_row_transfers=2 * p2p_links * unit_padded_rows,
+        model_plan=make_model_plan(units, chunks, keep_last_k, pp_size) if include_schedule else None,
     )
 
 
@@ -125,7 +130,7 @@ class StepPlanTelemetry:
     def add(self, plan: PlanTelemetry) -> None:
         self.plans.append(plan)
 
-    def to_metrics(self, pp_size: int) -> dict[str, int | float]:
+    def to_metrics(self, pp_size: int, *, simulate_schedule: bool = False) -> dict[str, int | float]:
         if not self.plans:
             return {}
 
@@ -143,7 +148,7 @@ class StepPlanTelemetry:
             plan.unit_padded_rows * (1.0 + (pp_size - 1) / max(plan.num_units, 1)) for plan in self.plans
         ) / max(padded_rows, 1)
 
-        return {
+        metrics = {
             "num_microbatches": num_microbatches,
             "input_rows": input_rows,
             "source_rows": source_rows,
@@ -181,3 +186,18 @@ class StepPlanTelemetry:
             "p2p_messages": sum(plan.p2p_messages for plan in self.plans),
             "p2p_row_transfers": sum(plan.p2p_row_transfers for plan in self.plans),
         }
+        if simulate_schedule:
+            started = time.perf_counter()
+            prediction = predict_step(self.plans, pp_size)
+            metrics.update(
+                {
+                    "schedule_model_baseline_makespan": prediction["baseline"]["makespan"],
+                    "schedule_model_chunkflow_makespan": prediction["chunkflow"]["makespan"],
+                    "schedule_model_speedup": prediction["speedup"],
+                    "schedule_model_baseline_bubble_fraction": prediction["baseline"]["bubble_fraction"],
+                    "schedule_model_chunkflow_bubble_fraction": prediction["chunkflow"]["bubble_fraction"],
+                    "schedule_model_analysis_time_s": time.perf_counter() - started,
+                    "schedule_model_version": 1,
+                }
+            )
+        return metrics

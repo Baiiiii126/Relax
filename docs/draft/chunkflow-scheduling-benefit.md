@@ -111,7 +111,7 @@ T_pred ≈ T_compute · frag · tok_recomp · [1 + a·(rect_attn − 1)] · B_cf
 - **`CHUNK_SIZE`**：`0` = baseline 臂（走标准 Megatron 调度）；`>0` = chunkflow 臂。
 - **可选对照**：`PACK_POLICY ∈ {staggered(主), lockstep}`。
 
-本方案**固定 `MAX_TOKENS_PER_GPU=SEQ_LENGTH=32768`**，用不同 `GBS` 扫描。`M` 必须以运行时
+本方案将 `MAX_TOKENS_PER_GPU` 和 `SEQ_LENGTH` 均固定为 **32768**，用不同 `GBS` 扫描。`M` 必须以运行时
 `train/chunkflow/num_microbatches` 为准，不能只由 `GBS` 猜测。
 
 | `GBS` | `M` | 说明 |
@@ -315,6 +315,80 @@ MODEL_DIR=... DATA_DIR=... PROMPT_DATA=${DATA_DIR}/chunkflow-longtail/train.parq
 §1.1 的结构性事实（每个 microbatch 重启一次流水线）意味着 ChunkFlow 当前要为 `M` 个 parent 分别支付 fill/drain。如果改成**让所有 microbatch 的 unit 汇入同一条流水线**（一次 fill/drain），等 unit 成本模型里的 `M²<U` 限制就会消失。
 
 这**不在本方案范围内**（本方案只做「现状收益是否对齐」的验证），但它是本实验可能指向的下一步。建议在 §4 的判读里记录实测收益随 `M` 的衰减，并与逐 step 加权气泡代理比较。
+
+## 9. 逐 step 归因：预测是否解释实测波动
+
+先保留执行实现，统计预测与实测的关系，再选择优化方向。每个配对 step 定义
+`x = 100 × (theory_x - 1)`、`y = 100 × (actual_x - 1)`，单位都是加速比变化的百分数，
+不与耗时减少百分比混用。
+
+```bash
+python3 scripts/training/sft/tools/chunkflow_align.py \
+  --baseline "$baseline" --chunkflow "$chunkflow" \
+  --theory-source proxy --drop-first 5 --output-prefix analysis/gbs4-chunk1024
+```
+
+`--theory-source proxy` 使用原有气泡公式，已有日志可回溯。脚本输出：
+
+| 计数 | 预测正收益 | 预测负收益 |
+| --- | --- | --- |
+| 实际正收益 | 同方向 | 反方向 |
+| 实际负收益 | 反方向 | 同方向 |
+
+对默认 9 个 tail 实验，可自动选择 6 组 A/B 对比，并输出与上表相同的中文 Markdown 表：
+
+```bash
+python3 scripts/training/sft/tools/chunkflow_align.py \
+  --sweep-log-dir log --theory-source proxy --drop-first 5 \
+  --output-prefix analysis/chunkflow-attribution
+cat analysis/chunkflow-attribution.md
+```
+
+完整日志去掉各组前 5 步后，共有 140 次 A/B step 比较（120+15+5）。中性点单独报告，
+四格计数之和等于非中性比较数。自动选取每个配置最新 baseline 及之后的 CF 日志，
+会打印实际使用的路径；若新一轮还未跑齐则报错，不与更早的 CF 日志静默混配。
+自定义矩阵或指定历史轮次时，使用显式 `--baseline` / `--chunkflow`。
+
+同时计算方向一致率、Pearson、Spearman 和平均绝对预测误差。`--tolerance-pct 1` 可将
+绝对加速变化不超过 1% 的点归入中性，不计入正负方向表；相关系数仍使用全部点。
+预测或实测恒定、或样本不足时相关系数输出 undefined，不能解释为零相关。
+输出文件包括每步 `.csv`、统计 `.json`、带零轴和 `y=x` 参考线的散点 `.svg`。
+
+重复传入成对的 `--baseline` / `--chunkflow` 可合并多个配置，预热过滤逐配置进行。
+报告同时保留分配置和合并统计。合并相关性可能仅来自配置差异；复用同一个 baseline
+也会让跨配置观测相关，因此不为合并结果生成独立 step bootstrap 置信区间。
+
+### 调度时间轴预测
+
+新的 `schedule_model.py` 与 PP 执行器共用前后向顺序及依赖延迟。CPU 模拟器按每个
+stage 的执行顺序建立 DAG，FIFO 匹配阻塞通信的 shape/data 两阶段，求关键路径 makespan。
+假设：每 128 行的 F 成本为 1、B 为 2、Fr 为 1，各 stage 相同，网络耗时为 0；
+计入 unit padding 和计划内重算。它没有拟合本次实测时间，也不计真实 kernel 效率、
+TP 通信、KV 复制、optimizer 和最终梯度同步，因此是声明假设后的时间轴模型，不是论文实现一致性的证明。
+
+若事先知道一个 step 的各样本 token 长度，可在训练之前离线输出预测和调度图：
+
+```bash
+# step_lengths.json 是该 step 按原顺序排列的样本长度 JSON 数组
+python3 scripts/training/sft/tools/chunkflow_benefit_model.py \
+  --lengths step_lengths.json --gbs 4 --max-tokens-per-gpu 32768 \
+  --chunk-sizes 1024 --pp-size 4 --tp-size 2 --timeline-dir analysis/timelines
+```
+
+表里的 `theory_x` 仍是旧气泡代理，`schedule_x` 才是两个模拟 makespan 的比值；
+SVG 使用相同时间轴并排展示 baseline/CF，JSON 保存每个计算事件的开始与结束位置。
+
+后续诊断运行可用 `RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS=1` 启用运行时预测汇总。
+计划在各 parent 执行前捕获，完整 step 模拟在 step 末汇总并上传 ClearML，
+指标名为 `train/chunkflow/schedule_model_speedup`。这会增加 CPU 分析开销，默认关闭；
+`schedule_model_analysis_time_s` 记录最后一个 PP stage 的模拟器 CPU 时间，
+不代表所有 rank 的完整诊断开销，不应直接从实测时间中扣除。
+有此指标的日志可使用 `--theory-source schedule` 做归因；缺少时脚本报错，不会静默
+替换成气泡代理。现有实验可先用 proxy 分析，无需立即重跑整个矩阵。
+
+高度正相关说明预测有解释力，但还要检查收益方向和预测误差；例如始终差一倍的预测
+也可能高度相关。低相关应进一步检查样本配对、预测取值范围、额外开销和配置分层，
+不能仅据此断言实现与论文不一致。本轮只增加测量和统计，不实现自动开关策略。
 
 ## 附录：关键代码位置
 

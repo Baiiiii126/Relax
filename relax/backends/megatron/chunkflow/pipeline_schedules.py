@@ -40,9 +40,10 @@ from megatron.core.pipeline_parallel.schedules import (
 from megatron.core.utils import get_model_config
 
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
+from relax.backends.megatron.chunkflow.schedule_model import pipeline_plan
 from relax.backends.megatron.chunkflow.telemetry import summarize_plan
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
-from relax.backends.megatron.chunkflow.units import classify_units, completed_groups, make_unit_bwd_order
+from relax.backends.megatron.chunkflow.units import completed_groups
 
 
 def _no_loss_step_func(forward_step_func):
@@ -72,28 +73,7 @@ def _pipeline_plan(units, chunks, keep_last_k):
     ``C`` covers the first group's completion. It is stage-independent; the
     caller adds the standard pipeline depth for its stage.
     """
-    standalone = [u.unit_id for u in units if not u.is_dependent]
-    dependent = sorted((u for u in units if u.is_dependent), key=lambda u: u.round)
-    fwd_seq = standalone + [u.unit_id for u in dependent]
-    bwd_seq = make_unit_bwd_order(units, fwd_seq)
-    _, need_fr = classify_units(units, chunks, keep_last_k)
-
-    by_id = {u.unit_id: u for u in units}
-    fwd_pos = {u: i for i, u in enumerate(fwd_seq)}
-    done_at: dict[int, int] = {}
-    for u in units:
-        for g in u.groups:
-            done_at[g] = max(done_at.get(g, -1), fwd_pos[u.unit_id])
-
-    def ready(unit_id):
-        """Forward position at which this backward's store is full."""
-        unit = by_id[unit_id]
-        if not unit.groups:
-            return fwd_pos[unit_id]
-        return max(done_at[g] for g in unit.groups)
-
-    C = max((ready(u) - i) for i, u in enumerate(bwd_seq)) if bwd_seq else 0
-    return fwd_seq, bwd_seq, need_fr, C
+    return pipeline_plan(units, chunks, keep_last_k)
 
 
 def _pipeline_schedule(units, chunks, keep_last_k, pp, stage):
@@ -242,6 +222,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                     keep_last_k,
                     p2p_communicator.total_stages,
                     warmup_depths,
+                    include_schedule=runtime.schedule_analysis,
                     source_rows=sum(
                         int(length) for length in (seq_lengths if source_lengths is None else source_lengths)
                     ),

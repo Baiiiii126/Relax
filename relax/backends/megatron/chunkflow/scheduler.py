@@ -509,11 +509,12 @@ def interleave_1f1b(
 
 
 def splice_recomputes(base: Sequence[Op], need_fr: set[int], fr_lead: int) -> list[Op]:
-    """Insert an ``Fr`` for each dropped id, ``fr_lead`` ops ahead of its ``B``.
+    """Insert an ``Fr`` for each dropped id, ``fr_lead`` ops ahead of its
+    ``B``.
 
     ``fr_lead`` is how far ahead of the backward the recompute is issued — 0
-    for the local/lazy strategies (immediately before), larger for eager (so
-    it can overlap across a stage boundary). A recompute is only ever emitted
+    for the local/lazy strategies (immediately before), larger for eager (so it
+    can overlap across a stage boundary). A recompute is only ever emitted
     after the forward that produced this id's K/V; without that there would be
     nothing to reuse and the recompute would be a wasted extra forward.
     """

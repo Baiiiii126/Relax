@@ -74,8 +74,8 @@ EXP_NAME="${EXP_NAME:-qwen3-4b-sft-${ARM}}"
 
 if [ ! -e "${MODEL_DIR}/Qwen3-4B" ]; then
    echo "ERROR: ${MODEL_DIR}/Qwen3-4B does not exist. Set MODEL_DIR / DATA_DIR, e.g." >&2
-   echo "  export MODEL_DIR=/mnt/tidal-nj01/usr/yuzhe1/baihaonan/models" >&2
-   echo "  export DATA_DIR=/mnt/tidal-nj01/usr/yuzhe1/baihaonan/data" >&2
+   echo "  export MODEL_DIR=/path/to/models" >&2
+   echo "  export DATA_DIR=/path/to/data" >&2
    exit 1
 fi
 PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/chunkflow-longtail/train.parquet}"
@@ -104,12 +104,14 @@ SFT_ARGS=(
 )
 
 export RELAX_CHUNKFLOW_PIPELINE_UNTESTED="${RELAX_CHUNKFLOW_PIPELINE_UNTESTED:=1}"
+export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS="${RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS:-0}"
 
 export RUNTIME_ENV_JSON=$(python3 -c '
 import json, os
 env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 target = env.setdefault("env_vars", {})
 target["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"] = os.environ["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"]
+target["RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS"] = os.environ["RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS"]
 print(json.dumps(env))
 ')
 
