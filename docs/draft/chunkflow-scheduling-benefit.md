@@ -390,6 +390,57 @@ SVG 使用相同时间轴并排展示 baseline/CF，JSON 保存每个计算事�
 也可能高度相关。低相关应进一步检查样本配对、预测取值范围、额外开销和配置分层，
 不能仅据此断言实现与论文不一致。本轮只增加测量和统计，不实现自动开关策略。
 
+### 聚焦已有最佳候选，自动生成归因表
+
+`run_chunkflow_attribution.sh` 默认 GBS=8，固定 TP2/PP4、capacity=32768、staggered、keep-last-k=0，
+顺序运行 baseline 和 chunk=2048。2048 是当前实测最好的候选，已有置信区间仍跨过 1，不能保证正收益。
+两组默认各运行 510 步，去掉前 10 对预热 step，保留 500 对。
+GBS 可用环境变量调整，例如 `GBS=4` 或 `GBS=16`。默认 8 让短、中序列在同一 step 内混合打包；
+它是候选配置，不代表最优值，microbatch 数 M 应以实际日志为准。
+
+默认采用模拟的混合长度分布，先生成数据：
+
+```bash
+MODEL_DIR=/path/to/models DATA_DIR=/path/to/data \
+  bash scripts/training/sft/tools/build_chunkflow_mixed_sft.sh
+```
+
+共 5000 条样本，按样本数量分配：0–2K 占 70%，2K–8K 占 20%，8K–16K 占 8%，
+16K–32K 占 2%。最后 100 条长尾中有 25 条明确位于 28K–32K（最高 32256 tokens），
+其余 75 条位于 16K–28K。长度按完整 chat template 渲染后的 prompt + answer 计算。
+这是模拟分布，不是业务数据统计；长样本占用的 token 和计算量比例会高于样本数量比例。
+生成器固定 seed、打乱顺序，并保存 `train.stats.json`，其中记录实际分桶计数、
+28K–32K 样本数、长度范围和文件校验值。
+
+```bash
+MODEL_DIR=/path/to/models DATA_DIR=/path/to/data \
+  bash scripts/training/sft/tools/run_chunkflow_attribution.sh
+```
+
+默认数据文件为 `$DATA_DIR/chunkflow-mixed/train.parquet`，也可以显式设置 `PROMPT_DATA`。
+通过 `STEPS` 和 `DROP_FIRST` 调整总步数与预热步数。
+设置 `DRY_RUN=1` 只打印配置和命令；不需要先跑 smoke。
+必须取消 `RAY_NO_WAIT`，以保证两组顺序执行。
+
+每次运行创建独立的 `analysis/chunkflow-attribution-时间-进程号/` 目录；
+也可用 `REPORT_DIR` 指定尚不存在的目录。该目录包含：
+
+- `baseline.log`、`chunk2048.log`：本次两组完整训练日志。
+- `attribution.md`：四格计数表、Pearson、Spearman、实际加速及区间。
+- `attribution.csv`：逐 step 的预测、实测收益及差额。
+- `attribution.svg`：预测与实测收益散点图。
+- `attribution.json`、`summary.txt`：结构化统计与分析终端输出。
+
+新入口启用 `RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS=1`，报告明确使用 `schedule` 预测，
+不会回退到旧的 `proxy`。缺少预测、两组 token 数不同、配对步数不足或训练失败都会终止，
+避免把不完整实验当成完整归因表。此目录应使用新入口的自动报告；旧的 `--sweep-log-dir` 匹配旧矩阵。
+
+模拟器 CPU 开销可能进入训练计时；参照上文 `schedule_model_analysis_time_s` 的限制解释结果。
+默认每组需要 4080 条样本，低于数据集的 5000 条；增加 GBS 或步数时应同时检查数据量，
+避免重复读取。每步的 token 数与长度构成会不同，不能把所有计时视为独立同分布观测。
+尤其是 28K–32K 只有 25 条，分桶结论应同时报告样本数。
+本实验可检查收益方向和相关性，不能单凭相关性确定具体性能瓶颈。
+
 ## 附录：关键代码位置
 
 | 内容 | 位置 |

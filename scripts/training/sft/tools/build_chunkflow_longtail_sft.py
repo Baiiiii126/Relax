@@ -63,6 +63,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--medium-count", type=int, default=25)
     parser.add_argument("--long-count", type=int, default=20)
     parser.add_argument("--tail-count", type=int, default=5)
+    parser.add_argument(
+        "--synthetic-ultralong-count",
+        type=int,
+        default=0,
+        help="Subset of --tail-count reserved for 28K-32K; requires --synthetic-only",
+    )
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--max-scan-per-source", type=int, default=200_000)
     parser.add_argument("--min-cjk-ratio", type=float, default=0.05)
@@ -153,15 +159,23 @@ def _build_synthetic_rows(
     targets: Mapping[str, int],
     tokenizer,
     seed: int,
+    ultralong_count: int = 0,
 ) -> dict[str, list[dict[str, Any]]]:
     """Generate deterministic Chinese samples inside every token bucket."""
+    if not 0 <= ultralong_count <= targets.get("tail_16k_32k", 0):
+        raise ValueError("synthetic ultralong count must be between zero and tail count")
     rng = random.Random(seed)
     ranges = {name: (lower, upper) for name, lower, upper in BUCKETS}
     rows_by_bucket: dict[str, list[dict[str, Any]]] = {name: [] for name in targets}
 
     for bucket, count in targets.items():
-        lower, upper = ranges[bucket]
         for index in range(count):
+            lower, upper = ranges[bucket]
+            if bucket == "tail_16k_32k" and ultralong_count:
+                if index < ultralong_count:
+                    lower = 28_672
+                else:
+                    upper = 28_672
             target = rng.randint(lower + (upper - lower) // 4, upper - (upper - lower) // 4 - 1)
             context = SYNTHETIC_CONTEXTS[(index + len(bucket)) % len(SYNTHETIC_CONTEXTS)]
             answer_unit = SYNTHETIC_ANSWERS[index % len(SYNTHETIC_ANSWERS)]
@@ -317,6 +331,8 @@ def _collect(
 
 def main() -> None:
     args = _parse_args()
+    if args.synthetic_ultralong_count and not args.synthetic_only:
+        raise ValueError("--synthetic-ultralong-count requires --synthetic-only")
 
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -331,7 +347,7 @@ def main() -> None:
     if args.local_long_data and not args.local_json:
         raise ValueError("--local-long-data requires --local-json so both short and long buckets use local real data")
     if args.synthetic_only:
-        rows_by_bucket = _build_synthetic_rows(targets, tokenizer, args.seed)
+        rows_by_bucket = _build_synthetic_rows(targets, tokenizer, args.seed, args.synthetic_ultralong_count)
         scanned_by_source = {"synthetic-chinese-v1": sum(targets.values())}
         revisions = {"synthetic-chinese-v1": "v1"}
     elif args.local_json:
@@ -422,6 +438,7 @@ def main() -> None:
         "min_cjk_ratio": args.min_cjk_ratio,
         "total_rows": len(rows),
         "bucket_counts": {name: len(rows_by_bucket[name]) for name in targets},
+        "ultralong_28k_32k_count": sum(28_672 <= row["token_count"] < 32_257 for row in rows),
         "targets": targets,
         "scanned_by_source": scanned_by_source,
         "source_revisions": revisions,

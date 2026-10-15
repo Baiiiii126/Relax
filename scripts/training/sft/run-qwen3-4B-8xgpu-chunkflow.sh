@@ -157,8 +157,8 @@ CLEARML_ARGS=(
    --tb-experiment-name "${EXP_NAME}-${now}"
 )
 
-mkdir -p log
-LOG_FILE="log/${EXP_NAME}-gpu${NUM_GPUS}-${now}.log"
+LOG_FILE="${LOG_FILE:-log/${EXP_NAME}-gpu${NUM_GPUS}-${now}.log}"
+mkdir -p "$(dirname -- "${LOG_FILE}")"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
 echo "LOG_FILE=${LOG_FILE}"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD_ADDRESS}" \
