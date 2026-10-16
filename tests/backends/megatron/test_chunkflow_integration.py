@@ -253,6 +253,31 @@ def _drive_units(attn, q, k, v, dout, chunk_size, descending_backward=True):
     return torch.cat([o.detach() for o in outs], dim=0)
 
 
+def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding(monkeypatch):
+    from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
+    from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
+    from relax.backends.megatron.chunkflow.scheduler import build_chunks
+    from relax.backends.megatron.chunkflow.units import build_micro_batches
+
+    recorded = []
+    original = UnitCacheAttention.apply
+
+    def capture(*args):
+        recorded.append((args[0].shape[0], args[-1]))
+        return original(*args)
+
+    monkeypatch.setattr(UnitCacheAttention, "apply", capture)
+    attn = _unit_attn(8)
+    units = build_micro_batches(build_chunks([13], chunk_size=8, repack_tail=False), "staggered")
+    for unit in units:
+        length = sum(seg.length for chunk in unit.chunks for seg in chunk.segments)
+        packed = SimpleNamespace(cu_seqlens_q_cpu=[0, length], **{UNIT_ATTR: unit})
+        q, k, v = _qkv(length + 3, 4, 8, kv_heads=2)
+        output = attn(q, k, v, packed_seq_params=packed)
+        assert output.shape[0] == length + 3
+    assert recorded == [(8, (8, 8)), (5, (5, 13))]
+
+
 def test_unit_mode_matches_the_in_forward_loop():
     """Driving chunks as separate units must equal chunking inside one
     forward."""

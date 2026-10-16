@@ -307,17 +307,18 @@ def _offset_causal_mask(ql, kl):
     return (kpos <= qpos).unsqueeze(0).unsqueeze(0)
 
 
-def _unit_attention_raw(q, k, v, cu_q, cu_kv, causal=True):
+def _unit_attention_raw(q, k, v, cu_q, cu_kv, causal=True, max_seqlens=None):
     from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
 
     parts = [k[s:e] for s, e in zip(cu_kv[:-1], cu_kv[1:])]
     vparts = [v[s:e] for s, e in zip(cu_kv[:-1], cu_kv[1:])]
     scale = q.shape[-1] ** -0.5
-    return UnitCacheAttention.apply(q, causal, scale, cu_q, cu_kv, *parts, *vparts)
+    metadata = () if max_seqlens is None else (max_seqlens,)
+    return UnitCacheAttention.apply(q, causal, scale, cu_q, cu_kv, *parts, *vparts, *metadata)
 
 
-def _unit_attention(q, k, v, cu_q, cu_kv, causal=True):
-    return _unit_attention_raw(q, k, v, cu_q, cu_kv, causal)[0]
+def _unit_attention(q, k, v, cu_q, cu_kv, causal=True, max_seqlens=None):
+    return _unit_attention_raw(q, k, v, cu_q, cu_kv, causal, max_seqlens)[0]
 
 
 def test_unit_attention_matches_per_sequence_sdpa():
@@ -387,7 +388,8 @@ def test_unit_attention_backward_matches_per_sequence_sdpa():
     torch.testing.assert_close(v_.grad, vr.grad, atol=1e-9, rtol=1e-9)
 
 
-def test_unit_attention_matches_compact_gqa_forward_and_backward():
+@pytest.mark.parametrize("max_seqlens", [None, (10, 30)])
+def test_unit_attention_matches_compact_gqa_forward_and_backward(max_seqlens):
     torch.manual_seed(0)
     h, kv_h, d = 4, 2, 8
     cu_q = torch.tensor([0, 10, 20], dtype=torch.int32)
@@ -398,7 +400,7 @@ def test_unit_attention_matches_compact_gqa_forward_and_backward():
     dout = torch.randn(20, h, d, dtype=torch.float64)
 
     q_, k_, v_ = (tensor.clone().requires_grad_(True) for tensor in (q0, k0, v0))
-    got = _unit_attention(q_, k_, v_, cu_q, cu_kv)
+    got = _unit_attention(q_, k_, v_, cu_q, cu_kv, max_seqlens=max_seqlens)
     got.backward(dout)
 
     qr, kr, vr = (tensor.clone().requires_grad_(True) for tensor in (q0, k0, v0))
@@ -420,6 +422,66 @@ def test_unit_attention_matches_compact_gqa_forward_and_backward():
     torch.testing.assert_close(q_.grad, qr.grad, atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(k_.grad, kr.grad, atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(v_.grad, vr.grad, atol=1e-9, rtol=1e-9)
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_unit_flash_reuses_cpu_maxima_in_forward_and_backward(monkeypatch, with_metadata):
+    """Unequal packed sequences must use per-sequence maxima, not total rows.
+
+    Exercise the Flash argument and autograd interfaces on CPU with a numeric
+    reference kernel. Explicit metadata must bypass scalar length reads.
+    """
+    from unittest.mock import Mock
+
+    from relax.backends.megatron.chunkflow import attention_ops as ao
+
+    calls = []
+
+    def forward(q, k, v, cu_q, cu_kv, max_q, max_kv, dropout, scale, causal):
+        calls.append(("forward", max_q, max_kv))
+        out, lse = ao._manual_varlen_forward(q, k, v, cu_q, cu_kv, causal, scale)
+        return out, lse, None, None
+
+    def backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_kv, max_q, max_kv, dropout, scale, causal, *rest):
+        calls.append(("backward", max_q, max_kv))
+        gradients = ao._manual_varlen_backward(dout, q, k, v, lse, cu_q, cu_kv, causal, scale)
+        for target, gradient in zip((dq, dk, dv), gradients):
+            target.copy_(gradient)
+
+    read_max = Mock(wraps=ao._max_seqlen)
+    if with_metadata:
+        read_max.side_effect = AssertionError("CPU metadata must bypass GPU scalar length reads")
+    monkeypatch.setattr(ao, "_max_seqlen", read_max)
+    monkeypatch.setattr(ao, "_use_flash", lambda q: True)
+    monkeypatch.setattr(ao, "_flash_varlen_ops", lambda: (forward, backward))
+    torch.manual_seed(17)
+    cu_q, cu_kv = torch.tensor([0, 3, 10]), torch.tensor([0, 11, 20])
+    q, k, v = (torch.randn(n, h, 8, dtype=torch.float64, requires_grad=True) for n, h in ((10, 4), (20, 2), (20, 2)))
+    dout = torch.randn_like(q)
+    result = _unit_attention(q, k, v, cu_q, cu_kv, max_seqlens=(7, 11) if with_metadata else None)
+    result.backward(dout)
+    assert calls == [("forward", 7, 11), ("backward", 7, 11)]
+    assert read_max.call_count == (0 if with_metadata else 2)
+
+    qr, kr, vr = (tensor.detach().clone().requires_grad_(True) for tensor in (q, k, v))
+    reference = []
+    for qs, qe, ks, ke in ((0, 3, 0, 11), (3, 10, 11, 20)):
+        reference.append(
+            F.scaled_dot_product_attention(
+                qr[qs:qe].permute(1, 0, 2).unsqueeze(0),
+                kr[ks:ke].repeat_interleave(2, dim=1).permute(1, 0, 2).unsqueeze(0),
+                vr[ks:ke].repeat_interleave(2, dim=1).permute(1, 0, 2).unsqueeze(0),
+                attn_mask=_offset_causal_mask(qe - qs, ke - ks),
+                scale=8**-0.5,
+            )
+            .squeeze(0)
+            .permute(1, 0, 2)
+        )
+    expected = torch.cat(reference)
+    expected.backward(dout)
+    torch.testing.assert_close(result, expected, atol=1e-9, rtol=1e-9)
+    for actual, wanted in zip((q, k, v), (qr, kr, vr)):
+        torch.testing.assert_close(actual.grad, wanted.grad, atol=1e-9, rtol=1e-9)
 
 
 def test_unit_attention_gradients_do_not_leak_across_sequences():

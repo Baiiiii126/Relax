@@ -306,16 +306,30 @@ class UnitCacheAttention(torch.autograd.Function):
     and ``cu_seqlens_kv`` the K/V lengths -- the two differ for any chunk with
     a prefix, which is what lets one call serve them all instead of one call
     per chunk. Call count, not FLOPs, dominates chunked attention's cost.
+
+    An optional final ``(max_q, max_kv)`` tuple supplies CPU length metadata.
+    The production caller already has these lengths before creating CUDA
+    cu_seqlens; carrying them through backward avoids GPU scalar reads.
     """
 
     @staticmethod
     def forward(ctx, q, causal, softmax_scale, cu_q, cu_kv, *kv):
+        ctx.has_max_seqlens = bool(kv and isinstance(kv[-1], tuple))
+        max_seqlens = kv[-1] if ctx.has_max_seqlens else None
+        if ctx.has_max_seqlens:
+            kv = kv[:-1]
+            if len(max_seqlens) != 2 or any(type(length) is not int or length <= 0 for length in max_seqlens):
+                raise ValueError("max_seqlens must contain two positive Python integers")
         n = len(kv) // 2
         k_all = torch.cat(kv[:n], dim=0)
         v_all = torch.cat(kv[n:], dim=0)
         flash = _use_flash(q)
         if flash:
-            out, lse = _flash_varlen(q, k_all, v_all, cu_q, cu_kv, causal, softmax_scale)
+            if max_seqlens is None:
+                # Compatibility for callers without CPU metadata: read once
+                # in forward and reuse the result in backward.
+                max_seqlens = (_max_seqlen(cu_q), _max_seqlen(cu_kv))
+            out, lse = _flash_varlen(q, k_all, v_all, cu_q, cu_kv, causal, softmax_scale, max_seqlens=max_seqlens)
         else:
             out, lse = _manual_varlen_forward(q, k_all, v_all, cu_q, cu_kv, causal, softmax_scale)
 
@@ -325,6 +339,7 @@ class UnitCacheAttention(torch.autograd.Function):
         ctx.flash = flash
         ctx.n = n
         ctx.kv_lengths = [k.shape[0] for k in kv[:n]]
+        ctx.max_seqlens = max_seqlens
         return out, lse
 
     @staticmethod
@@ -338,7 +353,17 @@ class UnitCacheAttention(torch.autograd.Function):
         v_all = torch.cat(rest[n:], dim=0)
         if ctx.flash:
             dq, dk_all, dv_all = _flash_varlen_backward(
-                dout.contiguous(), q, k_all, v_all, out, lse, cu_q, cu_kv, ctx.causal, ctx.softmax_scale
+                dout.contiguous(),
+                q,
+                k_all,
+                v_all,
+                out,
+                lse,
+                cu_q,
+                cu_kv,
+                ctx.causal,
+                ctx.softmax_scale,
+                max_seqlens=ctx.max_seqlens,
             )
         else:
             dq, dk_all, dv_all = _manual_varlen_backward(
@@ -346,7 +371,8 @@ class UnitCacheAttention(torch.autograd.Function):
             )
         dks = torch.split(dk_all, ctx.kv_lengths, dim=0)
         dvs = torch.split(dv_all, ctx.kv_lengths, dim=0)
-        return (dq, None, None, None, None, *dks, *dvs)
+        gradients = (dq, None, None, None, None, *dks, *dvs)
+        return (*gradients, None) if ctx.has_max_seqlens else gradients
 
 
 def _manual_varlen_forward(q, k, v, cu_q, cu_kv, causal, softmax_scale):
@@ -402,16 +428,17 @@ def _max_seqlen(cu: torch.Tensor) -> int:
     return max(int(cu[i + 1] - cu[i]) for i in range(cu.numel() - 1))
 
 
-def _flash_varlen(q, k, v, cu_q, cu_kv, causal, softmax_scale):
+def _flash_varlen(q, k, v, cu_q, cu_kv, causal, softmax_scale, *, max_seqlens: tuple[int, int] | None = None):
     fwd, _bwd = _flash_varlen_ops()
+    max_q, max_kv = max_seqlens if max_seqlens is not None else (_max_seqlen(cu_q), _max_seqlen(cu_kv))
     out, lse, _s, _rng = fwd(
         q,
         k,
         v,
         cu_q.to(torch.int32),
         cu_kv.to(torch.int32),
-        _max_seqlen(cu_q),
-        _max_seqlen(cu_kv),
+        max_q,
+        max_kv,
         0.0,
         softmax_scale,
         causal,
@@ -419,8 +446,11 @@ def _flash_varlen(q, k, v, cu_q, cu_kv, causal, softmax_scale):
     return out, lse
 
 
-def _flash_varlen_backward(dout, q, k, v, out, lse, cu_q, cu_kv, causal, softmax_scale):
+def _flash_varlen_backward(
+    dout, q, k, v, out, lse, cu_q, cu_kv, causal, softmax_scale, *, max_seqlens: tuple[int, int] | None = None
+):
     _fwd, bwd = _flash_varlen_ops()
+    max_q, max_kv = max_seqlens if max_seqlens is not None else (_max_seqlen(cu_q), _max_seqlen(cu_kv))
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     bwd(
         dout,
@@ -434,8 +464,8 @@ def _flash_varlen_backward(dout, q, k, v, out, lse, cu_q, cu_kv, causal, softmax
         dv,
         cu_q.to(torch.int32),
         cu_kv.to(torch.int32),
-        _max_seqlen(cu_q),
-        _max_seqlen(cu_kv),
+        max_q,
+        max_kv,
         0.0,
         softmax_scale,
         causal,

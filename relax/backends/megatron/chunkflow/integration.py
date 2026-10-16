@@ -119,7 +119,11 @@ class ChunkedCoreAttention(nn.Module):
         cu_q = torch.tensor(cu, dtype=torch.int32, device=device)
         cu_kv = torch.tensor([0, *itertools.accumulate(t.shape[0] for t in ks)], dtype=torch.int32, device=device)
         scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1] ** -0.5
-        out, _lse = UnitCacheAttention.apply(query, True, scale, cu_q, cu_kv, *ks, *vs)
+        max_seqlens = (
+            max(end - start for start, end in zip(cu[:-1], cu[1:])),
+            max(tensor.shape[0] for tensor in ks),
+        )
+        out, _lse = UnitCacheAttention.apply(query, True, scale, cu_q, cu_kv, *ks, *vs, max_seqlens)
         return out
 
     def _attend_one_sequence(self, q, k, v) -> torch.Tensor:
