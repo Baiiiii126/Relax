@@ -15,6 +15,8 @@ def test_qwen36_dpo_scripts_have_required_runtime_flags():
         script = (DPO_DIR / name).read_text(encoding="utf-8")
         assert "--enable-weights-backuper" in script
         assert "--use-gloo-process-groups" in script
+        if "expandable_segments:True" in script and "--colocate" in script:
+            assert "--selective-offload" in script
         assert '--load "${CHECKPOINT_DIR}"' in script
         assert '--save "${CHECKPOINT_DIR}"' in script
 
