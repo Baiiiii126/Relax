@@ -71,6 +71,24 @@ fi
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/dev/chunkflow-benefit}"
 EXP_NAME="${EXP_NAME:-qwen3-4b-sft-${ARM}}"
+RUN_NAME="${RUN_NAME:-${EXP_NAME}-${now}}"
+TRAIN_SEED="${TRAIN_SEED:-1234}"
+
+# Profiling is an explicit, separate diagnostic run. The staged experiment
+# driver never mixes its timings into a performance report.
+PROFILE_ARGS=()
+if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
+   PROFILE_START="${PROFILE_START:-10}"
+   PROFILE_END="${PROFILE_END:-12}"
+   if ! [[ "${PROFILE_START}" =~ ^[0-9]+$ && "${PROFILE_END}" =~ ^[0-9]+$ ]] ||
+      [ "${PROFILE_END}" -lt "${PROFILE_START}" ] || [ "${NUM_ROLLOUT}" -le "$((PROFILE_END + 1))" ]; then
+      echo "ERROR: profiling needs 0 <= PROFILE_START <= PROFILE_END and NUM_ROLLOUT > PROFILE_END + 1" >&2
+      exit 2
+   fi
+   PROFILE_ARGS=(--use-pytorch-profiler --profile-target train_overall
+      --profile-step-start "${PROFILE_START}" --profile-step-end "${PROFILE_END}")
+   echo "Profiler output (relative to worker cwd): traces/${RUN_NAME}/train_trace"
+fi
 
 if [ ! -e "${MODEL_DIR}/Qwen3-4B" ]; then
    echo "ERROR: ${MODEL_DIR}/Qwen3-4B does not exist. Set MODEL_DIR / DATA_DIR, e.g." >&2
@@ -143,7 +161,7 @@ OPTIMIZER_ARGS=(
 )
 
 MISC_ARGS=(
-   --seed 1234
+   --seed "${TRAIN_SEED}"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
@@ -154,7 +172,7 @@ MISC_ARGS=(
 CLEARML_ARGS=(
    --use-clearml
    --tb-project-name "${PROJECT_NAME}"
-   --tb-experiment-name "${EXP_NAME}-${now}"
+   --tb-experiment-name "${RUN_NAME}"
 )
 
 LOG_FILE="${LOG_FILE:-log/${EXP_NAME}-gpu${NUM_GPUS}-${now}.log}"
@@ -172,6 +190,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD_ADDRESS}" \
     "${OPTIMIZER_ARGS[@]}" \
     "${PERF_ARGS[@]}" \
     "${CHUNKFLOW_ARGS[@]}" \
+    "${PROFILE_ARGS[@]}" \
     "${CLEARML_ARGS[@]}" \
     "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_FILE}"
 

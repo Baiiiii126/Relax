@@ -441,6 +441,92 @@ MODEL_DIR=/path/to/models DATA_DIR=/path/to/data \
 尤其是 28K–32K 只有 25 条，分桶结论应同时报告样本数。
 本实验可检查收益方向和相关性，不能单凭相关性确定具体性能瓶颈。
 
+## 10. 已有结果的深入诊断（无需训练）
+
+```bash
+python3 scripts/training/sft/tools/chunkflow_diagnose.py \
+  --csv /path/to/experiment/attribution.csv \
+  --output-prefix /path/to/experiment/diagnosis --tolerance-pct 0
+python3 scripts/training/sft/tools/chunkflow_model_audit.py \
+  --output /path/to/experiment/model-audit.json
+```
+
+诊断工具使用已去除预热的 CSV，不再次丢弃 step。每个 case 分开报告总体加速、
+Pearson/Spearman、收益方向相关性、实际提速的 AUROC、预测收益分档、整步 token 分档和 M 分组。
+M 分组还给出线性控制整步 token 数后的 Pearson，避免把共同长度趋势全归于调度预测能力。
+预测方向恒正时方向相关性未定义，不等于连续收益相关性为零。
+
+默认中性带为正负 1 个收益百分点；设为 0 可复现原归因表的方向定义。
+默认用长度为 10 的连续 step block 做 bootstrap；可用 `--block-steps 5` 或 `20` 检查敏感性。
+它只考虑局部依赖，不代替重复 A/B 实验，也不能排除先后运行造成的机器状态变化。
+分档不能用于在同一批数据选择阈值后宣称泛化，成本代理的残差相关性也不能证明因果。
+整步 token 数不能判断是否含超长样本，进一步的序列级归因需要额外输入记录。
+
+模型核对工具使用论文第 3–5 节的四条长度示例，并报告当前模型与论文气泡比例的差异，
+另外包含单长 parent 的正收益对照和多 parent 不切分的负收益对照。
+它核对的是当前模型，不是独立实现的论文调度 oracle；时间轴数字不一致时，应先逐事件检查
+执行顺序、依赖、通信语义和重计算位置，不能直接据此断定论文错误。
+
+## 11. 现有 8 卡的分阶段实验
+
+入口为 `scripts/training/sft/tools/run_chunkflow_8gpu.sh`。沿用 Qwen3-4B 和已有
+mixed 数据，固定 TP=2、PP=4、DP=1、CP=1、capacity=32768、staggered、K=0。
+这里 K=0 表示保留全部 chunk 激活。此配置用于验证当前实现的收益，不等同于论文配置。
+
+| 阶段 | 顺序 | 默认步数 | seed | 目的 |
+| --- | --- | --- | --- | --- |
+| `screen` | baseline、chunk4096、chunk8192 | 每组 110，去掉前 10 | 1234 | 单独验证 chunk 粒度影响 |
+| `confirm` | baseline/候选、候选/baseline、baseline/候选 | 每组 510，去掉前 10 | 每轮 1235、1236、1237，轮内一致 | 用新 seed 复验候选 |
+| `profile` | baseline、候选 | 每组 14，采集 step 10–12 | 1234 | 采样 CPU/CUDA 操作，定位开销 |
+
+默认 GBS=8，可用 `GBS` 覆盖。一次只改变一个因素；首轮保持模型、数据、GBS 和 K 不变。
+若改变 GBS，要重新跑同 GBS 的 baseline，并检查数据量与样本重复情况。
+`confirm` 和 `profile` 必须显式设置 `CHUNK_SIZE`，脚本不会自动选择或进入下一阶段。
+
+### 第一阶段
+
+在仓库根目录设置已有的 `MODEL_DIR`、`DATA_DIR`；默认读取
+`${DATA_DIR}/chunkflow-mixed/train.parquet`，也可显式设置 `PROMPT_DATA`。
+使用独占且空闲的 Ray 集群：已有 `ray-job.sh` 会清理旧训练和 Serve 状态，不应与其他任务并行。
+
+```bash
+unset RAY_NO_WAIT RELAX_ENTRYPOINT_MODE WORKING_DIR CHUNK_SIZE CHUNKFLOW_PROFILE
+unset TP_SIZE PP_SIZE SEQ_LENGTH MAX_TOKENS_PER_GPU PACK_POLICY KEEP_LAST_K
+unset REPEATS PROFILE_START PROFILE_END DRY_RUN
+export REPORT_DIR="analysis/chunkflow-8gpu-screen-$(date +%Y%m%d-%H%M%S)"
+GBS=8 STEPS=110 DROP_FIRST=10 TRAIN_SEED=1234 CHUNK_SIZES="4096 8192" \
+  bash scripts/training/sft/tools/run_chunkflow_8gpu.sh screen
+cat "${REPORT_DIR}/summary.md"
+```
+
+可用 `DRY_RUN=1` 只打印配置，不创建目录、不提交训练。没有 GPU smoke 阶段。
+每组在当前代码与数据上顺序运行；旧结果目录不可覆盖。中途失败会停止后续运行，
+保留已有日志。`manifest.json` 的 `status=complete` 才表示整组完成。
+脚本校验完整 step ID、有限正计时、逐 step token 数、数据和相关代码的校验和。
+相同文件与 seed 加 token 数检查用于发现明显配对错误，不能代替 loss/梯度数值对齐验证。
+
+### 看结果后再运行下一阶段
+
+下面以 4096 为示例，实际按 screen 报告选择；分别运行，不能把三条命令当成必跑清单。
+
+```bash
+# 若出现收益，复验一个候选。先 unset REPORT_DIR，让脚本为新阶段建立新目录。
+unset REPORT_DIR CHUNK_SIZES STEPS TRAIN_SEED
+CHUNK_SIZE=4096 bash scripts/training/sft/tools/run_chunkflow_8gpu.sh confirm
+
+# 若仍然变慢，单独采样。也可以选报告中的代表 step，例如 PROFILE_START=27 PROFILE_END=29。
+CHUNK_SIZE=4096 bash scripts/training/sft/tools/run_chunkflow_8gpu.sh profile
+```
+
+`summary.md` 包含每个候选的总体加速比、95% block bootstrap 区间、step_time 加速比、
+四格表和相关系数。逐步 CSV、分组诊断、散点图保存在 `repeatN/chunkSIZE/`。
+筛选时共享的 baseline 不构成独立样本；区间不能消除机器状态差异。
+`manifest.json` 保存有效配置、代码版本、相关代码哈希、数据哈希、各组日志路径和 ClearML 链接。
+
+profile 阶段不生成收益报告，避免把 profiler 开销当成真实收益。
+时间轴由训练 worker 写到其工作目录下的 `traces/<RUN_NAME>/train_trace/*.pt.trace.json.gz`，
+每组确切的相对目录在 `profile.md` 和 `manifest.json` 中；不会自动复制到报告目录。
+
 ## 附录：关键代码位置
 
 | 内容 | 位置 |
