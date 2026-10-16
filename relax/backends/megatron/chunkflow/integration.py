@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from relax.backends.megatron.chunkflow.attention_ops import chunk_attention_forward
+from relax.backends.megatron.chunkflow.flash_backends import flash3_varlen_ops, flash_backend_name
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from relax.backends.megatron.chunkflow.state_store import ChunkState, StateStore
 from relax.utils.logging_utils import get_logger
@@ -214,6 +215,10 @@ def install(model, chunk_size: int) -> int:
     """
     from relax.backends.megatron.chunkflow.runtime import attach_runtime
 
+    backend = flash_backend_name()
+    if backend == "fa3":
+        flash3_varlen_ops()  # Explicit selection must fail rather than silently use FA2.
+    logger.info(f"chunkflow: flash attention backend={backend}")
     runtime = attach_runtime(model, chunk_size)
     from relax.backends.megatron.chunkflow import rope as chunkflow_rope
 

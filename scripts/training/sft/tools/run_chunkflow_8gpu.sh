@@ -4,6 +4,7 @@
 # Usage: bash scripts/training/sft/tools/run_chunkflow_8gpu.sh screen
 #        CHUNK_SIZE=4096 bash scripts/training/sft/tools/run_chunkflow_8gpu.sh confirm
 #        CHUNK_SIZE=4096 bash scripts/training/sft/tools/run_chunkflow_8gpu.sh profile
+#        CHUNK_SIZE=4096 bash scripts/training/sft/tools/run_chunkflow_8gpu.sh backend
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 cd "${SCRIPT_DIR}/../../../.."

@@ -507,3 +507,121 @@ def test_unit_attention_gradients_do_not_leak_across_sequences():
     assert v.grad[16:24].abs().sum() == 0
     assert k.grad[:16].abs().sum() > 0, "sequence 0's K/V should still get gradient"
     assert q.grad[8:16].abs().sum() == 0, "silenced queries must not move"
+
+
+def test_unit_fa3_adapter_preserves_gqa_gradients_and_forward_backend(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    from relax.backends.megatron.chunkflow import attention_ops as ao
+    from relax.backends.megatron.chunkflow import flash_backends as fb
+
+    native = ModuleType("flash_attn_3.flash_attn_interface")
+    calls = []
+
+    def forward(q, k, v, **kwargs):
+        assert (kwargs["max_seqlen_q"], kwargs["max_seqlen_k"]) == (7, 11)
+        calls.append("fa3-forward")
+        out, lse = ao._manual_varlen_forward(
+            q, k, v, kwargs["cu_seqlens_q"], kwargs["cu_seqlens_k"], kwargs["causal"], kwargs["softmax_scale"]
+        )
+        return out, lse, None, None
+
+    def backward(dout, q, k, v, out, lse, **kwargs):
+        assert (kwargs["max_seqlen_q"], kwargs["max_seqlen_k"]) == (7, 11)
+        calls.append("fa3-backward")
+        gradients = ao._manual_varlen_backward(
+            dout,
+            q,
+            k,
+            v,
+            lse,
+            kwargs["cu_seqlens_q"],
+            kwargs["cu_seqlens_k"],
+            kwargs["is_causal"],
+            kwargs["softmax_scale"],
+        )
+        for name, gradient in zip(("dq", "dk", "dv"), gradients):
+            kwargs[name].copy_(gradient)
+
+    native._flash_attn_forward, native._flash_attn_backward = forward, backward
+    fb.flash3_varlen_ops.cache_clear()
+    monkeypatch.setitem(sys.modules, "flash_attn_3.flash_attn_interface", native)
+    monkeypatch.setenv("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa3")
+    monkeypatch.setattr(ao, "_use_flash", lambda q: True)
+
+    def forbidden(*args):
+        raise AssertionError("must reuse CPU maxima and the forward backend")
+
+    monkeypatch.setattr(ao, "_max_seqlen", forbidden)
+    q, k, v = (torch.randn(n, h, 8, dtype=torch.float64, requires_grad=True) for n, h in ((10, 4), (20, 2), (20, 2)))
+    qr, kr, vr = (tensor.detach().clone().requires_grad_(True) for tensor in (q, k, v))
+    cu_q, cu_kv = torch.tensor([0, 3, 10]), torch.tensor([0, 11, 20])
+    result = _unit_attention(q, k, v, cu_q, cu_kv, max_seqlens=(7, 11))
+    monkeypatch.setenv("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa2")
+    monkeypatch.setattr(ao, "_flash_varlen_ops", forbidden)
+    dout = torch.randn_like(q)
+    result.backward(dout)
+    reference = []
+    for qs, qe, ks, ke in ((0, 3, 0, 11), (3, 10, 11, 20)):
+        reference.append(
+            F.scaled_dot_product_attention(
+                qr[qs:qe].permute(1, 0, 2).unsqueeze(0),
+                kr[ks:ke].repeat_interleave(2, dim=1).permute(1, 0, 2).unsqueeze(0),
+                vr[ks:ke].repeat_interleave(2, dim=1).permute(1, 0, 2).unsqueeze(0),
+                attn_mask=_offset_causal_mask(qe - qs, ke - ks),
+                scale=8**-0.5,
+            )
+            .squeeze(0)
+            .permute(1, 0, 2)
+        )
+    expected = torch.cat(reference)
+    expected.backward(dout)
+    torch.testing.assert_close(result, expected, atol=1e-9, rtol=1e-9)
+    for actual, wanted in zip((q, k, v), (qr, kr, vr)):
+        torch.testing.assert_close(actual.grad, wanted.grad, atol=1e-9, rtol=1e-9)
+    assert calls == ["fa3-forward", "fa3-backward"]
+    fb.flash3_varlen_ops.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 numeric validation requires a CUDA GPU")
+def test_unit_fa3_matches_cuda_reference(monkeypatch):
+    """Validate the real FA3 kernels against FA2 on the production GQA
+    layout."""
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("requires the Hopper FA3 build used by this experiment")
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except ImportError:
+        pytest.skip("FA2 reference kernel is not installed")
+
+    from relax.backends.megatron.chunkflow import flash_backends as fb
+
+    fb.flash3_varlen_ops.cache_clear()
+    monkeypatch.setenv("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa3")
+    try:
+        fb.flash3_varlen_ops()
+    except RuntimeError as exc:
+        if isinstance(exc.__cause__, ImportError):
+            pytest.skip("optional FA3 interface is not installed")
+        raise
+    bounds_q, bounds_k = [0, 17, 26], [0, 40, 53]
+    cu_q = torch.tensor(bounds_q, device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor(bounds_k, device="cuda", dtype=torch.int32)
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    q, k, v = (
+        torch.randn(n, h, 128, device="cuda", dtype=torch.bfloat16, generator=generator, requires_grad=True)
+        for n, h in ((26, 16), (53, 4), (53, 4))
+    )
+    qr, kr, vr = (tensor.detach().clone().requires_grad_(True) for tensor in (q, k, v))
+    parts = [k[a:b] for a, b in zip(bounds_k[:-1], bounds_k[1:])]
+    values = [v[a:b] for a, b in zip(bounds_k[:-1], bounds_k[1:])]
+    from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
+
+    result, _ = UnitCacheAttention.apply(q, True, 128**-0.5, cu_q, cu_k, *parts, *values, (17, 40))
+    expected = flash_attn_varlen_func(qr, kr, vr, cu_q, cu_k, 17, 40, causal=True)
+    dout = torch.randn_like(result)
+    result.backward(dout)
+    expected.backward(dout)
+    for actual, wanted in ((result, expected), (q.grad, qr.grad), (k.grad, kr.grad), (v.grad, vr.grad)):
+        torch.testing.assert_close(actual, wanted, atol=0.02, rtol=0.02)

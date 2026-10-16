@@ -527,6 +527,54 @@ profile 阶段不生成收益报告，避免把 profiler 开销当成真实收�
 时间轴由训练 worker 写到其工作目录下的 `traces/<RUN_NAME>/train_trace/*.pt.trace.json.gz`，
 每组确切的相对目录在 `profile.md` 和 `manifest.json` 中；不会自动复制到报告目录。
 
+## 12. FA2 / FA3 后端消融
+
+Profiler 已确认 baseline 的 Transformer Engine 使用 FA3，原 ChunkFlow 使用 FA2。
+`backend` 阶段在保留 CPU 长度优化的基础上，顺序运行同一 baseline、CF-FA2、CF-FA3。
+两组 ChunkFlow 的 chunk、输入、seed、GBS、并行配置和调度相同。
+
+本次适配以已安装 FA3 接口为准，保留非对称 Q/KV、bottom-right causal、GQA 与原生 LSE。
+前向选择的接口保存在 autograd ctx，反向复用。只导入
+`flash_attn_3.flash_attn_interface`；不得额外导入顶层 `flash_attn_interface`，避免重复注册 custom ops。
+默认后端为 FA2；显式选择 FA3 时，缺模块或接口错误会终止实验，不会自动降级。
+
+服务器代码同步后，先验证真实 CUDA kernel 的输出及 Q/K/V 梯度：
+
+```bash
+python3 -m pytest tests/backends/megatron/test_chunkflow_attention_ops.py \
+  -k test_unit_fa3_matches_cuda_reference -q
+```
+
+应显示 `1 passed`。若失败或跳过，先检查环境/数值，不继续性能实验。
+这是 attention 正确性检查，不是训练 smoke；本机无 CUDA 时不执行该项。
+
+然后在原有独占且空闲的 8 卡环境运行：
+
+```bash
+unset CHUNK_SIZES RAY_NO_WAIT RELAX_ENTRYPOINT_MODE WORKING_DIR CHUNKFLOW_PROFILE DRY_RUN REPEATS
+export REPORT_DIR="analysis/chunkflow-backend-$(date +%Y%m%d-%H%M%S)"
+GBS=8 CHUNK_SIZE=4096 STEPS=110 DROP_FIRST=10 TRAIN_SEED=1234 \
+  bash scripts/training/sft/tools/run_chunkflow_8gpu.sh backend
+cat "${REPORT_DIR}/summary.md"
+```
+
+仍沿用 `MODEL_DIR`、`DATA_DIR` / `PROMPT_DATA`。三组各 110 步、各去掉前 10 步。
+日志和逐步结果分开保存到 `repeat1/chunk4096-fa2` 和 `repeat1/chunk4096-fa3`。
+报告除各自相对 baseline 的收益和四格表外，还给出
+`FA3 相对 FA2 加速比 = CF-FA2 总训练时间 / CF-FA3 总训练时间` 和配对 block 区间。
+共享 baseline 不代表独立样本；顺序运行的机器状态偏差需要后续换顺序复验。
+
+其他阶段可设置 `RELAX_CHUNKFLOW_FLASH_BACKEND=fa3` 选择一个后端，例如在确认收益后单独采样 FA3：
+
+```bash
+unset REPORT_DIR
+RELAX_CHUNKFLOW_FLASH_BACKEND=fa3 CHUNK_SIZE=4096 PROFILE_START=16 PROFILE_END=18 STEPS=20 \
+  bash scripts/training/sft/tools/run_chunkflow_8gpu.sh profile
+```
+
+变量会显式传给 Ray workers，并记录在 manifest、实验名及安装日志中。
+驱动检查 worker 的后端日志标记；实际 kernel 可进一步通过 profiler 中 `flash_attn_3` 算子确认。
+
 ## 附录：关键代码位置
 
 | 内容 | 位置 |

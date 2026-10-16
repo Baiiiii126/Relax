@@ -6,6 +6,7 @@ invocation.
 screen: baseline + 4K + 8K, 110 steps each, fixed GBS=8 by default.
 confirm: one explicitly selected chunk, three A/B repeats, 510 steps each.
 profile: one baseline/CF pair with a short profiler window, no speedup report.
+backend: shared baseline + CF-FA2 + CF-FA3 for one explicitly selected chunk.
 DRY_RUN=1 prints the resolved plan without launching or creating files.
 """
 
@@ -43,6 +44,9 @@ def integer(env: Mapping[str, str], key: str, default: int, minimum: int = 0) ->
 
 
 def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
+    backend = env.get("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa2")
+    if backend not in ("fa2", "fa3"):
+        raise ValueError("RELAX_CHUNKFLOW_FLASH_BACKEND must be fa2 or fa3")
     for key, expected in {
         "TP_SIZE": "2",
         "PP_SIZE": "4",
@@ -78,7 +82,7 @@ def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
         raise ValueError("chunk sizes must be distinct multiples of 256 in [256, 32768]")
     profile_start = integer(env, "PROFILE_START", 10)
     profile_end = integer(env, "PROFILE_END", 12)
-    default_steps = {"screen": 110, "confirm": 510, "profile": profile_end + 2}[phase]
+    default_steps = {"screen": 110, "confirm": 510, "profile": profile_end + 2, "backend": 110}[phase]
     steps = integer(env, "STEPS", default_steps, 1)
     drop = integer(env, "DROP_FIRST", 10)
     if phase == "profile":
@@ -109,6 +113,8 @@ def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
         "data": str(data),
         "gbs": integer(env, "GBS", 8, 1),
         "chunks": chunks,
+        "flash_backend": backend,
+        "backends": ["fa2", "fa3"] if phase == "backend" else [backend],
         "steps": steps,
         "drop_first": drop,
         "repeats": repeats,
@@ -158,8 +164,16 @@ def code_hashes() -> dict[str, str]:
     return {str(path.relative_to(ROOT)): sha256(path) for path in paths}
 
 
-def arm_environment(config: dict[str, Any], repeat: int, chunk: int) -> dict[str, str]:
-    arm = f"chunk{chunk}" if chunk else "baseline"
+def arm_label(config: dict[str, Any], chunk: int, backend: str) -> str:
+    if not chunk:
+        return "baseline"
+    suffix = f"-{backend}" if config["phase"] == "backend" or backend != "fa2" else ""
+    return f"chunk{chunk}{suffix}"
+
+
+def arm_environment(config: dict[str, Any], repeat: int, chunk: int, backend: str | None = None) -> dict[str, str]:
+    backend = backend or config["flash_backend"]
+    arm = arm_label(config, chunk, backend)
     name = f"cf8-{config['phase']}-{config['run_id']}-r{repeat}-gbs{config['gbs']}-{arm}"
     return {
         "MODEL_DIR": str(Path(config["model"]).parent),
@@ -178,6 +192,7 @@ def arm_environment(config: dict[str, Any], repeat: int, chunk: int) -> dict[str
         "RUN_NAME": name,
         "LOG_FILE": str(Path(config["report_dir"]) / f"repeat{repeat}" / f"{arm}.log"),
         "RELAX_CHUNKFLOW_PIPELINE_UNTESTED": "1",
+        "RELAX_CHUNKFLOW_FLASH_BACKEND": backend,
         "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS": "0" if config["phase"] == "profile" else "1",
         "CHUNKFLOW_PROFILE": "1" if config["phase"] == "profile" else "0",
         "PROFILE_START": str(config["profile_start"] or 0),
@@ -185,7 +200,7 @@ def arm_environment(config: dict[str, Any], repeat: int, chunk: int) -> dict[str
     }
 
 
-def validate_log(path: Path, steps: int, chunk: int, profile: bool) -> None:
+def validate_log(path: Path, steps: int, chunk: int, profile: bool, backend: str | None = None) -> None:
     expected = set(range(steps))
     for metric in ("actor_train_time", "step_time"):
         timings = align._perf_rows(path, metric)
@@ -200,6 +215,8 @@ def validate_log(path: Path, steps: int, chunk: int, profile: bool) -> None:
     if chunk:
         if "chunked attention installed" not in path.read_text(errors="replace"):
             raise ValueError(f"{path.name}: chunked attention was not installed")
+        if backend and f"chunkflow: flash attention backend={backend}" not in path.read_text(errors="replace"):
+            raise ValueError(f"{path.name}: requested attention backend {backend} not confirmed in worker logs")
         if not profile and set(align._theory(path)) != expected:
             raise ValueError(f"{path.name}: missing per-step scheduling telemetry")
 
@@ -215,15 +232,17 @@ def validate_inputs(base: Path, cf: Path) -> None:
             raise ValueError(f"step {step}: missing or different token counts ({a} != {b})")
 
 
-def analyze_pair(config: dict[str, Any], repeat: int, chunk: int) -> dict[str, Any]:
+def analyze_pair(config: dict[str, Any], repeat: int, chunk: int, backend: str | None = None) -> dict[str, Any]:
+    backend = backend or config["flash_backend"]
     folder = Path(config["report_dir"]) / f"repeat{repeat}"
-    base, cf = folder / "baseline.log", folder / f"chunk{chunk}.log"
+    label = arm_label(config, chunk, backend)
+    base, cf = folder / "baseline.log", folder / f"{label}.log"
     rows = align._pair(base, cf, "actor_train_time", "schedule")
     wall_rows = align._pair(base, cf, "step_time", "schedule")
     if len(rows) != config["steps"] or len(wall_rows) != config["steps"]:
         raise ValueError("paired steps incomplete; inspect the current run's logs")
     rows, wall_rows = rows[config["drop_first"] :], wall_rows[config["drop_first"] :]
-    output = folder / f"chunk{chunk}"
+    output = folder / label
     output.mkdir()
     with (output / "attribution.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -238,6 +257,7 @@ def analyze_pair(config: dict[str, Any], repeat: int, chunk: int) -> dict[str, A
     result = {
         "repeat": repeat,
         "chunk_size": chunk,
+        "flash_backend": backend,
         "seed": config["seed"] + repeat - 1,
         "summary": summary,
         "block_ci95": report["cases"]["0"]["block_ci95"],
@@ -260,19 +280,45 @@ def write_report(config: dict[str, Any], results: list[dict[str, Any]]) -> None:
         "预测使用声明成本假设的调度模型，尚未按 GPU 算子成本校准。",
         "本表可在实验过程中增量生成；完整性以 manifest.json 的 status=complete 为准。",
         "",
-        "| 轮次 | chunk | 配对数 | 预测加速比 | 训练加速比 | 训练比 95% block 区间 | step_time 加速比 | 实际正收益率 |",
-        "| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |",
+        "| 轮次 | chunk | CF 后端 | 配对数 | 预测加速比 | 训练加速比 | 训练比 95% block 区间 | step_time 加速比 | 实际正收益率 |",
+        "| --- | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: |",
     ]
     for result in results:
         s, ci = result["summary"], result["block_ci95"].get("actual_x")
         interval = "未定义" if ci is None else f"[{ci[0]:.4f}, {ci[1]:.4f}]"
         lines.append(
-            f"| {result['repeat']} | {result['chunk_size']} | {s['paired_steps']} | "
+            f"| {result['repeat']} | {result['chunk_size']} | {result['flash_backend']} | {s['paired_steps']} | "
             f"{s['aggregate_theory_x']:.4f} | {s['aggregate_actual_x']:.4f} | {interval} | "
             f"{result['step_time_speedup']:.4f} | {100 * s['actual_positive_fraction']:.1f}% |"
         )
+    comparison = None
+    if config["phase"] == "backend" and len(results) == 2:
+        pair = {r["flash_backend"]: r for r in results}
+        left, right = (align._perf_rows(Path(pair[b]["chunkflow_log"]), "actor_train_time") for b in ("fa2", "fa3"))
+        direct = []
+        for step in sorted(left)[config["drop_first"] :]:
+            a, b = align._pick(left[step], "perf/actor_train_time"), align._pick(right[step], "perf/actor_train_time")
+            direct.append(
+                {
+                    "step": step,
+                    "base_time": a,
+                    "cf_time": b,
+                    "theory_gain_pct": 0,
+                    "actual_gain_pct": 100 * (a / b - 1),
+                }
+            )
+        comparison = {
+            "fa3_vs_fa2_x": align._aggregate_speedup(direct),
+            "block_ci95": diagnose.block_intervals(direct, 1000, 10, 1234),
+        }
+        ci = comparison["block_ci95"].get("actual_x")
+        lines += [
+            "",
+            f"**FA3 相对 FA2 的训练加速比：{comparison['fa3_vs_fa2_x']:.4f}**（FA2 总时间 / FA3 总时间）。",
+            f"95% block 区间：{ci}。大于 1 表示 FA3 更快；是否胜过 baseline 仍看上表。",
+        ]
     for result in results:
-        lines += ["", f"## 轮次 {result['repeat']}，chunk={result['chunk_size']}", ""]
+        lines += ["", f"## 轮次 {result['repeat']}，chunk={result['chunk_size']}，{result['flash_backend']}", ""]
         s = result["summary"]
         # The same renderer is used by the original attribution tool.
         table = align._markdown_report(
@@ -295,7 +341,7 @@ def write_report(config: dict[str, Any], results: list[dict[str, Any]]) -> None:
     ]
     folder = Path(config["report_dir"])
     (folder / "summary.md").write_text("\n".join(lines) + "\n")
-    save_json(folder / "summary.json", {"configuration": config, "results": results})
+    save_json(folder / "summary.json", {"configuration": config, "results": results, "backend_comparison": comparison})
 
 
 def run(config: dict[str, Any]) -> None:
@@ -305,14 +351,16 @@ def run(config: dict[str, Any]) -> None:
         if config["phase"] == "confirm" and repeat % 2 == 0:
             chunks.reverse()
         for chunk in chunks:
-            arms.append(
-                {
-                    "repeat": repeat,
-                    "chunk": chunk,
-                    "environment": arm_environment(config, repeat, chunk),
-                    "status": "pending",
-                }
-            )
+            for backend in config["backends"] if chunk else ["fa2"]:
+                arms.append(
+                    {
+                        "repeat": repeat,
+                        "chunk": chunk,
+                        "backend": backend,
+                        "environment": arm_environment(config, repeat, chunk, backend),
+                        "status": "pending",
+                    }
+                )
     print(
         json.dumps({"configuration": config, "run_order": [a["environment"]["RUN_NAME"] for a in arms]}, indent=2),
         flush=True,
@@ -395,17 +443,21 @@ def update_run(action: str, folder: Path, index: int | None) -> None:
             arm.update(status="running", started_utc=datetime.now(timezone.utc).isoformat())
         elif action == "_after":
             log = Path(arm["environment"]["LOG_FILE"])
-            validate_log(log, config["steps"], arm["chunk"], config["phase"] == "profile")
+            validate_log(log, config["steps"], arm["chunk"], config["phase"] == "profile", arm["backend"])
             summary_path = folder / "summary.json"
             results = json.loads(summary_path.read_text())["results"] if summary_path.exists() else []
             for candidate in config["chunks"]:
-                base, cf = log.parent / "baseline.log", log.parent / f"chunk{candidate}.log"
-                already = any(r["repeat"] == arm["repeat"] and r["chunk_size"] == candidate for r in results)
-                if base.is_file() and cf.is_file() and not already:
-                    validate_inputs(base, cf)
-                    if config["phase"] != "profile":
-                        results.append(analyze_pair(config, arm["repeat"], candidate))
-                        write_report(config, results)
+                for backend in config["backends"]:
+                    base, cf = log.parent / "baseline.log", log.parent / f"{arm_label(config, candidate, backend)}.log"
+                    already = any(
+                        r["repeat"] == arm["repeat"] and r["chunk_size"] == candidate and r["flash_backend"] == backend
+                        for r in results
+                    )
+                    if base.is_file() and cf.is_file() and not already:
+                        validate_inputs(base, cf)
+                        if config["phase"] != "profile":
+                            results.append(analyze_pair(config, arm["repeat"], candidate, backend))
+                            write_report(config, results)
             arm.update(
                 status="complete",
                 finished_utc=datetime.now(timezone.utc).isoformat(),
@@ -441,7 +493,9 @@ def update_run(action: str, folder: Path, index: int | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("phase", choices=["screen", "confirm", "profile", "_before", "_after", "_finish", "_fail"])
+    parser.add_argument(
+        "phase", choices=["screen", "confirm", "profile", "backend", "_before", "_after", "_finish", "_fail"]
+    )
     parser.add_argument("--report-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--arm", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()

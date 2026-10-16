@@ -42,10 +42,14 @@ class EightGpuTests(unittest.TestCase):
             "chunk = int(os.environ['CHUNK_SIZE'])\n"
             "profile = os.environ['CHUNKFLOW_PROFILE'] == '1'\n"
             "assert os.environ['RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS'] == ('0' if profile else '1')\n"
+            "backend = os.environ['RELAX_CHUNKFLOW_FLASH_BACKEND']\n"
             "lines = ['chunked attention installed'] if chunk else []\n"
+            "if chunk and not os.environ.get('DROP_BACKEND_MARKER'):\n"
+            "    lines.append('chunkflow: flash attention backend=' + backend)\n"
             "count = int(os.environ['NUM_ROLLOUT']) - (int(os.environ.get('MISS_LAST', '0')) if chunk else 0)\n"
             "for step in range(count):\n"
             "    seconds = {0: 5, 4096: 4, 8192: 6}[chunk]\n"
+            "    if chunk and backend == 'fa3': seconds = 3\n"
             "    tokens = 1000 + step + (1 if chunk and os.environ.get('WRONG_TOKENS') else 0)\n"
             "    lines.append(f\"perf {step}: {{'perf/actor_train_time': {seconds}, "
             "'perf/step_time': {seconds + 2}, 'perf/actor_train_tokens': {tokens}}}\")\n"
@@ -132,6 +136,23 @@ class EightGpuTests(unittest.TestCase):
         self.assertFalse((folder / "summary.json").exists())
         self.assertFalse(list(folder.glob("**/attribution.csv")))
 
+    def test_backend_phase_shares_baseline_and_reports_direct_fa3_gain(self):
+        folder = self.run_phase("backend", CHUNK_SIZE="4096")
+        manifest = json.loads((folder / "manifest.json").read_text())
+        arms = [a["environment"] for a in manifest["arms"]]
+        self.assertEqual([a["CHUNK_SIZE"] for a in arms], ["0", "4096", "4096"])
+        self.assertEqual([a["RELAX_CHUNKFLOW_FLASH_BACKEND"] for a in arms], ["fa2", "fa2", "fa3"])
+        self.assertEqual({a["TRAIN_SEED"] for a in arms}, {"1234"})
+        report = json.loads((folder / "summary.json").read_text())
+        self.assertEqual([r["flash_backend"] for r in report["results"]], ["fa2", "fa3"])
+        self.assertAlmostEqual(report["backend_comparison"]["fa3_vs_fa2_x"], 4 / 3)
+        for backend in ("fa2", "fa3"):
+            self.assertTrue((folder / f"repeat1/chunk4096-{backend}/attribution.csv").exists())
+        with self.assertRaisesRegex(RuntimeError, "not confirmed"):
+            self.run_phase(
+                "backend", CHUNK_SIZE="4096", REPORT_DIR=str(self.root / "missing-backend"), DROP_BACKEND_MARKER="1"
+            )
+
     def test_training_script_passes_seed_and_profiler_window_to_ray(self):
         binary = self.root / "bin"
         binary.mkdir()
@@ -154,6 +175,7 @@ class EightGpuTests(unittest.TestCase):
             "RUNTIME_ENV_JSON": "{}",
             "CAPTURE_ARGS": str(capture),
             "CHUNK_SIZE": "4096",
+            "RELAX_CHUNKFLOW_FLASH_BACKEND": "fa3",
             "CHUNKFLOW_PROFILE": "1",
             "PROFILE_START": "2",
             "PROFILE_END": "4",
@@ -166,6 +188,12 @@ class EightGpuTests(unittest.TestCase):
         result = subprocess.run(command, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         args = json.loads(capture.read_text())
+        runtime = (
+            json.loads(args[args.index("--runtime-env-json") + 1])
+            if "--runtime-env-json" in args
+            else json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("--runtime-env-json=")))
+        )
+        self.assertEqual(runtime["env_vars"]["RELAX_CHUNKFLOW_FLASH_BACKEND"], "fa3")
         self.assertIn("--use-pytorch-profiler", args)
         for flag, value in {
             "--profile-target": "train_overall",
@@ -206,6 +234,7 @@ class EightGpuTests(unittest.TestCase):
             {"CHUNKFLOW_PROFILE": "1"},
             {"CHUNK_SIZES": "4096 4096"},
             {"STEPS": "11"},
+            {"RELAX_CHUNKFLOW_FLASH_BACKEND": "auto"},
         ):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 self.tool.configuration("screen", {**self.env, **extra})
