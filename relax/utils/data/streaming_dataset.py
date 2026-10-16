@@ -391,8 +391,8 @@ class IndexManager:
             dataset_seed_offset: Number of dataset RNG seeds consumed before
                 the persistent dataset shuffle.
             shuffle_enabled: When ``False`` both shuffle stages are skipped and
-                samples are consumed in ``index_pool`` order (i.e. row order on
-                disk). Used by cross-framework alignment runs, where a matching
+                samples are consumed in physical row order within ``index_pool``.
+                Used by cross-framework alignment runs, where a matching
                 permutation cannot be reproduced on the other side.
         """
         self.total_size = total_size
@@ -417,7 +417,7 @@ class IndexManager:
 
         if not self.shuffle_enabled:
             # Sequential consumption: every epoch replays the pool in row order.
-            self.indices = list(self.index_pool)
+            self.indices = sorted(self.index_pool)
             self.current_epoch = epoch_id
             self.position = 0
             logger.info(f"Dataset shuffle disabled; using row order for epoch {epoch_id}")

@@ -231,6 +231,40 @@ def test_production_dpo_rejects_empty_completion_mask(monkeypatch):
         loss_module.dpo_loss_function(_args(), batch, torch.ones(1), lambda value: value)
 
 
+@pytest.mark.parametrize("reference_free", [False, True])
+def test_cp_dpo_empty_local_branches_keep_zero_logits_gradient(monkeypatch, reference_free):
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 16)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_rank", lambda: 15)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: None)
+    logits = torch.ones(1, 4, 8, requires_grad=True)
+    empty_log_probs = [logits.new_zeros((0,)) for _ in range(2)]
+    monkeypatch.setattr(
+        loss_module, "get_log_probs_and_entropy", lambda *args, **kwargs: (None, {"log_probs": empty_log_probs})
+    )
+
+    def all_reduce(tensor, **_kwargs):
+        torch.testing.assert_close(tensor, torch.zeros_like(tensor))
+        # Other ranks provide supervision and the global branch sums.
+        tensor.copy_(torch.ones_like(tensor) if tensor.dtype == torch.int32 else torch.tensor([-2.0, -3.0]))
+
+    monkeypatch.setattr(loss_module.dist, "all_reduce", all_reduce)
+    batch = {
+        "response_lengths": [8, 8],
+        "total_lengths": [8, 8],
+        "unconcat_tokens": [torch.zeros(8, dtype=torch.long)] * 2,
+        "loss_masks": [torch.ones(8)] * 2,
+        "preference_branch_pair_ids": [1, 1],
+        "preference_is_chosen": [True, False],
+        "ref_log_probs": empty_log_probs,
+    }
+    loss, _ = loss_module.dpo_loss_function(_args(reference_free=reference_free), batch, logits, lambda value: value)
+    expected_margin = torch.tensor(0.2 if reference_free else 0.0)
+    torch.testing.assert_close(loss, -F.logsigmoid(expected_margin))
+    assert loss.requires_grad
+    loss.backward()
+    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
+
+
 def test_cp_dpo_rejects_globally_empty_completion_mask(monkeypatch):
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 2)
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: object())

@@ -1393,9 +1393,10 @@ def dpo_loss_function(
     )
     chosen_rewards = dpo_rewards(policy_chosen, reference_chosen, beta=args.dpo_beta)
     rejected_rewards = dpo_rewards(policy_rejected, reference_rejected, beta=args.dpo_beta)
-    # pair_losses is never empty: build_preference_pair_indices raises on an
-    # empty micro-batch, so no gradient-safety fallback is needed here.
     loss = pair_losses.sum()
+    # A CP shard can have no local response logits even with global supervision.
+    if all(value.numel() == 0 for value in policy_token_log_probs):
+        loss = loss + 0 * logits.sum()
     reward_margin = chosen_rewards - rejected_rewards
     strict, tie, tie_aware = preference_accuracy(reward_margin)
     metrics = {
