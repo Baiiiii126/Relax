@@ -575,6 +575,45 @@ RELAX_CHUNKFLOW_FLASH_BACKEND=fa3 CHUNK_SIZE=4096 PROFILE_START=16 PROFILE_END=1
 变量会显式传给 Ray workers，并记录在 manifest、实验名及安装日志中。
 驱动检查 worker 的后端日志标记；实际 kernel 可进一步通过 profiler 中 `flash_attn_3` 算子确认。
 
+## 13. 每个 step 前置预测，再选择是否开启
+
+`gate` 阶段比较 baseline、始终开启 FA3、按预测阈值开启 FA3 三组。
+每步的流程是：读取当前 DataIterator 未消费的样本长度和实际分组 → CPU 构造候选计划 →
+模拟调度收益 → 所有 TP/PP rank 通过 CPU Gloo 确认输入及决策一致 → 执行所选前后向。
+预测不运行 GPU 模型、不读取当前 step 的实际耗时，也不会推进 iterator。
+
+`GATE_GAIN_PCT=140` 指 `100 * (predicted_speedup - 1) > 140`，即严格大于 **2.4 倍**；
+不是大于 1.4 倍。等于阈值时关闭。关闭时恢复原始 attention、原始 RoPE 设置和标准 Megatron 调度；
+当前 step 全部前后向完成后，才允许下一步选择。模型权重和 optimizer 状态在同一条训练轨迹上继续。
+
+仅支持本实验的 text SFT、materialized dynamic DataIterator、DP=CP=1、无 VPP、THD、staggered、K=0。
+流式 iterator 或不同 rank 的预测不一致时显式报错，避免各 stage 使用不同执行路径。
+
+在代码同步后的独占空闲 8 卡服务器运行：
+
+```bash
+export MODEL_DIR=/path/to/models
+export DATA_DIR=/path/to/data
+export PROMPT_DATA="${DATA_DIR}/chunkflow-mixed/train.parquet"
+unset CHUNK_SIZES CHUNKFLOW_PROFILE DRY_RUN REPEATS
+unset RAY_NO_WAIT RELAX_ENTRYPOINT_MODE WORKING_DIR
+export REPORT_DIR="analysis/chunkflow-gate-$(date +%Y%m%d-%H%M%S)"
+GBS=8 CHUNK_SIZE=4096 GATE_GAIN_PCT=140 STEPS=210 DROP_FIRST=10 TRAIN_SEED=1235 \
+  bash scripts/training/sft/tools/run_chunkflow_8gpu.sh gate
+cat "${REPORT_DIR}/summary.md"
+```
+
+默认新 seed=1235，每组210步、去掉前10步；阈值在运行前固定。
+报告包含策略相对 baseline 的总耗时比及 block 区间、开启/关闭次数、开启后实际提速次数、预测与一致性检查时间。
+`repeat1/chunk4096-fa3-gate140/attribution.csv` 每步记录预测值、实际选择及实际时间。
+关闭步骤的预测指标描述候选 ChunkFlow，并不表示执行了候选计划；对应实测指标描述最终选择的策略。
+驱动还核对前置预测与同输入 always-on arm 的候选 M/U/调度预测/填充指标是否一致。
+预测与一致性检查开销包含在计时内，不从策略总耗时中扣除。Profiler 不参与本实验。
+
+旧日志按阈值拼接耗时只用于离线估算，不能代替真实门控实验；同一数据选阈值后得到的结果不代表泛化。
+多组顺序执行仍受机器状态影响；若新 seed 上发现小幅提速，应另做反转顺序的重复对照。
+本阶段不提交任何 GPU 作业，除非用户显式运行上述命令。
+
 ## 附录：关键代码位置
 
 | 内容 | 位置 |

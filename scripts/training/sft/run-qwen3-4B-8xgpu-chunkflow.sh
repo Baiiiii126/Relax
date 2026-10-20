@@ -42,14 +42,20 @@ MODE="${1:-chunkflow}"
 case "${MODE}" in
    baseline)
       CHUNK_SIZE=0
+      export RELAX_CHUNKFLOW_GATE_GAIN_PCT=""
       ;;
    chunkflow)
       # Keep this below the benchmark dataset's 16K-32K sequences so this arm
       # exercises real multi-chunk execution.
       CHUNK_SIZE="${CHUNK_SIZE:-128}"
+      export RELAX_CHUNKFLOW_GATE_GAIN_PCT=""
+      ;;
+   adaptive)
+      CHUNK_SIZE="${CHUNK_SIZE:-4096}"
+      export RELAX_CHUNKFLOW_GATE_GAIN_PCT="${GATE_GAIN_PCT:-140}"
       ;;
    *)
-      echo "Usage: bash $0 {baseline|chunkflow}" >&2
+      echo "Usage: bash $0 {baseline|chunkflow|adaptive}" >&2
       exit 2
       ;;
 esac
@@ -63,6 +69,9 @@ if [ "${CHUNK_SIZE}" -gt 0 ]; then
    if [ "${KEEP_LAST_K}" -gt 0 ]; then
       CHUNKFLOW_ARGS+=(--chunkflow-keep-last-k ${KEEP_LAST_K})
       ARM="${ARM}-k${KEEP_LAST_K}"
+   fi
+   if [ "${MODE}" = adaptive ]; then
+      ARM="${ARM}-gate${RELAX_CHUNKFLOW_GATE_GAIN_PCT}"
    fi
 else
    CHUNKFLOW_ARGS=()
@@ -123,7 +132,9 @@ SFT_ARGS=(
 
 export RELAX_CHUNKFLOW_PIPELINE_UNTESTED="${RELAX_CHUNKFLOW_PIPELINE_UNTESTED:=1}"
 export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS="${RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS:-0}"
-export RELAX_CHUNKFLOW_FLASH_BACKEND="${RELAX_CHUNKFLOW_FLASH_BACKEND:-fa2}"
+DEFAULT_FLASH_BACKEND=fa2
+if [ "${MODE}" = adaptive ]; then DEFAULT_FLASH_BACKEND=fa3; fi
+export RELAX_CHUNKFLOW_FLASH_BACKEND="${RELAX_CHUNKFLOW_FLASH_BACKEND:-${DEFAULT_FLASH_BACKEND}}"
 case "${RELAX_CHUNKFLOW_FLASH_BACKEND}" in
    fa2|fa3) ;;
    *) echo "ERROR: RELAX_CHUNKFLOW_FLASH_BACKEND must be fa2 or fa3" >&2; exit 2 ;;
@@ -136,6 +147,7 @@ target = env.setdefault("env_vars", {})
 target["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"] = os.environ["RELAX_CHUNKFLOW_PIPELINE_UNTESTED"]
 target["RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS"] = os.environ["RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS"]
 target["RELAX_CHUNKFLOW_FLASH_BACKEND"] = os.environ["RELAX_CHUNKFLOW_FLASH_BACKEND"]
+target["RELAX_CHUNKFLOW_GATE_GAIN_PCT"] = os.environ["RELAX_CHUNKFLOW_GATE_GAIN_PCT"]
 print(json.dumps(env))
 ')
 

@@ -13,6 +13,7 @@ unit is executing travels on ``packed_seq_params``, not through a global.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from relax.backends.megatron.chunkflow.state_store import StateStore
 from relax.backends.megatron.chunkflow.telemetry import PlanTelemetry, StepPlanTelemetry
@@ -37,6 +38,8 @@ class ChunkflowRuntime:
         self._step_telemetry: StepPlanTelemetry | None = None
         self._max_live_stores = 0
         self._max_live_groups = 0
+        self.gate_metrics: dict[str, int | float] | None = None
+        self.baseline_rope_fusion: list[tuple[Any, bool]] = []
 
     def begin_step(self) -> None:
         """Start a fresh plan-telemetry window.
@@ -57,6 +60,13 @@ class ChunkflowRuntime:
         """Return and clear the latest step's CPU-only telemetry."""
         telemetry = self._step_telemetry
         self._step_telemetry = None
+        gate_metrics, self.gate_metrics = self.gate_metrics, None
+        if gate_metrics is not None:
+            # Candidate telemetry is counterfactual when the gate selects baseline.
+            metrics = dict(gate_metrics)
+            metrics["pp_last_max_live_stores"] = self._max_live_stores
+            metrics["pp_last_max_live_groups"] = self._max_live_groups
+            return metrics
         if telemetry is None:
             return {}
         metrics = telemetry.to_metrics(pp_size, simulate_schedule=self.schedule_analysis)

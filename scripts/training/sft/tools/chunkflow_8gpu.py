@@ -7,6 +7,7 @@ screen: baseline + 4K + 8K, 110 steps each, fixed GBS=8 by default.
 confirm: one explicitly selected chunk, three A/B repeats, 510 steps each.
 profile: one baseline/CF pair with a short profiler window, no speedup report.
 backend: shared baseline + CF-FA2 + CF-FA3 for one explicitly selected chunk.
+gate: shared baseline + always-on FA3 + pre-step gated FA3, new seed by default.
 DRY_RUN=1 prints the resolved plan without launching or creating files.
 """
 
@@ -44,9 +45,14 @@ def integer(env: Mapping[str, str], key: str, default: int, minimum: int = 0) ->
 
 
 def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
-    backend = env.get("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa2")
+    backend = env.get("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa3" if phase == "gate" else "fa2")
     if backend not in ("fa2", "fa3"):
         raise ValueError("RELAX_CHUNKFLOW_FLASH_BACKEND must be fa2 or fa3")
+    if phase == "gate" and backend != "fa3":
+        raise ValueError("gate phase requires RELAX_CHUNKFLOW_FLASH_BACKEND=fa3")
+    threshold = float(env.get("GATE_GAIN_PCT", "140"))
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("GATE_GAIN_PCT must be a finite nonnegative gain percentage")
     for key, expected in {
         "TP_SIZE": "2",
         "PP_SIZE": "4",
@@ -82,7 +88,7 @@ def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
         raise ValueError("chunk sizes must be distinct multiples of 256 in [256, 32768]")
     profile_start = integer(env, "PROFILE_START", 10)
     profile_end = integer(env, "PROFILE_END", 12)
-    default_steps = {"screen": 110, "confirm": 510, "profile": profile_end + 2, "backend": 110}[phase]
+    default_steps = {"screen": 110, "confirm": 510, "profile": profile_end + 2, "backend": 110, "gate": 210}[phase]
     steps = integer(env, "STEPS", default_steps, 1)
     drop = integer(env, "DROP_FIRST", 10)
     if phase == "profile":
@@ -115,10 +121,11 @@ def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
         "chunks": chunks,
         "flash_backend": backend,
         "backends": ["fa2", "fa3"] if phase == "backend" else [backend],
+        "gate_gain_pct": threshold if phase == "gate" else None,
         "steps": steps,
         "drop_first": drop,
         "repeats": repeats,
-        "seed": integer(env, "TRAIN_SEED", 1235 if phase == "confirm" else 1234),
+        "seed": integer(env, "TRAIN_SEED", 1235 if phase in ("confirm", "gate") else 1234),
         "tp": 2,
         "pp": 4,
         "dp": 1,
@@ -160,20 +167,26 @@ def code_hashes() -> dict[str, str]:
         TOOLS / "chunkflow_align.py",
         TOOLS / "chunkflow_diagnose.py",
     ]
+    model_file = ROOT / "relax/backends/megatron/model.py"
+    if model_file.is_file():
+        paths.append(model_file)
     paths.extend(sorted((ROOT / "relax/backends/megatron/chunkflow").glob("*.py")))
     return {str(path.relative_to(ROOT)): sha256(path) for path in paths}
 
 
-def arm_label(config: dict[str, Any], chunk: int, backend: str) -> str:
+def arm_label(config: dict[str, Any], chunk: int, backend: str, gated: bool = False) -> str:
     if not chunk:
         return "baseline"
     suffix = f"-{backend}" if config["phase"] == "backend" or backend != "fa2" else ""
-    return f"chunk{chunk}{suffix}"
+    gate = f"-gate{config['gate_gain_pct']:g}" if gated else ""
+    return f"chunk{chunk}{suffix}{gate}"
 
 
-def arm_environment(config: dict[str, Any], repeat: int, chunk: int, backend: str | None = None) -> dict[str, str]:
+def arm_environment(
+    config: dict[str, Any], repeat: int, chunk: int, backend: str | None = None, gated: bool = False
+) -> dict[str, str]:
     backend = backend or config["flash_backend"]
-    arm = arm_label(config, chunk, backend)
+    arm = arm_label(config, chunk, backend, gated)
     name = f"cf8-{config['phase']}-{config['run_id']}-r{repeat}-gbs{config['gbs']}-{arm}"
     return {
         "MODEL_DIR": str(Path(config["model"]).parent),
@@ -193,6 +206,7 @@ def arm_environment(config: dict[str, Any], repeat: int, chunk: int, backend: st
         "LOG_FILE": str(Path(config["report_dir"]) / f"repeat{repeat}" / f"{arm}.log"),
         "RELAX_CHUNKFLOW_PIPELINE_UNTESTED": "1",
         "RELAX_CHUNKFLOW_FLASH_BACKEND": backend,
+        "GATE_GAIN_PCT": str(config["gate_gain_pct"]) if gated else "",
         "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS": "0" if config["phase"] == "profile" else "1",
         "CHUNKFLOW_PROFILE": "1" if config["phase"] == "profile" else "0",
         "PROFILE_START": str(config["profile_start"] or 0),
@@ -232,16 +246,49 @@ def validate_inputs(base: Path, cf: Path) -> None:
             raise ValueError(f"step {step}: missing or different token counts ({a} != {b})")
 
 
-def analyze_pair(config: dict[str, Any], repeat: int, chunk: int, backend: str | None = None) -> dict[str, Any]:
+def gate_rows(path: Path, threshold: float, steps: int) -> dict[int, dict[str, float]]:
+    fields = ("gate_selected", "gate_threshold_gain_pct", "gate_prediction_time_s", "gate_consensus_time_s")
+    result = {}
+    theory = align._theory(path)
+    for step, metrics in align._iter_dicts(path.read_text(errors="replace"), "step"):
+        values = {key: align._pick(metrics, f"chunkflow/{key}") for key in fields}
+        if values["gate_selected"] is None:
+            continue
+        if any(v is None or not math.isfinite(v) for v in values.values()):
+            raise ValueError(f"step {step}: invalid gate telemetry")
+        expected = int(theory[step]["schedule_x"] > 1 + threshold / 100)
+        if values["gate_threshold_gain_pct"] != threshold or values["gate_selected"] != expected:
+            raise ValueError(f"step {step}: gate decision does not match pre-step threshold")
+        if min(values["gate_prediction_time_s"], values["gate_consensus_time_s"]) < 0:
+            raise ValueError(f"step {step}: negative gate overhead")
+        result[step] = values
+    if set(result) != set(range(steps)):
+        raise ValueError("missing pre-step gate decisions")
+    return result
+
+
+def analyze_pair(
+    config: dict[str, Any], repeat: int, chunk: int, backend: str | None = None, gated: bool = False
+) -> dict[str, Any]:
     backend = backend or config["flash_backend"]
     folder = Path(config["report_dir"]) / f"repeat{repeat}"
-    label = arm_label(config, chunk, backend)
+    label = arm_label(config, chunk, backend, gated)
     base, cf = folder / "baseline.log", folder / f"{label}.log"
     rows = align._pair(base, cf, "actor_train_time", "schedule")
     wall_rows = align._pair(base, cf, "step_time", "schedule")
     if len(rows) != config["steps"] or len(wall_rows) != config["steps"]:
         raise ValueError("paired steps incomplete; inspect the current run's logs")
     rows, wall_rows = rows[config["drop_first"] :], wall_rows[config["drop_first"] :]
+    decisions = gate_rows(cf, config["gate_gain_pct"], config["steps"]) if gated else {}
+    if gated:
+        reference = align._theory(folder / f"{arm_label(config, chunk, backend)}.log")
+        candidate = align._theory(cf)
+        for step in range(config["steps"]):
+            if any(candidate[step].get(k) != reference[step].get(k) for k in ("M", "U", "schedule_x", "frag")):
+                raise ValueError(f"step {step}: pre-step prediction differs from always-on executed plan")
+    for row in rows:
+        if gated:
+            row.update(decisions[row["step"]])
     output = folder / label
     output.mkdir()
     with (output / "attribution.csv").open("w", newline="") as handle:
@@ -258,6 +305,7 @@ def analyze_pair(config: dict[str, Any], repeat: int, chunk: int, backend: str |
         "repeat": repeat,
         "chunk_size": chunk,
         "flash_backend": backend,
+        "gated": gated,
         "seed": config["seed"] + repeat - 1,
         "summary": summary,
         "block_ci95": report["cases"]["0"]["block_ci95"],
@@ -265,6 +313,16 @@ def analyze_pair(config: dict[str, Any], repeat: int, chunk: int, backend: str |
         "baseline_log": str(base),
         "chunkflow_log": str(cf),
     }
+    if gated:
+        selected = [r for r in rows if r["gate_selected"]]
+        result["gate"] = {
+            "threshold_gain_pct": config["gate_gain_pct"],
+            "selected_steps": len(selected),
+            "fallback_steps": len(rows) - len(selected),
+            "selected_actual_wins": sum(r["actual_x"] > 1 for r in selected),
+            "prediction_time_s": sum(r["gate_prediction_time_s"] for r in rows),
+            "consensus_time_s": sum(r["gate_consensus_time_s"] for r in rows),
+        }
     save_json(output / "attribution.json", result)
     return result
 
@@ -280,14 +338,15 @@ def write_report(config: dict[str, Any], results: list[dict[str, Any]]) -> None:
         "预测使用声明成本假设的调度模型，尚未按 GPU 算子成本校准。",
         "本表可在实验过程中增量生成；完整性以 manifest.json 的 status=complete 为准。",
         "",
-        "| 轮次 | chunk | CF 后端 | 配对数 | 预测加速比 | 训练加速比 | 训练比 95% block 区间 | step_time 加速比 | 实际正收益率 |",
-        "| --- | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: |",
+        "| 轮次 | chunk | CF 后端 | 策略 | 配对数 | 预测加速比 | 训练加速比 | 训练比 95% block 区间 | step_time 加速比 | 实际正收益率 |",
+        "| --- | ---: | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |",
     ]
     for result in results:
         s, ci = result["summary"], result["block_ci95"].get("actual_x")
         interval = "未定义" if ci is None else f"[{ci[0]:.4f}, {ci[1]:.4f}]"
+        policy = f"预测收益 > {config['gate_gain_pct']:g}% 才开启" if result.get("gated") else "始终开启"
         lines.append(
-            f"| {result['repeat']} | {result['chunk_size']} | {result['flash_backend']} | {s['paired_steps']} | "
+            f"| {result['repeat']} | {result['chunk_size']} | {result['flash_backend']} | {policy} | {s['paired_steps']} | "
             f"{s['aggregate_theory_x']:.4f} | {s['aggregate_actual_x']:.4f} | {interval} | "
             f"{result['step_time_speedup']:.4f} | {100 * s['actual_positive_fraction']:.1f}% |"
         )
@@ -318,7 +377,22 @@ def write_report(config: dict[str, Any], results: list[dict[str, Any]]) -> None:
             f"95% block 区间：{ci}。大于 1 表示 FA3 更快；是否胜过 baseline 仍看上表。",
         ]
     for result in results:
-        lines += ["", f"## 轮次 {result['repeat']}，chunk={result['chunk_size']}，{result['flash_backend']}", ""]
+        suffix = "，逐步预测门控" if result.get("gated") else ""
+        lines += [
+            "",
+            f"## 轮次 {result['repeat']}，chunk={result['chunk_size']}，{result['flash_backend']}{suffix}",
+            "",
+        ]
+        if result.get("gated"):
+            g = result["gate"]
+            lines += [
+                f"前置预测后开启 {g['selected_steps']} 步，回退 baseline {g['fallback_steps']} 步；"
+                f"开启步骤中实际胜过独立 baseline 的有 {g['selected_actual_wins']} 步。",
+                f"记录的预测 CPU 时间 {g['prediction_time_s']:.4f}s，一致性检查 {g['consensus_time_s']:.4f}s；"
+                "这些开销已包含在训练计时中，不从总耗时扣除。",
+                "该组预测值描述候选 ChunkFlow；实际值描述最终门控策略。关闭步骤不代表测到了 ChunkFlow 的实际性能。",
+                "",
+            ]
         s = result["summary"]
         # The same renderer is used by the original attribution tool.
         table = align._markdown_report(
@@ -357,10 +431,22 @@ def run(config: dict[str, Any]) -> None:
                         "repeat": repeat,
                         "chunk": chunk,
                         "backend": backend,
+                        "gated": False,
                         "environment": arm_environment(config, repeat, chunk, backend),
                         "status": "pending",
                     }
                 )
+                if config["phase"] == "gate" and chunk:
+                    arms.append(
+                        {
+                            "repeat": repeat,
+                            "chunk": chunk,
+                            "backend": backend,
+                            "gated": True,
+                            "environment": arm_environment(config, repeat, chunk, backend, True),
+                            "status": "pending",
+                        }
+                    )
     print(
         json.dumps({"configuration": config, "run_order": [a["environment"]["RUN_NAME"] for a in arms]}, indent=2),
         flush=True,
@@ -401,7 +487,7 @@ def run(config: dict[str, Any]) -> None:
                     "bash",
                     str(ENTRYPOINT),
                     str(RUN_SCRIPT),
-                    "chunkflow" if arm["chunk"] else "baseline",
+                    "adaptive" if arm["gated"] else "chunkflow" if arm["chunk"] else "baseline",
                 ]
             )
         )
@@ -446,17 +532,22 @@ def update_run(action: str, folder: Path, index: int | None) -> None:
             validate_log(log, config["steps"], arm["chunk"], config["phase"] == "profile", arm["backend"])
             summary_path = folder / "summary.json"
             results = json.loads(summary_path.read_text())["results"] if summary_path.exists() else []
-            for candidate in config["chunks"]:
-                for backend in config["backends"]:
-                    base, cf = log.parent / "baseline.log", log.parent / f"{arm_label(config, candidate, backend)}.log"
+            for candidate_arm in manifest["arms"]:
+                if candidate_arm["repeat"] == arm["repeat"] and candidate_arm["chunk"]:
+                    candidate, backend, gated = (candidate_arm[k] for k in ("chunk", "backend", "gated"))
+                    base = log.parent / "baseline.log"
+                    cf = log.parent / f"{arm_label(config, candidate, backend, gated)}.log"
                     already = any(
-                        r["repeat"] == arm["repeat"] and r["chunk_size"] == candidate and r["flash_backend"] == backend
+                        r["repeat"] == arm["repeat"]
+                        and r["chunk_size"] == candidate
+                        and r["flash_backend"] == backend
+                        and r.get("gated", False) == gated
                         for r in results
                     )
                     if base.is_file() and cf.is_file() and not already:
                         validate_inputs(base, cf)
                         if config["phase"] != "profile":
-                            results.append(analyze_pair(config, arm["repeat"], candidate, backend))
+                            results.append(analyze_pair(config, arm["repeat"], candidate, backend, gated))
                             write_report(config, results)
             arm.update(
                 status="complete",
@@ -494,7 +585,7 @@ def update_run(action: str, folder: Path, index: int | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "phase", choices=["screen", "confirm", "profile", "backend", "_before", "_after", "_finish", "_fail"]
+        "phase", choices=["screen", "confirm", "profile", "backend", "gate", "_before", "_after", "_finish", "_fail"]
     )
     parser.add_argument("--report-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--arm", type=int, help=argparse.SUPPRESS)

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from relax.backends.megatron.chunkflow.integration import (
     ChunkedCoreAttention,
+    baseline_attention,
     install,
     split_sizes,
     uninstall,
@@ -203,6 +204,37 @@ def test_chunkflow_install_enables_rope_offset_patch(monkeypatch):
 
     assert install(torch.nn.Sequential(FakeAttn()), chunk_size=128) == 1
     assert calls == [True]
+
+
+def test_gate_fallback_restores_original_attention_rope_and_gradients():
+    class FakeAttn(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.layer_number = 1
+            self.config = config
+            self.core_attention = torch.nn.Linear(3, 3, bias=False, dtype=torch.float64)
+
+    config = SimpleNamespace(context_parallel_size=1, apply_rope_fusion=True)
+    model = torch.nn.Sequential(FakeAttn(config))
+    original = model[0].core_attention
+    install(model, 4096)
+    chunked = model[0].core_attention
+    assert not config.apply_rope_fusion
+    for fail in (False, True, False):
+        x = torch.ones(2, 3, dtype=torch.float64, requires_grad=True)
+        try:
+            with baseline_attention(model):
+                assert model[0].core_attention is original
+                assert config.apply_rope_fusion
+                model[0].core_attention(x).sum().backward()
+                torch.testing.assert_close(x.grad, original.weight.sum(dim=0).expand_as(x))
+                if fail:
+                    raise RuntimeError("test exception")
+        except RuntimeError as exc:
+            assert str(exc) == "test exception"
+        assert model[0].core_attention is chunked
+        assert not config.apply_rope_fusion
+        assert model.chunkflow_runtime.num_stores() == 0
 
 
 # ---------------------------------------------------------------------------

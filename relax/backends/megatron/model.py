@@ -8,7 +8,7 @@ import string
 import uuid
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -1173,7 +1173,16 @@ def train_one_step(
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
-    if getattr(args, "use_chunkflow", False):
+    use_chunkflow_this_step = getattr(args, "use_chunkflow", False)
+    gated_fallback = False
+    if use_chunkflow_this_step and os.environ.get("RELAX_CHUNKFLOW_GATE_GAIN_PCT"):
+        from relax.backends.megatron.chunkflow.gating import prepare_step_gate
+
+        if len(model) != 1 or len(data_iterator) != 1:
+            raise ValueError("adaptive ChunkFlow requires one model chunk and one materialized iterator")
+        use_chunkflow_this_step = prepare_step_gate(args, model[0], data_iterator[0], num_microbatches)
+        gated_fallback = not use_chunkflow_this_step
+    if use_chunkflow_this_step:
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size > 1:
             if getattr(args, "chunkflow_pipeline", 0) != pp_size:
@@ -1183,8 +1192,6 @@ def train_one_step(
             # UNVERIFIED: this executor has not run end to end. Enable with
             # RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1 once it has been validated at
             # PP=2; it is not wired into any default path.
-            import os
-
             from relax.backends.megatron.chunkflow.pipeline_schedules import (
                 chunkflow_forward_backward_pipelining_without_interleaving,
             )
@@ -1216,16 +1223,22 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-    )
+    attention_context = nullcontext()
+    if gated_fallback:
+        from relax.backends.megatron.chunkflow.integration import baseline_attention
+
+        attention_context = baseline_attention(model[0])
+    with attention_context:
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+        )
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group

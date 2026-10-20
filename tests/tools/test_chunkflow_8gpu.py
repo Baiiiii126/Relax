@@ -43,6 +43,8 @@ class EightGpuTests(unittest.TestCase):
             "profile = os.environ['CHUNKFLOW_PROFILE'] == '1'\n"
             "assert os.environ['RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS'] == ('0' if profile else '1')\n"
             "backend = os.environ['RELAX_CHUNKFLOW_FLASH_BACKEND']\n"
+            "gated = bool(os.environ['GATE_GAIN_PCT'])\n"
+            "gate_phase = 'cf8-gate-' in os.environ['RUN_NAME']\n"
             "lines = ['chunked attention installed'] if chunk else []\n"
             "if chunk and not os.environ.get('DROP_BACKEND_MARKER'):\n"
             "    lines.append('chunkflow: flash attention backend=' + backend)\n"
@@ -50,13 +52,23 @@ class EightGpuTests(unittest.TestCase):
             "for step in range(count):\n"
             "    seconds = {0: 5, 4096: 4, 8192: 6}[chunk]\n"
             "    if chunk and backend == 'fa3': seconds = 3\n"
+            "    prediction = (2.5 if step % 2 == 0 else 2.4) if gate_phase else 1.2\n"
+            "    selected = int(prediction > 1 + float(os.environ.get('GATE_GAIN_PCT') or 140) / 100)\n"
+            "    if gated and not selected: seconds = 5\n"
             "    tokens = 1000 + step + (1 if chunk and os.environ.get('WRONG_TOKENS') else 0)\n"
             "    lines.append(f\"perf {step}: {{'perf/actor_train_time': {seconds}, "
             "'perf/step_time': {seconds + 2}, 'perf/actor_train_tokens': {tokens}}}\")\n"
             "    if chunk and not profile:\n"
-            "        lines.append(f\"step {step}: {{'train/chunkflow/schedule_model_speedup': 1.2, "
+            "        gate = {}\n"
+            "        if gated and not os.environ.get('DROP_GATE_MARKER'):\n"
+            "            gate = {'train/chunkflow/gate_selected': selected, "
+            "'train/chunkflow/gate_threshold_gain_pct': float(os.environ['GATE_GAIN_PCT']), "
+            "'train/chunkflow/gate_prediction_time_s': .001, 'train/chunkflow/gate_consensus_time_s': .002}\n"
+            "        metrics = {'train/chunkflow/schedule_model_speedup': prediction, "
             "'train/chunkflow/equal_unit_fill_drain_baseline_proxy': 2, "
-            "'train/chunkflow/equal_unit_fill_drain_chunkflow_proxy': 1}}\")\n"
+            "'train/chunkflow/equal_unit_fill_drain_chunkflow_proxy': 1}\n"
+            "        metrics.update(gate)\n"
+            "        lines.append(f'step {step}: {metrics!r}')\n"
             "Path(os.environ['LOG_FILE']).write_text('\\n'.join(lines))\n"
             "if os.environ.get('MUTATE_DATA'):\n"
             "    Path(os.environ['PROMPT_DATA']).write_text('changed')\n"
@@ -208,6 +220,36 @@ class EightGpuTests(unittest.TestCase):
         plain = subprocess.run(command, env={**env, "CHUNKFLOW_PROFILE": "0"}, capture_output=True, text=True)
         self.assertEqual(plain.returncode, 0, plain.stderr)
         self.assertNotIn("--use-pytorch-profiler", json.loads(capture.read_text()))
+        adaptive = subprocess.run(
+            [*command[:-1], "adaptive"],
+            env={**env, "CHUNKFLOW_PROFILE": "0", "GATE_GAIN_PCT": "140"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(adaptive.returncode, 0, adaptive.stderr)
+        args = json.loads(capture.read_text())
+        runtime = (
+            json.loads(args[args.index("--runtime-env-json") + 1])
+            if "--runtime-env-json" in args
+            else json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("--runtime-env-json=")))
+        )
+        self.assertEqual(runtime["env_vars"]["RELAX_CHUNKFLOW_GATE_GAIN_PCT"], "140")
+
+    def test_gate_phase_runs_baseline_always_and_online_selected_with_new_seed(self):
+        folder = self.run_phase("gate", CHUNK_SIZE="4096")
+        manifest = json.loads((folder / "manifest.json").read_text())
+        arms = manifest["arms"]
+        self.assertEqual([a["gated"] for a in arms], [False, False, True])
+        self.assertEqual({a["environment"]["TRAIN_SEED"] for a in arms}, {"1235"})
+        report = json.loads((folder / "summary.json").read_text())
+        self.assertEqual(len(report["results"]), 2)
+        gated = report["results"][1]
+        self.assertEqual(gated["gate"]["selected_steps"], 10)
+        self.assertEqual(gated["gate"]["fallback_steps"], 10)
+        self.assertAlmostEqual(gated["summary"]["aggregate_actual_x"], 1.25)
+        self.assertTrue((folder / "repeat1/chunk4096-fa3-gate140/attribution.csv").exists())
+        with self.assertRaisesRegex(RuntimeError, "missing pre-step"):
+            self.run_phase("gate", CHUNK_SIZE="4096", REPORT_DIR=str(self.root / "missing-gate"), DROP_GATE_MARKER="1")
 
     def test_rejects_partial_runs_and_token_mismatch_before_next_arm(self):
         for key, error in (

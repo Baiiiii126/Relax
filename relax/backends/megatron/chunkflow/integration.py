@@ -12,6 +12,8 @@ attention. ``install(model, chunk_size)`` swaps every ``core_attention``;
 from __future__ import annotations
 
 import itertools
+from contextlib import contextmanager
+from typing import Iterator
 
 import torch
 from torch import nn
@@ -245,13 +247,43 @@ def install(model, chunk_size: int) -> int:
         )
         n += 1
     if n:
+        seen_configs: set[int] = set()
         for module in model.modules():
             cfg = getattr(module, "config", None)
-            if cfg is not None and getattr(cfg, "apply_rope_fusion", False):
+            if cfg is not None and hasattr(cfg, "apply_rope_fusion") and id(cfg) not in seen_configs:
+                seen_configs.add(id(cfg))
+                runtime.baseline_rope_fusion.append((cfg, cfg.apply_rope_fusion))
                 cfg.apply_rope_fusion = False
         logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
     logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
     return n
+
+
+@contextmanager
+def baseline_attention(model) -> Iterator[None]:
+    """Restore original attention and RoPE for a complete fallback F/B pass."""
+    from relax.backends.megatron.chunkflow.runtime import require_runtime
+
+    runtime = require_runtime(model)
+    runtime.assert_empty("before baseline fallback")
+    layers = [
+        (a, a.core_attention, getattr(a, _ORIG_ATTR)) for a in _attention_modules(model) if hasattr(a, _ORIG_ATTR)
+    ]
+    if not layers:
+        raise RuntimeError("baseline fallback could not find the original attention modules")
+    rope = [(cfg, cfg.apply_rope_fusion, original) for cfg, original in runtime.baseline_rope_fusion]
+    try:
+        for layer, _, original in layers:
+            layer.core_attention = original
+        for cfg, _, original in rope:
+            cfg.apply_rope_fusion = original
+        yield
+    finally:
+        for layer, chunked, _ in layers:
+            layer.core_attention = chunked
+        for cfg, chunked, _ in rope:
+            cfg.apply_rope_fusion = chunked
+        runtime.assert_empty("after baseline fallback")
 
 
 def uninstall(model) -> int:
