@@ -614,6 +614,21 @@ cat "${REPORT_DIR}/summary.md"
 多组顺序执行仍受机器状态影响；若新 seed 上发现小幅提速，应另做反转顺序的重复对照。
 本阶段不提交任何 GPU 作业，除非用户显式运行上述命令。
 
+若关闭步骤仍明显慢于独立 baseline，先诊断回退路径，不继续扫描阈值：
+
+```bash
+export REPORT_DIR="analysis/chunkflow-gate-profile-$(date +%Y%m%d-%H%M%S)"
+PROFILE_GATE=1 GBS=8 CHUNK_SIZE=4096 GATE_GAIN_PCT=140 TRAIN_SEED=1235 \
+  PROFILE_START=12 PROFILE_END=14 STEPS=16 \
+  bash scripts/training/sft/tools/run_chunkflow_8gpu.sh profile
+cat "${REPORT_DIR}/profile.md"
+```
+
+该模式采样 baseline 与真正的门控路径，不会再次采样始终开启路径。
+trace 包含预测/一致性检查、回退准备、替换原 attention、前后向以及恢复 ChunkFlow 的分段标记。
+seed1235 的既有非 profiler 结果中 step12/14 为回退、step13 为开启，可对比两种分支。
+采样带来的额外开销不能用来判断策略是否提速。退出此诊断后应 `unset PROFILE_GATE`。
+
 ## 附录：关键代码位置
 
 | 内容 | 位置 |

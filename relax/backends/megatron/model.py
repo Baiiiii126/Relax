@@ -1180,7 +1180,13 @@ def train_one_step(
 
         if len(model) != 1 or len(data_iterator) != 1:
             raise ValueError("adaptive ChunkFlow requires one model chunk and one materialized iterator")
-        use_chunkflow_this_step = prepare_step_gate(args, model[0], data_iterator[0], num_microbatches)
+        prediction_context = (
+            torch.profiler.record_function("chunkflow.gate.predict_and_agree")
+            if getattr(args, "use_pytorch_profiler", False)
+            else nullcontext()
+        )
+        with prediction_context:
+            use_chunkflow_this_step = prepare_step_gate(args, model[0], data_iterator[0], num_microbatches)
         gated_fallback = not use_chunkflow_this_step
     if use_chunkflow_this_step:
         pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -1227,18 +1233,25 @@ def train_one_step(
     if gated_fallback:
         from relax.backends.megatron.chunkflow.integration import baseline_attention
 
-        attention_context = baseline_attention(model[0])
+        attention_context = baseline_attention(model[0], profile=getattr(args, "use_pytorch_profiler", False))
     with attention_context:
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
+        path = "chunkflow" if use_chunkflow_this_step else "baseline"
+        compute_context = (
+            torch.profiler.record_function(f"chunkflow.path.{path}.forward_backward")
+            if getattr(args, "use_pytorch_profiler", False)
+            else nullcontext()
         )
+        with compute_context:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+            )
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group

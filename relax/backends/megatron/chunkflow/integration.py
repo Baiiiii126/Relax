@@ -12,7 +12,7 @@ attention. ``install(model, chunk_size)`` swaps every ``core_attention``;
 from __future__ import annotations
 
 import itertools
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Iterator
 
 import torch
@@ -260,30 +260,33 @@ def install(model, chunk_size: int) -> int:
 
 
 @contextmanager
-def baseline_attention(model) -> Iterator[None]:
+def baseline_attention(model, *, profile: bool = False) -> Iterator[None]:
     """Restore original attention and RoPE for a complete fallback F/B pass."""
     from relax.backends.megatron.chunkflow.runtime import require_runtime
 
     runtime = require_runtime(model)
-    runtime.assert_empty("before baseline fallback")
-    layers = [
-        (a, a.core_attention, getattr(a, _ORIG_ATTR)) for a in _attention_modules(model) if hasattr(a, _ORIG_ATTR)
-    ]
-    if not layers:
-        raise RuntimeError("baseline fallback could not find the original attention modules")
-    rope = [(cfg, cfg.apply_rope_fusion, original) for cfg, original in runtime.baseline_rope_fusion]
+    with torch.profiler.record_function("chunkflow.gate.prepare_fallback") if profile else nullcontext():
+        runtime.assert_empty("before baseline fallback")
+        layers = [
+            (a, a.core_attention, getattr(a, _ORIG_ATTR)) for a in _attention_modules(model) if hasattr(a, _ORIG_ATTR)
+        ]
+        if not layers:
+            raise RuntimeError("baseline fallback could not find the original attention modules")
+        rope = [(cfg, cfg.apply_rope_fusion, original) for cfg, original in runtime.baseline_rope_fusion]
     try:
-        for layer, _, original in layers:
-            layer.core_attention = original
-        for cfg, _, original in rope:
-            cfg.apply_rope_fusion = original
+        with torch.profiler.record_function("chunkflow.gate.swap_to_baseline") if profile else nullcontext():
+            for layer, _, original in layers:
+                layer.core_attention = original
+            for cfg, _, original in rope:
+                cfg.apply_rope_fusion = original
         yield
     finally:
-        for layer, chunked, _ in layers:
-            layer.core_attention = chunked
-        for cfg, chunked, _ in rope:
-            cfg.apply_rope_fusion = chunked
-        runtime.assert_empty("after baseline fallback")
+        with torch.profiler.record_function("chunkflow.gate.restore_chunkflow") if profile else nullcontext():
+            for layer, chunked, _ in layers:
+                layer.core_attention = chunked
+            for cfg, chunked, _ in rope:
+                cfg.apply_rope_fusion = chunked
+            runtime.assert_empty("after baseline fallback")
 
 
 def uninstall(model) -> int:

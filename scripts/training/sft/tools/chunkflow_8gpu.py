@@ -45,10 +45,15 @@ def integer(env: Mapping[str, str], key: str, default: int, minimum: int = 0) ->
 
 
 def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
-    backend = env.get("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa3" if phase == "gate" else "fa2")
+    if env.get("PROFILE_GATE", "0") not in ("0", "1"):
+        raise ValueError("PROFILE_GATE must be 0 or 1")
+    profile_gate = env.get("PROFILE_GATE", "0") == "1"
+    if profile_gate and phase != "profile":
+        raise ValueError("PROFILE_GATE=1 is only supported in the profile phase")
+    backend = env.get("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa3" if phase == "gate" or profile_gate else "fa2")
     if backend not in ("fa2", "fa3"):
         raise ValueError("RELAX_CHUNKFLOW_FLASH_BACKEND must be fa2 or fa3")
-    if phase == "gate" and backend != "fa3":
+    if (phase == "gate" or profile_gate) and backend != "fa3":
         raise ValueError("gate phase requires RELAX_CHUNKFLOW_FLASH_BACKEND=fa3")
     threshold = float(env.get("GATE_GAIN_PCT", "140"))
     if not math.isfinite(threshold) or threshold < 0:
@@ -121,7 +126,8 @@ def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
         "chunks": chunks,
         "flash_backend": backend,
         "backends": ["fa2", "fa3"] if phase == "backend" else [backend],
-        "gate_gain_pct": threshold if phase == "gate" else None,
+        "gate_gain_pct": threshold if phase == "gate" or profile_gate else None,
+        "profile_gate": profile_gate,
         "steps": steps,
         "drop_first": drop,
         "repeats": repeats,
@@ -426,13 +432,14 @@ def run(config: dict[str, Any]) -> None:
             chunks.reverse()
         for chunk in chunks:
             for backend in config["backends"] if chunk else ["fa2"]:
+                gated = bool(chunk and config["profile_gate"])
                 arms.append(
                     {
                         "repeat": repeat,
                         "chunk": chunk,
                         "backend": backend,
-                        "gated": False,
-                        "environment": arm_environment(config, repeat, chunk, backend),
+                        "gated": gated,
+                        "environment": arm_environment(config, repeat, chunk, backend, gated),
                         "status": "pending",
                     }
                 )

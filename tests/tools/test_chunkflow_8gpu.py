@@ -148,6 +148,26 @@ class EightGpuTests(unittest.TestCase):
         self.assertFalse((folder / "summary.json").exists())
         self.assertFalse(list(folder.glob("**/attribution.csv")))
 
+    def test_profile_gate_collects_baseline_and_real_adaptive_path(self):
+        folder = self.run_phase(
+            "profile",
+            CHUNK_SIZE="4096",
+            STEPS="16",
+            PROFILE_START="12",
+            PROFILE_END="14",
+            PROFILE_GATE="1",
+            TRAIN_SEED="1235",
+        )
+        manifest = json.loads((folder / "manifest.json").read_text())
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual([a["gated"] for a in manifest["arms"]], [False, True])
+        self.assertEqual(manifest["arms"][1]["environment"]["GATE_GAIN_PCT"], "140.0")
+        self.assertEqual(manifest["arms"][1]["backend"], "fa3")
+        self.assertIn("chunk4096-fa3-gate140", (folder / "profile.md").read_text())
+        self.assertFalse((folder / "summary.json").exists())
+        with self.assertRaisesRegex(ValueError, "only supported"):
+            self.tool.configuration("gate", {**self.env, "CHUNK_SIZE": "4096", "PROFILE_GATE": "1"})
+
     def test_backend_phase_shares_baseline_and_reports_direct_fa3_gain(self):
         folder = self.run_phase("backend", CHUNK_SIZE="4096")
         manifest = json.loads((folder / "manifest.json").read_text())

@@ -237,6 +237,29 @@ def test_gate_fallback_restores_original_attention_rope_and_gradients():
         assert model.chunkflow_runtime.num_stores() == 0
 
 
+def test_gate_profiler_marks_fallback_setup_compute_and_restore():
+    class FakeAttn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_number = 1
+            self.config = SimpleNamespace(context_parallel_size=1, apply_rope_fusion=False)
+            self.core_attention = torch.nn.Linear(3, 3, bias=False)
+
+    model = torch.nn.Sequential(FakeAttn())
+    original = model[0].core_attention
+    install(model, 4096)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        with baseline_attention(model, profile=True):
+            model[0].core_attention(torch.ones(2, 3)).sum().backward()
+    names = {event.key for event in prof.key_averages()}
+    assert {
+        "chunkflow.gate.prepare_fallback",
+        "chunkflow.gate.swap_to_baseline",
+        "chunkflow.gate.restore_chunkflow",
+    } <= names
+    assert model[0].core_attention is not original
+
+
 # ---------------------------------------------------------------------------
 # Unit mode: chunks driven one at a time, backward descending
 # ---------------------------------------------------------------------------
