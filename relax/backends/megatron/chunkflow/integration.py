@@ -79,7 +79,6 @@ class ChunkedCoreAttention(nn.Module):
         folds it into the gradient flowing to the live tensor.
         """
         from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
-        from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
 
         unit = getattr(packed_seq_params, UNIT_ATTR, None)
         recompute = getattr(packed_seq_params, RECOMPUTE_ATTR, False)

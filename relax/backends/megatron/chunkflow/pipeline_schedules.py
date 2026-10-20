@@ -1,23 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""PP>1 chunkflow schedule: chunks are the units that flow through the
-pipeline.
+"""Non-interleaved 1F1B over ChunkFlow execution units for PP>1.
 
-The p2p pattern is Megatron's standard non-interleaved 1F1B (bare warmup
-forwards, fused steady ``send_forward_recv_backward`` /
-``send_backward_recv_forward``, bare cooldown backwards). That pattern is
-deadlock-free because the backward a steady step receives lags the forward it
-sends by the warmup depth, so the peer has always produced it already.
-
-The op order is what makes it chunkflow. A dependency group's chunk ``m`` can
-only backward once every chunk ``j >= m`` has (the dK/dV fold-back must be
-complete), and a group's backward can only run once the whole group has
-forwarded (the store is only full then). ``_pipeline_schedule`` lays that out
-as a forward order and a backward order, and adds ``C`` -- a constant of extra
-warmup that covers the first group's completion -- to the standard
-``pp - stage - 1`` depth so the steady phase always has a backward ready. Every
-stage derives the identical orders from the batch's sequence lengths, so the
-p2p send/recv pairs stay aligned without broadcasting the plan.
+Each dependency group must finish forwarding before descending backward folds
+all later dK/dV contributions into its earlier chunks. Shared CPU plans add the
+dependency delay to pipeline warmup and align all stages' P2P calls.
 """
 
 from __future__ import annotations
@@ -64,21 +51,9 @@ def _no_loss_step_func(forward_step_func):
     return step
 
 
-def _pipeline_plan(units, chunks, keep_last_k):
-    """The stage-independent forward/backward plan and dependency delay.
-
-    ``fwd_seq`` runs standalones first -- they backward immediately -- then the
-    dependent units by depth, so a group always forwards its earlier chunks
-    first. ``bwd_seq`` is ``make_unit_bwd_order``'s dependency-valid order. The
-    ``C`` covers the first group's completion. It is stage-independent; the
-    caller adds the standard pipeline depth for its stage.
-    """
-    return pipeline_plan(units, chunks, keep_last_k)
-
-
 def _pipeline_schedule(units, chunks, keep_last_k, pp, stage):
     """The per-stage plan: forward order, backward order, warmup depth."""
-    fwd_seq, bwd_seq, need_fr, C = _pipeline_plan(units, chunks, keep_last_k)
+    fwd_seq, bwd_seq, need_fr, C = pipeline_plan(units, chunks, keep_last_k)
     W = min(C + (pp - stage - 1), len(fwd_seq))
     return fwd_seq, bwd_seq, need_fr, W
 
@@ -203,7 +178,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
             parent = next_parent()
             chunks, units = _plan(parent, chunk_size, policy)
             by_id = {u.unit_id: u for u in units}
-            fwd_seq, bwd_seq, need_fr, dependency_delay = _pipeline_plan(units, chunks, keep_last_k)
+            fwd_seq, bwd_seq, need_fr, dependency_delay = pipeline_plan(units, chunks, keep_last_k)
             warmup_depths = [
                 min(
                     dependency_delay + (p2p_communicator.total_stages - plan_stage - 1),

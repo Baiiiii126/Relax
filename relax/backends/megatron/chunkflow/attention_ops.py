@@ -47,7 +47,6 @@ def _manual_attn_forward(
 
     out = out_h.permute(1, 0, 2).contiguous()  # [Tq, H, D]
     lse = lse_h.permute(1, 0).contiguous()  # [Tq, H]
-    del h
     return out, lse
 
 
@@ -305,11 +304,8 @@ def _split_sizes_by_cu(cu: torch.Tensor) -> list[int]:
 class UnitCacheAttention(torch.autograd.Function):
     """One varlen call for a whole execution unit.
 
-    A unit packs several sequences, each attending over its own K/V: its
-    group's prefix plus its own chunk. ``cu_seqlens_q`` gives the query lengths
-    and ``cu_seqlens_kv`` the K/V lengths -- the two differ for any chunk with
-    a prefix, which is what lets one call serve them all instead of one call
-    per chunk. Call count, not FLOPs, dominates chunked attention's cost.
+    Each packed sequence attends its group's prefix plus its own chunk.
+    Query and K/V cu_seqlens differ when a sequence has a cached prefix.
 
     An optional final ``(max_q, max_kv)`` tuple supplies CPU length metadata.
     The production caller already has these lengths before creating CUDA

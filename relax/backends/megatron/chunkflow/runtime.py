@@ -1,13 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Per-rank state that has to outlive a single forward call.
+"""Per-rank KV stores and step telemetry attached to the built model.
 
-``StateStore`` is per (layer, dependency group): chunk ``i`` reads chunks
-``0..i`` of that layer's K/V, and chunk ``i+1`` needs them again after chunk
-``i``'s forward has returned. Stores live here, hung off the built model, and
-appear with a group's first chunk and go away with its last backward
-(``release_group``); ``assert_empty`` turns a leaked store into an error. Which
-unit is executing travels on ``packed_seq_params``, not through a global.
+Stores live from a group's first forward through its last backward. The active
+unit travels on packed_seq_params, not through global state.
 """
 
 from __future__ import annotations
@@ -21,9 +17,7 @@ from relax.backends.megatron.chunkflow.telemetry import PlanTelemetry, StepPlanT
 
 RUNTIME_ATTR = "chunkflow_runtime"
 UNIT_ATTR = "chunkflow_unit"
-# Set on packed_seq_params for an Fr op: this chunk's K/V leaf already lives in
-# the store from its Fp pass, so the attention must reuse it instead of putting
-# again (which would trip the store's ascending invariant).
+# Fr reuses the K/V leaves stored by Fp; a second put would break ascending order.
 RECOMPUTE_ATTR = "chunkflow_recompute"
 
 
@@ -42,11 +36,7 @@ class ChunkflowRuntime:
         self.baseline_rope_fusion: list[tuple[Any, bool]] = []
 
     def begin_step(self) -> None:
-        """Start a fresh plan-telemetry window.
-
-        Overwriting stale counters here also makes a failed previous step
-        unable to contaminate the next successful step's metrics.
-        """
+        """Reset plan telemetry and peak counters for the next step."""
         self._step_telemetry = StepPlanTelemetry()
         self._max_live_stores = len(self._stores)
         self._max_live_groups = len(self._live_group_ids)
@@ -64,13 +54,11 @@ class ChunkflowRuntime:
         if gate_metrics is not None:
             # Candidate telemetry is counterfactual when the gate selects baseline.
             metrics = dict(gate_metrics)
-            metrics["pp_last_max_live_stores"] = self._max_live_stores
-            metrics["pp_last_max_live_groups"] = self._max_live_groups
-            return metrics
-        if telemetry is None:
+        elif telemetry is not None:
+            metrics = telemetry.to_metrics(pp_size, simulate_schedule=self.schedule_analysis)
+        else:
             return {}
-        metrics = telemetry.to_metrics(pp_size, simulate_schedule=self.schedule_analysis)
-        if metrics:
+        if gate_metrics is not None or metrics:
             metrics["pp_last_max_live_stores"] = self._max_live_stores
             metrics["pp_last_max_live_groups"] = self._max_live_groups
         return metrics
@@ -109,11 +97,7 @@ class ChunkflowRuntime:
         return sum(store.num_elements for store in self._stores.values())
 
     def assert_empty(self, where: str) -> None:
-        """Fail loudly if a step ended without releasing its groups.
-
-        A leak here is a schedule bug that would otherwise show up much later
-        as unexplained memory growth.
-        """
+        """Reject stores leaked by an incomplete backward schedule."""
         if self._stores:
             groups = self.live_groups()
             raise RuntimeError(
@@ -132,13 +116,7 @@ def attach_runtime(model, chunk_size: int) -> ChunkflowRuntime:
 
 
 def find_runtime(model) -> ChunkflowRuntime | None:
-    """The runtime on a model, unwrapping Megatron's module wrappers.
-
-    The schedule is handed the same object the model provider built, but after
-    DDP/`Float16Module` wrapping the attribute lives on an inner module — walk
-    down until it is found, the way Megatron's own ``get_attr_wrapped_model``
-    does.
-    """
+    """Find the runtime through Megatron's DDP/Float16 module wrappers."""
     seen = 0
     while model is not None and seen < 8:
         runtime = getattr(model, RUNTIME_ATTR, None)
@@ -150,13 +128,8 @@ def find_runtime(model) -> ChunkflowRuntime | None:
 
 
 def require_runtime(model) -> ChunkflowRuntime:
-    """Return the runtime installed before Megatron wrapped ``model``.
-
-    ``install()`` runs on the bare model, while pipeline schedules receive its
-    Float16/DDP wrapper. Attaching directly to the wrapper would create a second
-    runtime: attention would write one store while the schedule released the
-    other.
-    """
+    """Require the installed runtime; creating one on a wrapper splits KV
+    state."""
     runtime = find_runtime(model)
     if runtime is None:
         raise RuntimeError("chunkflow runtime is missing; install ChunkFlow before selecting its schedule")

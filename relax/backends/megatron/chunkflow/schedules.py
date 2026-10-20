@@ -79,7 +79,7 @@ def chunkflow_forward_backward_no_pipelining(
     forward_step_func,
     data_iterator: Union[Iterator, List[Iterator]],
     model: Union[torch.nn.Module, List[torch.nn.Module]],
-    num_microbatches: int,  # ignored -- the iterator drives the count
+    num_microbatches: int,
     seq_length: int,  # unused
     micro_batch_size: int,  # unused
     decoder_seq_length: Optional[int] = None,  # unused
@@ -97,9 +97,7 @@ def chunkflow_forward_backward_no_pipelining(
         assert len(data_iterator) == 1, "chunkflow schedule requires a single iterator"
         data_iterator = data_iterator[0]
 
-    # Unlike the streaming schedules -- which get a StreamingTQIterator and pull
-    # until StopIteration -- the standard path hands us a DataIterator, which has
-    # no __iter__: micro-batches come from get_next() and the caller owns the count.
+    # DataIterator uses get_next(); the caller supplies the microbatch count.
     num_mb = _num_microbatches(num_microbatches)
 
     from megatron.training.global_vars import get_args
@@ -110,11 +108,8 @@ def chunkflow_forward_backward_no_pipelining(
     args = get_args()
     chunk_size = int(args.chunkflow_chunk_size)
     policy = getattr(args, "chunkflow_pack_policy", "staggered")
-    # No recompute yet, so every chunk of a group keeps its activation. A group
-    # larger than this would need the Fp/Fr path.
+    # K=0 retains all activations; earlier chunks otherwise use Fp/Fr.
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
-    # Only K chunks of each group keep their activation; the rest go through
-    # Fp (no graph) and Fr (recompute before backward).
     runtime = require_runtime(model)
     runtime.begin_step()
 

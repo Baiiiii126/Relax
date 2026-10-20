@@ -60,7 +60,7 @@ def forecast_step(
         raise ValueError("invalid gate layout")
     step = StepPlanTelemetry()
     for source in samples:
-        lengths = [int(n) for n in source]
+        lengths = list(source)
         padding = (-sum(lengths)) % pad_size
         if padding:
             lengths.append(padding)

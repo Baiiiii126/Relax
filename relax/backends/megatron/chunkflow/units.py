@@ -1,18 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Execution units: which chunks share one forward/backward call.
+"""Group chunks into forward/backward execution units.
 
-An attention call happens once per (layer, unit), and chunkflow's attention
-cost is dominated by call count, not FLOPs. So the number of calls is set by
-how many chunks share a unit, which is the lever this module provides:
-
-``staggered``: one unit per chunk. Groups can sit at different depths, which
-fills pipeline bubbles but maximizes call count.
-``lockstep``: same-depth chunks across groups share a unit. Far fewer calls,
-but no stagger left to hide bubbles with.
-
-Merging is safe because chunks at the same depth in different groups are
-mutually independent; a unit never holds two chunks of the same group.
+Staggered uses one unit per chunk; lockstep merges equal-depth chunks across
+independent groups to reduce call count. A unit never repeats a group.
 """
 
 from __future__ import annotations
@@ -59,10 +50,8 @@ class Unit:
 
     @property
     def groups(self) -> frozenset[int]:
-        """Dependency groups this unit touches, ascending.
-
-        Empty if purely standalone.
-        """
+        """Dependency groups touched by this unit; empty for standalone
+        units."""
         return frozenset(c.group for c in self.chunks if c.is_dependent)
 
     @property

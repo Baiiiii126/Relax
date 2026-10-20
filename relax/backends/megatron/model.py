@@ -1195,18 +1195,14 @@ def train_one_step(
                 raise NotImplementedError(
                     f"chunkflow at --pipeline-model-parallel-size {pp_size} needs --chunkflow-pipeline {pp_size}."
                 )
-            # UNVERIFIED: this executor has not run end to end. Enable with
-            # RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1 once it has been validated at
-            # PP=2; it is not wired into any default path.
+            # The experimental pipeline executor requires explicit opt-in.
             from relax.backends.megatron.chunkflow.pipeline_schedules import (
                 chunkflow_forward_backward_pipelining_without_interleaving,
             )
 
             if os.environ.get("RELAX_CHUNKFLOW_PIPELINE_UNTESTED") != "1":
                 raise NotImplementedError(
-                    "chunkflow's pipeline executor is a skeleton that has not been validated. Validate it at PP=2 "
-                    "first, then set RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1 to use it. The scheduler already produces "
-                    "per-stage op orders (gen_state_aware_1f1b_ops); the p2p driving is what is untested."
+                    "chunkflow's experimental pipeline executor requires RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1."
                 )
             forward_backward_func = chunkflow_forward_backward_pipelining_without_interleaving
         else:

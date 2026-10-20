@@ -1,22 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Slice one micro-batch into per-unit batches the existing loss can consume.
+"""Slice a processed parent microbatch into per-unit PrepackedBatch objects.
 
-The schedule runs ``get_batch`` once per micro-batch (so alignment, padding and
-cu_seqlens match the baseline exactly), then cuts the result into one batch per
-execution unit, shaped so ``loss_function`` works unmodified.
-
-``unconcat_tokens`` must not survive the slice: the loss pairs logit row *j*
-with token *j+1*, so a unit covering parent rows ``[s, e)`` reports the
-parent's tokens ``[s+1, e+1)`` as targets -- never past the owning sequence's
-end. The unit's ``packed_seq_params`` stays chunk-local for the attention
-kernels and carries absolute offsets for RoPE.
-
-The result is a ``PrepackedBatch``: it is a slice *of* an already-processed
-micro-batch, so the second ``get_batch`` inside ``forward_step_func`` must hand
-it back untouched. Letting that pass run would recompute ``packed_seq_params``
-from the concatenated tokens as one sequence, losing both the per-segment
-``cu_seqlens`` and the unit attributes the attention reads.
+Targets shift one row forward without crossing sequence boundaries. Packed
+metadata retains chunk-local lengths and sequence-local RoPE offsets. get_batch
+must return these slices unchanged to preserve that metadata.
 """
 
 from __future__ import annotations
@@ -76,12 +64,7 @@ def slice_parent_batch(
     segments = [seg for chunk in unit.chunks for seg in chunk.segments]
 
     token_parts = [flat_tokens[s:e] for s, e in rows]
-    # Targets are the parent's tokens one row ahead, but never across a segment
-    # boundary: the last row of a sequence predicts nothing, and reading the next
-    # sequence's first token there would train on the wrong data. The real
-    # pipeline zeroes that row's mask (``F.pad(loss_mask, (prompt_length-1, 1))``
-    # in get_batch), so it is unread either way -- clamping makes that a
-    # guarantee of this function rather than a property of its caller.
+    # Shift targets within their original sequence; pad rather than cross its end.
     target_parts = []
     for (s, e), length, seg in zip(rows, lengths, segments, strict=True):
         seq_end = parent_cu[seg.seq_id + 1]
@@ -100,10 +83,7 @@ def slice_parent_batch(
     unit_targets = torch.cat(target_parts)
     unit_mask = torch.cat(mask_parts)
 
-    # loss_masks and full_loss_masks are two different things: the loss splits
-    # log-probs by response_lengths and multiplies by loss_masks element-wise,
-    # so that one must stay the unpadded length; the model's forward wants one
-    # mask row per padded token, so full_loss_masks is padded alongside tokens.
+    # The loss uses unpadded response masks; the model needs a mask per padded row.
     full_mask = unit_mask.clone()
     pad = (-unit_tokens.size(0)) % 128
     if pad:
@@ -112,10 +92,7 @@ def slice_parent_batch(
         )
         full_mask = torch.cat([full_mask, torch.zeros(pad, dtype=unit_mask.dtype, device=unit_mask.device)])
 
-    # RoPE positions restart at zero for every packed sequence in the baseline.
-    # ``seg.prefix`` is therefore already the absolute position within its own
-    # sequence; adding the packed batch's row offset corrupts every sequence
-    # after the first one.
+    # RoPE offsets are sequence-local prefixes, not packed batch row offsets.
     offsets = _rope_offsets(unit)
     packed = _build_packed_seq_params(unit_tokens, lengths, offsets)
 
@@ -127,11 +104,7 @@ def slice_parent_batch(
             "unconcat_tokens": [unit_targets],
             "full_loss_masks": full_mask.unsqueeze(0),
             "loss_masks": [unit_mask],
-            # ``get_cp_local_num_tokens`` clamps every sample's count to at
-            # least one. A unit is only a slice of a sample, so applying that
-            # clamp per unit over-counts prompt-only chunks and changes the
-            # step's gradient normalization. Preserve the exact additive
-            # count for the ChunkFlow loss path instead.
+            # Do not clamp token counts per unit: prompt-only chunks contribute zero.
             "__num_tokens_override__": unit_mask.sum(),
             "total_lengths": [sum(lengths) + 1],
             "response_lengths": [sum(lengths)],
@@ -140,7 +113,7 @@ def slice_parent_batch(
         }
     )
 
-    _slice_response_aligned_keys(parent, batch, unit, rows)
+    _slice_response_aligned_keys(parent, batch, rows)
     for key in ("__is_dummy__", "__loss_scale__", "replay_micro_batch_index"):
         if key in parent:
             batch[key] = parent[key]
@@ -170,7 +143,7 @@ def _build_packed_seq_params(unit_tokens: torch.Tensor, lengths: list[int], offs
     return packed
 
 
-def _slice_response_aligned_keys(parent: dict, batch: dict, unit: Unit, rows: list[tuple[int, int]]) -> None:
+def _slice_response_aligned_keys(parent: dict, batch: dict, rows: list[tuple[int, int]]) -> None:
     """RL keys are indexed by response position; map each unit row onto one.
 
     A unit row ``r`` of parent sample ``k`` sits at response index
