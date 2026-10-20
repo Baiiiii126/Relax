@@ -75,6 +75,23 @@ class GatingTests(unittest.TestCase):
             with self.subTest(iterator=iterator), self.assertRaises(ValueError):
                 self.gate.forecast_step(iterator, 1, chunk_size=4096, pp_size=4, tp_size=2, pad_multiplier=128)
 
+    def test_remote_metrics_preserves_training_fields_and_full_local_diagnostics(self):
+        for prefix in ("train/chunkflow/", "train/critic-chunkflow/"):
+            local = {
+                "train/step": 12,
+                "train/loss": 0.2,
+                "train/grad_norm": 1.5,
+                "perf/actor_train_time": 3.0,
+                prefix + "gate_selected": 0,
+                prefix + "schedule_model_speedup": 2.3,
+            }
+            before = dict(local)
+            remote = self.gate.remote_metrics(local, prefix)
+            self.assertEqual(
+                remote, {"train/step": 12, "train/loss": 0.2, "train/grad_norm": 1.5, "perf/actor_train_time": 3.0}
+            )
+            self.assertEqual(local, before)
+
 
 if __name__ == "__main__":
     unittest.main()

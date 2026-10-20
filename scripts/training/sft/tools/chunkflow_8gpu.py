@@ -93,7 +93,7 @@ def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
         raise ValueError("chunk sizes must be distinct multiples of 256 in [256, 32768]")
     profile_start = integer(env, "PROFILE_START", 10)
     profile_end = integer(env, "PROFILE_END", 12)
-    default_steps = {"screen": 110, "confirm": 510, "profile": profile_end + 2, "backend": 110, "gate": 210}[phase]
+    default_steps = {"screen": 110, "confirm": 510, "profile": profile_end + 2, "backend": 110, "gate": 100}[phase]
     steps = integer(env, "STEPS", default_steps, 1)
     drop = integer(env, "DROP_FIRST", 10)
     if phase == "profile":
@@ -128,6 +128,7 @@ def configuration(phase: str, env: Mapping[str, str]) -> dict[str, Any]:
         "backends": ["fa2", "fa3"] if phase == "backend" else [backend],
         "gate_gain_pct": threshold if phase == "gate" or profile_gate else None,
         "profile_gate": profile_gate,
+        "telemetry_local_only": True,
         "steps": steps,
         "drop_first": drop,
         "repeats": repeats,
@@ -212,6 +213,7 @@ def arm_environment(
         "LOG_FILE": str(Path(config["report_dir"]) / f"repeat{repeat}" / f"{arm}.log"),
         "RELAX_CHUNKFLOW_PIPELINE_UNTESTED": "1",
         "RELAX_CHUNKFLOW_FLASH_BACKEND": backend,
+        "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY": "1",
         "GATE_GAIN_PCT": str(config["gate_gain_pct"]) if gated else "",
         "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS": "0" if config["phase"] == "profile" else "1",
         "CHUNKFLOW_PROFILE": "1" if config["phase"] == "profile" else "0",
@@ -342,6 +344,7 @@ def write_report(config: dict[str, Any], results: list[dict[str, Any]]) -> None:
         "",
         "实际加速比 = baseline 总耗时 / ChunkFlow 总耗时；大于 1 表示提速。",
         "预测使用声明成本假设的调度模型，尚未按 GPU 算子成本校准。",
+        "详细 ChunkFlow 诊断指标保存在本地日志及 CSV；常规训练/耗时指标继续上报 ClearML。",
         "本表可在实验过程中增量生成；完整性以 manifest.json 的 status=complete 为准。",
         "",
         "| 轮次 | chunk | CF 后端 | 策略 | 配对数 | 预测加速比 | 训练加速比 | 训练比 95% block 区间 | step_time 加速比 | 实际正收益率 |",

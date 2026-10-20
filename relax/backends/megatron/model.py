@@ -1609,7 +1609,12 @@ def train(
                 log_dict[f"train/{role_tag}cur_epoch"] = (accumulated_step_id + 1) / (
                     num_per_epoch * num_steps_per_rollout
                 )
-            tracking_utils.log(args, log_dict, step_key="train/step")
+            tracking_dict = log_dict
+            if getattr(args, "use_chunkflow", False) and os.environ.get("RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY") == "1":
+                from relax.backends.megatron.chunkflow.gating import remote_metrics
+
+                tracking_dict = remote_metrics(log_dict, f"train/{role_tag}chunkflow/")
+            tracking_utils.log(args, tracking_dict, step_key="train/step")
             tracking_utils.flush_metrics(args, accumulated_step_id)
 
             if args.ci_test and not args.ci_disable_kl_checker:

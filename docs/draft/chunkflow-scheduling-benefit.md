@@ -595,15 +595,15 @@ RELAX_CHUNKFLOW_FLASH_BACKEND=fa3 CHUNK_SIZE=4096 PROFILE_START=16 PROFILE_END=1
 export MODEL_DIR=/path/to/models
 export DATA_DIR=/path/to/data
 export PROMPT_DATA="${DATA_DIR}/chunkflow-mixed/train.parquet"
-unset CHUNK_SIZES CHUNKFLOW_PROFILE DRY_RUN REPEATS
+unset PROFILE_GATE CHUNK_SIZES CHUNKFLOW_PROFILE DRY_RUN REPEATS
 unset RAY_NO_WAIT RELAX_ENTRYPOINT_MODE WORKING_DIR
 export REPORT_DIR="analysis/chunkflow-gate-$(date +%Y%m%d-%H%M%S)"
-GBS=8 CHUNK_SIZE=4096 GATE_GAIN_PCT=140 STEPS=210 DROP_FIRST=10 TRAIN_SEED=1235 \
+GBS=8 CHUNK_SIZE=4096 GATE_GAIN_PCT=140 STEPS=100 DROP_FIRST=10 TRAIN_SEED=1235 \
   bash scripts/training/sft/tools/run_chunkflow_8gpu.sh gate
 cat "${REPORT_DIR}/summary.md"
 ```
 
-默认新 seed=1235，每组210步、去掉前10步；阈值在运行前固定。
+默认新 seed=1235，每组总共100步、去掉前10步，统计90步；三组共运行300步。阈值在运行前固定。
 报告包含策略相对 baseline 的总耗时比及 block 区间、开启/关闭次数、开启后实际提速次数、预测与一致性检查时间。
 `repeat1/chunk4096-fa3-gate140/attribution.csv` 每步记录预测值、实际选择及实际时间。
 关闭步骤的预测指标描述候选 ChunkFlow，并不表示执行了候选计划；对应实测指标描述最终选择的策略。
@@ -628,6 +628,22 @@ cat "${REPORT_DIR}/profile.md"
 trace 包含预测/一致性检查、回退准备、替换原 attention、前后向以及恢复 ChunkFlow 的分段标记。
 seed1235 的既有非 profiler 结果中 step12/14 为回退、step13 为开启，可对比两种分支。
 采样带来的额外开销不能用来判断策略是否提速。退出此诊断后应 `unset PROFILE_GATE`。
+
+### 诊断指标上报与收益测量
+
+2026-10-20 的门控诊断发现：关闭 ChunkFlow 后，前后向耗时与独立 baseline 接近，
+额外耗时主要落在训练计时范围内同步等待的 `/metrics/report_step` 请求。
+门控组仍会上报候选计划的诊断指标，关闭步骤也会承担这部分成本。
+既有 177 个关闭步骤总计多耗时约 337.58 秒，其中训练指标上报请求的差额约 334.18 秒。
+这定位了上报路径的干扰，尚未定位服务内部具体哪个后端造成延迟。
+
+8 卡驱动现在为所有对照组统一设置 `RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY=1`：
+仅将 `train/*chunkflow/` 下的详细诊断指标留在本地完整日志，供归因 CSV 和门控报告解析。
+loss、梯度、学习率、训练步数以及性能指标继续正常上报，ClearML 耗时曲线保留。
+直接使用训练脚本时，该环境变量默认是 `0`，保持原上报行为。
+
+修复后应在相同设置下重新运行 baseline、始终开启、门控三组，使用新的实测计时比较。
+不能将旧结果减去 HTTP 请求耗时后作为新的实测收益，也不能混用修复前后的对照组。
 
 ## 附录：关键代码位置
 

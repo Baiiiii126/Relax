@@ -21,6 +21,11 @@ from relax.backends.megatron.chunkflow.units import build_micro_batches
 GATE_ENV = "RELAX_CHUNKFLOW_GATE_GAIN_PCT"
 
 
+def remote_metrics(metrics: dict[str, Any], chunkflow_prefix: str) -> dict[str, Any]:
+    """Keep diagnostics in the local log, outside synchronous reporting."""
+    return {key: value for key, value in metrics.items() if not key.startswith(chunkflow_prefix)}
+
+
 def gain_threshold(value: str) -> float | None:
     if not value:
         return None

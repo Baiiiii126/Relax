@@ -43,6 +43,7 @@ class EightGpuTests(unittest.TestCase):
             "profile = os.environ['CHUNKFLOW_PROFILE'] == '1'\n"
             "assert os.environ['RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS'] == ('0' if profile else '1')\n"
             "backend = os.environ['RELAX_CHUNKFLOW_FLASH_BACKEND']\n"
+            "assert os.environ['RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY'] == '1'\n"
             "gated = bool(os.environ['GATE_GAIN_PCT'])\n"
             "gate_phase = 'cf8-gate-' in os.environ['RUN_NAME']\n"
             "lines = ['chunked attention installed'] if chunk else []\n"
@@ -208,6 +209,7 @@ class EightGpuTests(unittest.TestCase):
             "CAPTURE_ARGS": str(capture),
             "CHUNK_SIZE": "4096",
             "RELAX_CHUNKFLOW_FLASH_BACKEND": "fa3",
+            "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY": "1",
             "CHUNKFLOW_PROFILE": "1",
             "PROFILE_START": "2",
             "PROFILE_END": "4",
@@ -226,6 +228,7 @@ class EightGpuTests(unittest.TestCase):
             else json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("--runtime-env-json=")))
         )
         self.assertEqual(runtime["env_vars"]["RELAX_CHUNKFLOW_FLASH_BACKEND"], "fa3")
+        self.assertEqual(runtime["env_vars"]["RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY"], "1")
         self.assertIn("--use-pytorch-profiler", args)
         for flag, value in {
             "--profile-target": "train_overall",
