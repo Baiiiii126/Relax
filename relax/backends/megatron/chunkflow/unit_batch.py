@@ -1,11 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Slice a processed parent microbatch into per-unit PrepackedBatch objects.
-
-Targets shift one row forward without crossing sequence boundaries. Packed
-metadata retains chunk-local lengths and sequence-local RoPE offsets. get_batch
-must return these slices unchanged to preserve that metadata.
-"""
 
 from __future__ import annotations
 
@@ -19,7 +13,6 @@ from relax.backends.megatron.chunkflow.units import Unit
 
 
 def _segment_rows(parent_cu: Sequence[int], segment: Segment) -> tuple[int, int]:
-    """The parent rows ``[start, end)`` of one segment."""
     start = parent_cu[segment.seq_id] + segment.prefix
     return start, start + segment.length
 
@@ -29,7 +22,6 @@ def _rows_for_unit(parent_cu: Sequence[int], unit: Unit) -> list[tuple[int, int]
 
 
 def _rope_offsets(unit: Unit) -> list[int]:
-    """Return sequence-local RoPE offsets, rejecting unsupported packing."""
     segments = [seg for chunk in unit.chunks for seg in chunk.segments]
     if unit.is_dependent and len(segments) > 1:
         raise NotImplementedError(
@@ -46,13 +38,6 @@ def slice_parent_batch(
     pad_token_id: int,
     args=None,
 ) -> dict:
-    """Cut a processed micro-batch into the batch for one execution unit.
-
-    ``parent`` is what ``get_batch`` returned for the whole micro-batch. The
-    result is a batch of the same shape holding only this unit's rows, with
-    ``unconcat_tokens`` shifted one row forward (see module docstring) and the
-    RoPE offset fields set on ``packed_seq_params``.
-    """
     tokens = parent["tokens"]
     assert tokens.dim() == 2 and tokens.size(0) == 1, f"expected [1, T], got {tokens.shape}"
     flat_tokens = tokens[0]
@@ -64,7 +49,7 @@ def slice_parent_batch(
     segments = [seg for chunk in unit.chunks for seg in chunk.segments]
 
     token_parts = [flat_tokens[s:e] for s, e in rows]
-    # Shift targets within their original sequence; pad rather than cross its end.
+    # Shift targets within sequence boundaries.
     target_parts = []
     for (s, e), length, seg in zip(rows, lengths, segments, strict=True):
         seq_end = parent_cu[seg.seq_id + 1]
@@ -83,7 +68,6 @@ def slice_parent_batch(
     unit_targets = torch.cat(target_parts)
     unit_mask = torch.cat(mask_parts)
 
-    # The loss uses unpadded response masks; the model needs a mask per padded row.
     full_mask = unit_mask.clone()
     pad = (-unit_tokens.size(0)) % 128
     if pad:
@@ -92,7 +76,7 @@ def slice_parent_batch(
         )
         full_mask = torch.cat([full_mask, torch.zeros(pad, dtype=unit_mask.dtype, device=unit_mask.device)])
 
-    # RoPE offsets are sequence-local prefixes, not packed batch row offsets.
+    # RoPE uses sequence-local prefixes, not packed row offsets.
     offsets = _rope_offsets(unit)
     packed = _build_packed_seq_params(unit_tokens, lengths, offsets)
 
@@ -104,7 +88,7 @@ def slice_parent_batch(
             "unconcat_tokens": [unit_targets],
             "full_loss_masks": full_mask.unsqueeze(0),
             "loss_masks": [unit_mask],
-            # Do not clamp token counts per unit: prompt-only chunks contribute zero.
+            # Prompt-only units must retain a zero token count.
             "__num_tokens_override__": unit_mask.sum(),
             "total_lengths": [sum(lengths) + 1],
             "response_lengths": [sum(lengths)],
@@ -121,7 +105,6 @@ def slice_parent_batch(
 
 
 def _build_packed_seq_params(unit_tokens: torch.Tensor, lengths: list[int], offsets: list[int]):
-    """Chunk-local cu_seqlens for the kernels, absolute offsets for RoPE."""
     from megatron.core.packed_seq_params import PackedSeqParams
 
     cu = [0]
@@ -144,20 +127,12 @@ def _build_packed_seq_params(unit_tokens: torch.Tensor, lengths: list[int], offs
 
 
 def _slice_response_aligned_keys(parent: dict, batch: dict, rows: list[tuple[int, int]]) -> None:
-    """RL keys are indexed by response position; map each unit row onto one.
-
-    A unit row ``r`` of parent sample ``k`` sits at response index
-    ``r - prompt_len(k)``. Rows before the response (or past its end) carry no
-    response-aligned value, so they take index 0 — their loss mask is 0, so the
-    value is never read.
-    """
     total_lengths = parent.get("total_lengths") or []
     response_lengths = parent.get("response_lengths") or []
     keys = ("log_probs", "ref_log_probs", "values", "advantages", "returns", "rollout_log_probs")
     if not any(parent.get(k) is not None for k in keys):
         return
 
-    # Parent row -> (sample index, response index).
     parent_cu = parent["packed_seq_params"].cu_seqlens_q_cpu
     sample_of_row: dict[int, tuple[int, int]] = {}
     for k, (cu_lo, cu_hi) in enumerate(zip(parent_cu[:-1], parent_cu[1:], strict=True)):

@@ -1,15 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""The chunkflow schedule: chunks are the units that flow through the model.
-
-``streaming_schedules.py`` is the template -- keyword-only signature, one-shot
-iterators, gradients accumulated under ``no_sync`` with one
-``finalize_model_grads`` at the end. The difference is the unit of work: a
-chunk (or a batch of independent chunks) instead of a micro-batch, in the order
-``gen_unit_ops`` prescribes. For PP=1 that order is ascending forward /
-descending backward, because a group's chunk ``m`` can only backward once every
-chunk ``j >= m`` has (dK/dV accumulation must be complete).
-"""
 
 from __future__ import annotations
 
@@ -27,8 +17,6 @@ from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 
 
-# Keys ``forward_step`` would have asked ``get_batch`` for. Kept in sync with
-# model.py's list; a key absent from the rollout data comes back None.
 _BATCH_KEYS = (
     "tokens",
     "packed_seq_params",
@@ -46,7 +34,6 @@ _BATCH_KEYS = (
 
 
 def _plan(parent: dict, chunk_size: int, policy: str):
-    """Build chunks and execution units for one processed micro-batch."""
     cu = parent["packed_seq_params"].cu_seqlens_q_cpu
     lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
     chunks = build_chunks(lengths, chunk_size=chunk_size, repack_tail=False)
@@ -54,8 +41,6 @@ def _plan(parent: dict, chunk_size: int, policy: str):
 
 
 def _num_microbatches(num_microbatches) -> int:
-    """``num_microbatches`` as an int -- the caller hands over an int, a list
-    or a 0-d tensor depending on the path."""
     if isinstance(num_microbatches, (list, tuple)):
         num_microbatches = num_microbatches[0]
     elif torch.is_tensor(num_microbatches):
@@ -80,15 +65,14 @@ def chunkflow_forward_backward_no_pipelining(
     data_iterator: Union[Iterator, List[Iterator]],
     model: Union[torch.nn.Module, List[torch.nn.Module]],
     num_microbatches: int,
-    seq_length: int,  # unused
-    micro_batch_size: int,  # unused
-    decoder_seq_length: Optional[int] = None,  # unused
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: Optional[int] = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     **kwargs,
 ):
-    """PP=1 chunkflow schedule."""
     del seq_length, micro_batch_size, decoder_seq_length, collect_non_loss_data, first_val_step
     if isinstance(model, list):
         assert len(model) == 1, "chunkflow schedule requires a single model chunk"
@@ -97,7 +81,6 @@ def chunkflow_forward_backward_no_pipelining(
         assert len(data_iterator) == 1, "chunkflow schedule requires a single iterator"
         data_iterator = data_iterator[0]
 
-    # DataIterator uses get_next(); the caller supplies the microbatch count.
     num_mb = _num_microbatches(num_microbatches)
 
     from megatron.training.global_vars import get_args
@@ -108,7 +91,7 @@ def chunkflow_forward_backward_no_pipelining(
     args = get_args()
     chunk_size = int(args.chunkflow_chunk_size)
     policy = getattr(args, "chunkflow_pack_policy", "staggered")
-    # K=0 retains all activations; earlier chunks otherwise use Fp/Fr.
+    # K=0 retains all activations; otherwise earlier chunks use Fp/Fr.
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
     runtime = require_runtime(model)
     runtime.begin_step()
@@ -122,8 +105,6 @@ def chunkflow_forward_backward_no_pipelining(
     with no_sync_func():
         for _ in range(num_mb):
             parent_batch = data_iterator.get_next(_BATCH_KEYS)
-            # get_batch's non-DataIterator branch unpacks a (batch, meta) pair
-            # off the iterator, the shape StreamingTQIterator yields.
             parent = get_batch(
                 iter([(parent_batch, {})]),
                 _BATCH_KEYS,
@@ -166,18 +147,11 @@ def chunkflow_forward_backward_no_pipelining(
                 batch = slice_parent_batch(parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args)
                 batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
                 if kind == "Fp":
-                    # Forward that keeps only K/V: the attention writes its leaf
-                    # into the store, but under no_grad nothing else (no
-                    # activations, no graph) survives to backward. That is the
-                    # whole memory win -- the first N-K chunks of a group do
-                    # this instead of holding activations.
                     batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, False)
                     with torch.no_grad():
                         model(**_forward_kwargs(batch))
                     continue
 
-                # F keeps the graph from this pass; Fr rebuilds it right before
-                # the unit's own backward. Both end with a loss to backward.
                 batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, kind == "Fr")
                 output = model(**_forward_kwargs(batch))
                 loss, num_tokens, log = loss_function(args, batch, 1, output)

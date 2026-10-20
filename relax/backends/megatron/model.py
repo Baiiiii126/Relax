@@ -1173,22 +1173,7 @@ def train_one_step(
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
-    use_chunkflow_this_step = getattr(args, "use_chunkflow", False)
-    gated_fallback = False
-    if use_chunkflow_this_step and os.environ.get("RELAX_CHUNKFLOW_GATE_GAIN_PCT"):
-        from relax.backends.megatron.chunkflow.gating import prepare_step_gate
-
-        if len(model) != 1 or len(data_iterator) != 1:
-            raise ValueError("adaptive ChunkFlow requires one model chunk and one materialized iterator")
-        prediction_context = (
-            torch.profiler.record_function("chunkflow.gate.predict_and_agree")
-            if getattr(args, "use_pytorch_profiler", False)
-            else nullcontext()
-        )
-        with prediction_context:
-            use_chunkflow_this_step = prepare_step_gate(args, model[0], data_iterator[0], num_microbatches)
-        gated_fallback = not use_chunkflow_this_step
-    if use_chunkflow_this_step:
+    if getattr(args, "use_chunkflow", False):
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size > 1:
             if getattr(args, "chunkflow_pipeline", 0) != pp_size:
@@ -1225,29 +1210,23 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    attention_context = nullcontext()
-    if gated_fallback:
-        from relax.backends.megatron.chunkflow.integration import baseline_attention
-
-        attention_context = baseline_attention(model[0], profile=getattr(args, "use_pytorch_profiler", False))
-    with attention_context:
-        path = "chunkflow" if use_chunkflow_this_step else "baseline"
-        compute_context = (
-            torch.profiler.record_function(f"chunkflow.path.{path}.forward_backward")
-            if getattr(args, "use_pytorch_profiler", False)
-            else nullcontext()
+    path = "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline"
+    compute_context = (
+        torch.profiler.record_function(f"chunkflow.path.{path}.forward_backward")
+        if getattr(args, "use_pytorch_profiler", False)
+        else nullcontext()
+    )
+    with compute_context:
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
         )
-        with compute_context:
-            losses_reduced = forward_backward_func(
-                forward_step_func=forward_step,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=False,
-            )
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -1607,7 +1586,7 @@ def train(
                 )
             tracking_dict = log_dict
             if getattr(args, "use_chunkflow", False) and os.environ.get("RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY") == "1":
-                from relax.backends.megatron.chunkflow.gating import remote_metrics
+                from relax.backends.megatron.chunkflow.telemetry import remote_metrics
 
                 tracking_dict = remote_metrics(log_dict, f"train/{role_tag}chunkflow/")
             tracking_utils.log(args, tracking_dict, step_key="train/step")

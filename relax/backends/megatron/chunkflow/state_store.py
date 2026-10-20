@@ -1,12 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Local, communication-free per-chunk state storage for chunkflow.
-
-A chunk's attention needs the K/V of every earlier chunk, so state is put in
-ascending order and freed in descending order. ``StateStore`` only enforces
-that ordering invariant (so a scheduling bug surfaces as ``StateStoreError``
-rather than a silently wrong gradient); it does not interpret the payload.
-"""
 
 from __future__ import annotations
 
@@ -17,49 +10,19 @@ import torch
 
 @dataclass(frozen=True)
 class ChunkState:
-    """Opaque per-chunk payload.
-
-    ``tensors`` holds whatever a chunk's forward pass needs to keep alive until
-    its backward runs — e.g. ``{"k": ..., "v": ...}`` for softmax attention, or
-    ``{"kv": ..., "indices": ...}`` for DSA.
-    """
-
     tensors: dict[str, torch.Tensor]
-
-    @property
-    def num_elements(self) -> int:
-        """Total element count across all stored tensors (memory-accounting
-        helper for tests)."""
-        return sum(t.numel() for t in self.tensors.values())
 
 
 class StateStoreError(RuntimeError):
-    """A StateStore call violated the chunkflow ordering invariant (ascending
-    put, descending free)."""
+    pass
 
 
 class StateStore:
-    """Local per-chunk KV/state store with incremental put, lookup, and
-    decremental free.
-
-    Chunk ids must start at 0 and be put in strictly ascending order; they must
-    be freed in strictly descending order (highest live id first). Both rules
-    are enforced with hard errors rather than tolerated silently, because a
-    violation means the caller's chunk schedule is wrong and any gradient
-    computed downstream would be silently incorrect.
-    """
-
     def __init__(self) -> None:
         self._chunks: dict[int, ChunkState] = {}
         self._next_expected_put: int = 0
 
     def put(self, chunk_id: int, state: ChunkState) -> None:
-        """Store ``state`` for ``chunk_id`` (增量存储).
-
-        Must be called with ``chunk_id == 0, 1, 2, ...`` in order — each
-        chunk's forward only has the previous chunks' state available once they
-        have actually been put.
-        """
         if chunk_id != self._next_expected_put:
             raise StateStoreError(
                 f"put() must be strictly ascending starting at 0: "
@@ -69,14 +32,6 @@ class StateStore:
         self._next_expected_put += 1
 
     def lookup(self, upto_chunk_id: int) -> list[ChunkState]:
-        """Return the states for chunks ``0..upto_chunk_id`` inclusive,
-        ascending (查找).
-
-        Raises if any chunk in that range is missing (never put, or already
-        freed) — a query chunk should never need a chunk that has been freed,
-        so this signals a scheduling bug rather than silently returning a
-        partial or wrong result.
-        """
         missing = [i for i in range(upto_chunk_id + 1) if i not in self._chunks]
         if missing:
             raise StateStoreError(
@@ -85,11 +40,6 @@ class StateStore:
         return [self._chunks[i] for i in range(upto_chunk_id + 1)]
 
     def free(self, chunk_id: int) -> None:
-        """Release the state for ``chunk_id`` (减量删除).
-
-        Must be called in strictly descending order relative to the highest
-        currently-live chunk id.
-        """
         if not self._chunks:
             raise StateStoreError("free() called on an empty StateStore")
         current_max = max(self._chunks)
@@ -105,10 +55,4 @@ class StateStore:
 
     @property
     def live_chunk_ids(self) -> list[int]:
-        """Currently-stored chunk ids, ascending."""
         return sorted(self._chunks)
-
-    @property
-    def num_elements(self) -> int:
-        """Total element count across all currently-live chunk states."""
-        return sum(state.num_elements for state in self._chunks.values())

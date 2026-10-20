@@ -5,7 +5,7 @@
 # Qwen3-4B SFT, 8 GPUs: TP2 x PP4 x DP1, FA3, 100 steps by default.
 # Set RELAX_CHUNKFLOW_FLASH_BACKEND=fa2 if workers do not provide FA3.
 #
-# Set MODEL_DIR and PROMPT_DATA, then select baseline, chunkflow or adaptive:
+# Set MODEL_DIR and PROMPT_DATA, then select baseline or chunkflow:
 #   bash scripts/entrypoint/ray-job.sh \
 #     scripts/training/sft/run-qwen3-4B-8xgpu-chunkflow.sh chunkflow
 set -eo pipefail
@@ -36,25 +36,19 @@ if [ "$((TP_SIZE * PP_SIZE))" -ne 8 ] || [ "$((36 % PP_SIZE))" -ne 0 ] ||
 fi
 export NUM_GPUS=8
 if [ "$#" -gt 1 ]; then
-   echo "Usage: bash $0 {baseline|chunkflow|adaptive}" >&2
+   echo "Usage: bash $0 {baseline|chunkflow}" >&2
    exit 2
 fi
 MODE="${1:-chunkflow}"
 case "${MODE}" in
    baseline)
       CHUNK_SIZE=0
-      export RELAX_CHUNKFLOW_GATE_GAIN_PCT=""
       ;;
    chunkflow)
       CHUNK_SIZE="${CHUNK_SIZE:-4096}"
-      export RELAX_CHUNKFLOW_GATE_GAIN_PCT=""
-      ;;
-   adaptive)
-      CHUNK_SIZE="${CHUNK_SIZE:-4096}"
-      export RELAX_CHUNKFLOW_GATE_GAIN_PCT="${GATE_GAIN_PCT:-140}"
       ;;
    *)
-      echo "Usage: bash $0 {baseline|chunkflow|adaptive}" >&2
+      echo "Usage: bash $0 {baseline|chunkflow}" >&2
       exit 2
       ;;
 esac
@@ -69,10 +63,6 @@ if [ "${PACK_POLICY}" != staggered ]; then
    echo "ERROR: this training example requires PACK_POLICY=staggered" >&2
    exit 2
 fi
-if [ "${MODE}" = adaptive ] && [ "${KEEP_LAST_K}" -ne 0 ]; then
-   echo "ERROR: adaptive mode requires KEEP_LAST_K=0" >&2
-   exit 2
-fi
 if [ "${CHUNK_SIZE}" -gt 0 ]; then
    CHUNKFLOW_ARGS=(--use-chunkflow --chunkflow-chunk-size ${CHUNK_SIZE} --chunkflow-pack-policy "${PACK_POLICY}")
    ARM="chunk${CHUNK_SIZE}-${PACK_POLICY}"
@@ -81,9 +71,6 @@ if [ "${CHUNK_SIZE}" -gt 0 ]; then
    if [ "${KEEP_LAST_K}" -gt 0 ]; then
       CHUNKFLOW_ARGS+=(--chunkflow-keep-last-k ${KEEP_LAST_K})
       ARM="${ARM}-k${KEEP_LAST_K}"
-   fi
-   if [ "${MODE}" = adaptive ]; then
-      ARM="${ARM}-gate${RELAX_CHUNKFLOW_GATE_GAIN_PCT}"
    fi
 else
    CHUNKFLOW_ARGS=()
@@ -169,16 +156,12 @@ esac
 
 RUNTIME_ENV_JSON=$(python3 -c '
 import json, os
-import math
 env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 target = env.setdefault("env_vars", {})
 for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS",
-            "RELAX_CHUNKFLOW_FLASH_BACKEND", "RELAX_CHUNKFLOW_GATE_GAIN_PCT",
+            "RELAX_CHUNKFLOW_FLASH_BACKEND",
             "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY"):
     target[key] = os.environ[key]
-threshold = target["RELAX_CHUNKFLOW_GATE_GAIN_PCT"]
-if threshold and (not math.isfinite(float(threshold)) or float(threshold) < 0):
-    raise ValueError("GATE_GAIN_PCT must be finite and nonnegative")
 print(json.dumps(env))
 ')
 export RUNTIME_ENV_JSON
@@ -262,10 +245,6 @@ if [ "${RAY_NO_WAIT:-0}" != 1 ]; then
       { ! grep -Eq 'chunkflow: chunked attention installed on [1-9][0-9]* layer' "${LOG_FILE}" ||
         ! grep -q "chunkflow: flash attention backend=${RELAX_CHUNKFLOW_FLASH_BACKEND}" "${LOG_FILE}"; }; then
       echo "ERROR: requested ChunkFlow attention installation/backend not confirmed in ${LOG_FILE}" >&2
-      exit 1
-   fi
-   if [ "${MODE}" = adaptive ] && ! grep -q "chunkflow gate before forward:" "${LOG_FILE}"; then
-      echo "ERROR: adaptive decisions not confirmed in ${LOG_FILE}" >&2
       exit 1
    fi
    if [ "${MODE}" = baseline ] && grep -q "chunkflow: chunked attention installed" "${LOG_FILE}"; then

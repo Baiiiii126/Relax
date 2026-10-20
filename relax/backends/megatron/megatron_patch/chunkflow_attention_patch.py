@@ -1,19 +1,7 @@
-# Install chunkflow's chunked attention on every freshly built model when
-# ``--use-chunkflow --chunkflow-chunk-size N`` is set (or, as a fallback for
-# scripts that cannot pass CLI args, ``RELAX_CHUNKFLOW_CHUNK_SIZE=N``).
-#
-# Hook point: ``model_provider._install_cp_probe`` runs right after the model is
-# constructed on all three build paths (custom provider, bridge, raw), so
-# wrapping it reaches every path without touching them. The wrapper only adds a
-# call; the original probe still runs.
-#
-# Off by default, so importing this module is a no-op for every existing run.
-# The switch is read at model-build time, not import time: ``get_args()`` does
-# not exist yet when this module body runs.
-#
-# Numerically chunking is equivalent to unchunked attention (verified against
-# the real Qwen3-0.6B for chunk sizes 4..64). It does not reduce memory on its
-# own; that needs the per-chunk backward schedule.
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+# Install ChunkFlow after model construction on each provider path.
+# CLI arguments take precedence over the environment fallback.
 
 from __future__ import annotations
 
@@ -26,12 +14,7 @@ logger = get_logger(__name__)
 
 
 def _chunk_size_from_args() -> int | None:
-    """Chunk size from CLI args; None only when args are unavailable.
-
-    Returning 0 (rather than None) when ``--use-chunkflow`` is absent matters:
-    args are the authority once they exist, so a stale env var must not switch
-    chunkflow on behind the back of a run that did not ask for it.
-    """
+    """Return CLI size, 0 when disabled, or None before args are available."""
     try:
         from megatron.training.global_vars import get_args
 

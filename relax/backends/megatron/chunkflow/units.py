@@ -1,14 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Group chunks into forward/backward execution units.
-
-Staggered uses one unit per chunk; lockstep merges equal-depth chunks across
-independent groups to reduce call count. A unit never repeats a group.
-"""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from relax.backends.megatron.chunkflow.scheduler import (
@@ -26,15 +21,6 @@ POLICIES = ("staggered", "lockstep")
 
 @dataclass
 class Unit:
-    """One execution unit: the chunks that share a single forward/backward
-    call.
-
-    ``chunks`` is never empty. A unit whose members all belong to one
-    dependency group carries that group; a unit spanning several groups (only
-    possible under ``lockstep``) carries all of them, and its backward must
-    wait for every one of them to finish forwarding.
-    """
-
     unit_id: int
     chunks: list[Chunk]
 
@@ -50,14 +36,10 @@ class Unit:
 
     @property
     def groups(self) -> frozenset[int]:
-        """Dependency groups touched by this unit; empty for standalone
-        units."""
         return frozenset(c.group for c in self.chunks if c.is_dependent)
 
     @property
     def round(self) -> int:
-        """Depth in the dependency chain: ``group_idx``, or -1 for standalone
-        units."""
         return max((c.group_idx for c in self.chunks if c.is_dependent), default=-1)
 
     @property
@@ -73,18 +55,7 @@ class Unit:
         return [c.chunk_id for c in self.chunks]
 
 
-# ---------------------------------------------------------------------------
-# Assembly
-# ---------------------------------------------------------------------------
-
-
 def build_micro_batches(chunks: Sequence[Chunk], policy: str = "staggered") -> list[Unit]:
-    """Partition ``chunks`` into execution units, in execution order.
-
-    The flattened order of the result is the *forward order*: the caller feeds
-    it to the unit-level schedule functions. For ``staggered`` that order is
-    exactly the chunk order, so it reduces to the chunk-level schedule.
-    """
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy!r}")
 
@@ -92,8 +63,6 @@ def build_micro_batches(chunks: Sequence[Chunk], policy: str = "staggered") -> l
         return [Unit(unit_id=i, chunks=[c]) for i, c in enumerate(chunks)]
 
     units: list[Unit] = []
-    # Standalone chunks are already bin-packed by ``build_chunks`` and carry no
-    # ordering constraint, so they go first and backward immediately.
     for c in chunks:
         if not c.is_dependent:
             units.append(Unit(unit_id=len(units), chunks=[c]))
@@ -108,27 +77,7 @@ def build_micro_batches(chunks: Sequence[Chunk], policy: str = "staggered") -> l
     return units
 
 
-def expand_units(units: Sequence[Unit]) -> list[Chunk]:
-    """Every chunk, in unit order — the flat list the chunk-level planner
-    needs."""
-    return [c for u in units for c in u.chunks]
-
-
-# ---------------------------------------------------------------------------
-# Unit-level op ordering
-# ---------------------------------------------------------------------------
-
-
 def classify_units(units: Sequence[Unit], chunks: Sequence[Chunk], keep_last_k: int) -> tuple[set[int], set[int]]:
-    """Split units into those that keep their first-pass activation and those
-    to recompute.
-
-    A unit can only be dropped when *every* member can be: dropping discards
-    activations for the whole unit, so a single member that must keep forces
-    the unit to keep. With equal-depth merging and groups of differing sizes
-    this costs some of the window's saving — the alternative (splitting the
-    unit) would cost the call-count saving instead.
-    """
     _, chunk_need_fr = classify_chunks(chunks, keep_last_k)
 
     keep: set[int] = set()
@@ -142,14 +91,6 @@ def classify_units(units: Sequence[Unit], chunks: Sequence[Chunk], keep_last_k: 
 
 
 def make_unit_bwd_order(units: Sequence[Unit], fwd_order: Sequence[int]) -> list[int]:
-    """Global backward order over units for a given forward order.
-
-    A standalone unit backwards immediately after its own forward. A unit
-    touching dependency groups backwards (descending by round) only once every
-    unit of *every* group it touches has forwarded — that is when the dK/dV
-    accumulating into its members is complete. Reduces exactly to
-    ``scheduler.make_bwd_order`` when every unit holds one chunk.
-    """
     by_id = {u.unit_id: u for u in units}
     units_of_group: dict[int, list[int]] = {}
     for u in units:
@@ -177,12 +118,6 @@ def make_unit_bwd_order(units: Sequence[Unit], fwd_order: Sequence[int]) -> list
 
 
 def completed_groups(unit: Unit) -> frozenset[int]:
-    """Groups whose final (lowest-index) backward is performed by ``unit``.
-
-    Dependent chunks backward in descending ``group_idx`` order. A group's
-    StateStore must therefore survive until its index-0 chunk has backwarded;
-    releasing it on the first (highest-index) backward breaks Fp/Fr recompute.
-    """
     return frozenset(c.group for c in unit.chunks if c.is_dependent and c.group_idx == 0)
 
 
@@ -196,12 +131,6 @@ def gen_unit_ops(
     fr_lead: int | None = None,
     bwd_lag: int | None = None,
 ) -> list[Op]:
-    """The unit-level op sequence one stage executes, in order.
-
-    Same shape as ``scheduler.gen_state_aware_1f1b_ops`` with units in place of
-    chunks; every stage must derive it from the same ``units`` to keep p2p
-    pairs aligned.
-    """
     if strategy not in STRATEGIES:
         raise ValueError(f"unknown strategy: {strategy!r}")
     keep, need_fr = classify_units(units, chunks, keep_last_k)
@@ -215,61 +144,3 @@ def gen_unit_ops(
     if not need_fr:
         return base
     return splice_recomputes(base, need_fr, fr_lead)
-
-
-# ---------------------------------------------------------------------------
-# Validators
-# ---------------------------------------------------------------------------
-
-
-def validate_units(units: Sequence[Unit], chunks: Sequence[Chunk]) -> list[str]:
-    """Every chunk appears in exactly one unit, and no unit spans two chunks of
-    one group."""
-    problems: list[str] = []
-    seen: list[int] = []
-    for u in units:
-        groups = [c.group for c in u.chunks if c.is_dependent]
-        if len(groups) != len(set(groups)):
-            problems.append(f"unit {u.unit_id} holds two chunks of the same group {groups}")
-        seen.extend(u.chunk_ids)
-
-    expected = sorted(c.chunk_id for c in chunks)
-    if sorted(seen) != expected:
-        missing = set(expected) - set(seen)
-        extra = set(seen) - set(expected)
-        problems.append(f"units do not tile the chunks: missing={sorted(missing)} extra={sorted(extra)}")
-    if len(seen) != len(set(seen)):
-        problems.append("a chunk appears in more than one unit")
-    return problems
-
-
-def validate_unit_backward_order(units: Sequence[Unit], ops: Sequence[Op]) -> list[str]:
-    """Every dependent unit's backward must follow all later-round units of its
-    groups.
-
-    A violation means dK/dV for that unit's members is incomplete when they
-    backward — a silently wrong gradient, not a crash. Unit-level analogue of
-    ``scheduler.validate_backward_order``.
-    """
-    by_id = {u.unit_id: u for u in units}
-    done: set[int] = set()
-    problems: list[str] = []
-    for kind, uid in ops:
-        if kind != "B":
-            continue
-        u = by_id[uid]
-        if u.is_dependent:
-            successors = [o.unit_id for o in units if o.groups & u.groups and o.round > u.round]
-            missing = [x for x in successors if x not in done]
-            if missing:
-                problems.append(
-                    f"backward order violated: unit {uid} (round {u.round}, groups {sorted(u.groups)}) "
-                    f"backwarded before later-round unit(s) {missing} -> incomplete gradient"
-                )
-        done.add(uid)
-    return problems
-
-
-def unit_lookup(units: Iterable[Unit]) -> dict[int, Unit]:
-    """``unit_id -> Unit``, for the execution layer."""
-    return {u.unit_id: u for u in units}

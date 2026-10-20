@@ -1,19 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Wire chunkflow's chunked attention into a built Megatron model.
-
-``ChunkedCoreAttention`` is a drop-in ``core_attention`` replacement: it splits
-each sequence into chunks and attends each chunk over the K/V of all chunks up
-to it, held in a per-layer ``StateStore``. Numerically identical to unchunked
-attention. ``install(model, chunk_size)`` swaps every ``core_attention``;
-``uninstall(model)`` restores.
-"""
 
 from __future__ import annotations
 
 import itertools
-from contextlib import contextmanager, nullcontext
-from typing import Iterator
 
 import torch
 from torch import nn
@@ -31,7 +21,6 @@ _ORIG_ATTR = "_chunkflow_original_core_attention"
 
 
 def split_sizes(total: int, chunk_size: int) -> list[int]:
-    """Chunk lengths covering ``total``; the tail keeps whatever is left."""
     if chunk_size <= 0 or chunk_size >= total:
         return [total]
     sizes = [chunk_size] * (total // chunk_size)
@@ -42,15 +31,6 @@ def split_sizes(total: int, chunk_size: int) -> list[int]:
 
 
 class ChunkedCoreAttention(nn.Module):
-    """core_attention replacement that runs attention chunk by chunk.
-
-    Shapes follow the THD convention ``[T, H, D]``. Each chunk's K/V go into a
-    StateStore and the chunk's queries attend over the accumulated cache ("q
-    short, kv long"). Sequence boundaries come from
-    ``packed_seq_params.cu_seqlens_q`` when present, otherwise the whole input
-    is treated as one sequence.
-    """
-
     def __init__(self, config, layer_number: int, chunk_size: int, softmax_scale=None, runtime=None, **kwargs):
         super().__init__()
         del kwargs
@@ -61,23 +41,6 @@ class ChunkedCoreAttention(nn.Module):
         self.runtime = runtime
 
     def _forward_unit(self, query, key, value, packed_seq_params) -> torch.Tensor:
-        """One attention call for a whole unit, each sequence over its own K/V.
-
-        A dependent sequence attends its group's earlier chunks plus its own; a
-        standalone one attends only its own. Both go into a single varlen call,
-        which is where the call-count saving comes from.
-
-        The store keeps a *detached leaf* per chunk rather than the live tensor.
-        Later chunks then read a leaf instead of chaining into this chunk's
-        graph, which is what lets the schedule backward one unit at a time --
-        with the live tensor, the second ``.backward()`` would hit "backward
-        through the graph a second time".
-
-        Detaching loses the gradient later chunks owe this chunk, so a hook adds
-        it back: by the time this unit backwards (the schedule goes descending),
-        the leaf has collected every later chunk's contribution, and the hook
-        folds it into the gradient flowing to the live tensor.
-        """
         from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
 
         unit = getattr(packed_seq_params, UNIT_ATTR, None)
@@ -95,28 +58,20 @@ class ChunkedCoreAttention(nn.Module):
                 continue
 
             store = self.runtime.store(self.layer_number, group)
-            if recompute:
-                # An Fp pass already put this chunk's K/V in the store as a leaf.
-                # Recompute only rebuilds this chunk's graph; re-putting would
-                # trip the store's ascending invariant.
-                states = store.lookup(group_idx)
-                leaf_k, leaf_v = states[-1].tensors["k"], states[-1].tensors["v"]
-            else:
-                leaf_k = k_own.detach().requires_grad_(True)
-                leaf_v = v_own.detach().requires_grad_(True)
-                store.put(group_idx, ChunkState({"k": leaf_k, "v": leaf_v}))
-            _fold_leaf_grad_into(k_own, leaf_k)
-            _fold_leaf_grad_into(v_own, leaf_v)
+            if not recompute:
+                store.put(
+                    group_idx,
+                    ChunkState({"k": k_own.detach().requires_grad_(True), "v": v_own.detach().requires_grad_(True)}),
+                )
+            states = store.lookup(group_idx)
+            _fold_leaf_grad_into(k_own, states[-1].tensors["k"])
+            _fold_leaf_grad_into(v_own, states[-1].tensors["v"])
 
-            earlier = store.lookup(group_idx)[:-1]  # this chunk's own entry is the leaf
+            earlier = states[:-1]
             ks.append(torch.cat([*(s.tensors["k"] for s in earlier), k_own], dim=0))
             vs.append(torch.cat([*(s.tensors["v"] for s in earlier), v_own], dim=0))
 
         device = query.device
-        # The unit batch is padded to an alignment multiple, so ``query`` can
-        # carry rows past cu[-1]. The kernel is given exactly the rows the
-        # cu_seqlens describe: a tensor longer than its own cu_seqlens is
-        # out-of-bounds by construction.
         query = query[: cu[-1]]
         cu_q = torch.tensor(cu, dtype=torch.int32, device=device)
         cu_kv = torch.tensor([0, *itertools.accumulate(t.shape[0] for t in ks)], dtype=torch.int32, device=device)
@@ -129,7 +84,6 @@ class ChunkedCoreAttention(nn.Module):
         return out
 
     def _attend_one_sequence(self, q, k, v) -> torch.Tensor:
-        """q/k/v: ``[T, H, D]`` for a single sequence. Returns ``[T, H, D]``."""
         store = StateStore()
         outs = []
         offset = 0
@@ -160,8 +114,6 @@ class ChunkedCoreAttention(nn.Module):
         if packed_seq_params is not None and getattr(packed_seq_params, UNIT_ATTR, None) is not None:
             padded_rows = query.shape[0]
             out = self._forward_unit(query, key, value, packed_seq_params).reshape(-1, query.shape[1] * query.shape[2])
-            # The unit batch is padded for alignment; the layer expects one
-            # output row per input row, and the pad rows' values are never read.
             if out.shape[0] < padded_rows:
                 out = torch.nn.functional.pad(out, (0, 0, 0, padded_rows - out.shape[0]))
             return out
@@ -182,21 +134,11 @@ class ChunkedCoreAttention(nn.Module):
 
 
 def _fold_leaf_grad_into(live: torch.Tensor, leaf: torch.Tensor) -> None:
-    """Add the leaf's accumulated gradient to ``live``'s on the way back.
-
-    ``live`` is detached into ``leaf`` for later chunks to read, so the
-    gradient they owe it never reaches ``live`` through the graph. By the time
-    ``live``'s own backward runs — the schedule descends — the leaf has every
-    later contribution, and this folds them in. One traversal, no second
-    backward.
-    """
-
+    # Descending backward folds later chunks' leaf gradients into this chunk.
     def hook(grad: torch.Tensor) -> torch.Tensor:
         return grad if leaf.grad is None else grad + leaf.grad
 
-    # An Fp forward runs under no_grad, so its k/v carry no gradient and cannot
-    # take a hook -- and they do not need one: the leaf holds the K/V and the
-    # gradient lands via the Fr pass's recomputed tensors, which do carry it.
+    # Fp has no graph; Fr attaches this hook to recomputed K/V.
     if live.requires_grad:
         live.register_hook(hook)
 
@@ -209,28 +151,18 @@ def _attention_modules(model):
 
 
 def install(model, chunk_size: int) -> int:
-    """Swap every ``core_attention`` for a chunked one.
-
-    Also attaches the runtime the unit mode needs — the stores that outlive a
-    single forward call live there. Returns how many layers were swapped.
-    """
     from relax.backends.megatron.chunkflow.runtime import attach_runtime
 
     backend = flash_backend_name()
     if backend == "fa3":
-        flash3_varlen_ops()  # Explicit selection must fail rather than silently use FA2.
+        flash3_varlen_ops()
     logger.info(f"chunkflow: flash attention backend={backend}")
     runtime = attach_runtime(model, chunk_size)
     from relax.backends.megatron.chunkflow import rope as chunkflow_rope
 
     chunkflow_rope.install()
 
-    # The unit path needs RoPE's unfused branch: it applies the position offset
-    # chunkflow patches in, while Transformer Engine's fused_rope kernel takes
-    # the padded cu_seqlens literally and reads past the frequency table (that
-    # is the illegal memory access at step 0, not an attention bug). The flag
-    # is read per forward, and install() runs after the model -- and therefore
-    # its config -- is built, so flipping it here takes effect everywhere.
+    # Chunk-local offsets require unfused RoPE.
     n = 0
     for attn in _attention_modules(model):
         if hasattr(attn, _ORIG_ATTR):
@@ -251,41 +183,10 @@ def install(model, chunk_size: int) -> int:
             cfg = getattr(module, "config", None)
             if cfg is not None and hasattr(cfg, "apply_rope_fusion") and id(cfg) not in seen_configs:
                 seen_configs.add(id(cfg))
-                runtime.baseline_rope_fusion.append((cfg, cfg.apply_rope_fusion))
                 cfg.apply_rope_fusion = False
         logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
     logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
     return n
-
-
-@contextmanager
-def baseline_attention(model, *, profile: bool = False) -> Iterator[None]:
-    """Restore original attention and RoPE for a complete fallback F/B pass."""
-    from relax.backends.megatron.chunkflow.runtime import require_runtime
-
-    runtime = require_runtime(model)
-    with torch.profiler.record_function("chunkflow.gate.prepare_fallback") if profile else nullcontext():
-        runtime.assert_empty("before baseline fallback")
-        layers = [
-            (a, a.core_attention, getattr(a, _ORIG_ATTR)) for a in _attention_modules(model) if hasattr(a, _ORIG_ATTR)
-        ]
-        if not layers:
-            raise RuntimeError("baseline fallback could not find the original attention modules")
-        rope = [(cfg, cfg.apply_rope_fusion, original) for cfg, original in runtime.baseline_rope_fusion]
-    try:
-        with torch.profiler.record_function("chunkflow.gate.swap_to_baseline") if profile else nullcontext():
-            for layer, _, original in layers:
-                layer.core_attention = original
-            for cfg, _, original in rope:
-                cfg.apply_rope_fusion = original
-        yield
-    finally:
-        with torch.profiler.record_function("chunkflow.gate.restore_chunkflow") if profile else nullcontext():
-            for layer, chunked, _ in layers:
-                layer.core_attention = chunked
-            for cfg, chunked, _ in rope:
-                cfg.apply_rope_fusion = chunked
-            runtime.assert_empty("after baseline fallback")
 
 
 def uninstall(model) -> int:

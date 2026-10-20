@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Adapt the installed FA3 interface to ChunkFlow's dropout-free FA2 calls."""
 
 from __future__ import annotations
 
@@ -21,8 +20,7 @@ def flash_backend_name() -> str:
 
 @lru_cache(maxsize=1)
 def flash3_varlen_ops() -> FlashOps:
-    # Import the exact namespace TE uses. Importing the top-level
-    # flash_attn_interface alias can register the same custom ops twice.
+    # Use TE's FA3 namespace to avoid duplicate custom-op registration.
     try:
         from flash_attn_3.flash_attn_interface import _flash_attn_backward, _flash_attn_forward
     except ImportError as exc:

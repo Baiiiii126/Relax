@@ -1,25 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Chunk construction and op ordering for chunkflow.
-
-Decides *what* runs and in *what order*; it executes nothing.
-
-``build_chunks``: split sequences longer than ``chunk_size`` into causally
-dependent chunks (a dependency group); bin-pack the short ones into standalone
-chunks. ``build_group_schedule`` / ``build_schedule``: keep only the last
-``keep_last_k`` chunks' activations; the earlier ones are recomputed (``Fr``)
-right before their own backward, and every group backwards descending (dK/dV
-accumulation must be complete before a chunk runs).
-
-The multi-stage layer (``classify_chunks``, ``make_bwd_order``,
-``gen_state_aware_1f1b_ops``) gives each pipeline stage its op sequence. Every
-input comes from sequence lengths, which every stage already has, so the plan
-is derived identically on each stage and p2p pairs stay aligned.
-
-``validate_schedule`` is the offline check a caller should run before driving
-real attention: a violation means silently wrong gradients, exactly what
-``StateStore`` enforces at runtime.
-"""
 
 from __future__ import annotations
 
@@ -28,24 +8,11 @@ from dataclasses import dataclass
 from typing import Sequence
 
 
-Op = tuple[str, int]  # ("F" | "Fp" | "Fr" | "B", chunk_id)
-
-# "F"  — normal forward, builds the graph (keeps the intermediate results / activation)
-# "Fp" — first-pass forward, keeps only K/V, discards the activation
-# "Fr" — recompute forward, right before this chunk's own backward
-# "B"  — backward
-FORWARD_KINDS = ("F", "Fp", "Fr")
+Op = tuple[str, int]
 
 
 @dataclass(frozen=True)
 class Segment:
-    """A contiguous run of tokens from one original sequence, inside a chunk.
-
-    ``prefix`` is how many tokens of this sequence precede this segment —
-    needed by a real attention op to know how much KV-cache history this
-    segment's queries must attend over.
-    """
-
     seq_id: int
     prefix: int
     length: int
@@ -53,14 +20,6 @@ class Segment:
 
 @dataclass
 class Chunk:
-    """One pipeline unit: one or more ``Segment``s packed together.
-
-    ``group`` is the id of the dependency group this chunk belongs to (the
-    originating long sequence's id), or ``None`` for a standalone chunk with no
-    ordering constraint. ``group_idx`` is this chunk's 0-based position within
-    the group, ascending.
-    """
-
     chunk_id: int
     segments: list[Segment]
     group: int | None = None
@@ -76,19 +35,7 @@ class Chunk:
         return self.group is not None
 
 
-# ---------------------------------------------------------------------------
-# Chunk construction (Algorithm 1)
-# ---------------------------------------------------------------------------
-
-
 def _bin_pack_min_bins(lengths: list[int], cap: int) -> list[list[int]]:
-    """Pack ``lengths`` into as few bins of capacity ``cap`` as possible.
-
-    Starts from the theoretical lower bound (``ceil(sum/cap)``) and tries best-
-    fit-decreasing at each bin count until one succeeds, so short sequences
-    that need no ordering constraint at all don't waste pipeline units one-per-
-    chunk.
-    """
     if not lengths:
         return []
     order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
@@ -119,51 +66,6 @@ def build_chunks(
     drop_tail: bool = False,
     drop_tail_max_tokens: int | None = None,
 ) -> list[Chunk]:
-    """Split/pack a batch of sequences (by length, 0-indexed) into chunks.
-
-    Sequences longer than ``chunk_size`` become an ascending dependency
-    group of ``ceil(length / chunk_size)`` chunks. Sequences at or under
-    ``chunk_size`` are bin-packed together into standalone chunks.
-
-    A long sequence's last chunk is often smaller than ``chunk_size`` (e.g.
-    a ``chunk_size + 2`` sequence produces one full chunk plus a lone
-    2-token tail) — pure overhead if left alone: that tiny chunk still
-    occupies a full pipeline unit *and* carries the group's ordering
-    constraint. ``repack_tail`` and ``drop_tail`` are two independent,
-    mutually exclusive switches for what to do about it — passing both
-    raises ``ValueError``; passing neither keeps that tiny tail chunk as-is
-    (the fragmentation defect described above).
-
-    ``repack_tail`` (default on): folds the tail into the short-sequence
-    packing pool instead (capped at one tail per chunk, so a chunk never
-    ends up belonging to two dependency groups at once). This trades memory
-    for it: those short sequences are no longer "free"
-    (forward-then-immediately-backward-and-free) — they must now wait for
-    the whole dependency group's forward pass to finish before the chunk
-    they share can backward. Prefer it on data that is strongly
-    long-tailed; on weakly long-tailed data the memory cost can outweigh
-    the pipeline-slot savings.
-
-    ``drop_tail`` (default off): discards the tail's tokens outright
-    instead of building a chunk for them at all — the sequence's
-    dependency group shrinks by one chunk (``group_size`` is adjusted to
-    match) and those trailing tokens never get a forward or backward.
-    This is **lossy**: if the tail happens to fall inside content that
-    matters (e.g. the final answer tokens or an EOS marker in an RL
-    response), that content silently never contributes to the loss for
-    this sequence. Only turn this on once you've confirmed the dropped
-    fragment doesn't matter for your data/objective — it buys the cheapest
-    possible fix (no extra chunk, no extra memory) at a correctness risk
-    that ``repack_tail`` doesn't carry.
-
-    ``drop_tail_max_tokens`` bounds how much ``drop_tail`` is allowed to
-    discard per sequence — dropping is meant for a handful of leftover
-    tokens, not for silently truncating a large fraction of a sequence. A
-    tail at or above this cap is **not** dropped; it falls through to the
-    same tiny-own-chunk behavior as if both switches were off. Defaults to
-    a quarter of ``chunk_size`` when left unset; ignored when ``drop_tail``
-    is off.
-    """
     if repack_tail and drop_tail:
         raise ValueError("repack_tail and drop_tail are mutually exclusive tail-handling strategies")
 
@@ -174,7 +76,7 @@ def build_chunks(
 
     chunks: list[Chunk] = []
     cid = 0
-    tails: list[tuple[int, int, int, int, int]] = []  # (seq_id, prefix, length, group_idx, group_size)
+    tails: list[tuple[int, int, int, int, int]] = []
 
     for seq_id in long_ids:
         length = seq_lengths[seq_id]
@@ -188,7 +90,7 @@ def build_chunks(
             seg_len = min(chunk_size, length - start)
             is_tail = i == num_chunks - 1 and seg_len < chunk_size
             if is_tail and should_drop_tail:
-                continue  # discard these trailing tokens entirely — see drop_tail docstring
+                continue
             if is_tail and repack_tail:
                 tails.append((seq_id, start, seg_len, i, group_size))
                 continue
@@ -211,8 +113,7 @@ def build_chunks(
             cid += 1
         return chunks
 
-    # Each tail claims its own slot first; short sequences best-fit into whatever's left.
-    slots: list[list] = [[t[2], t, []] for t in tails]  # [load, tail_or_None, [short idx, ...]]
+    slots: list[list] = [[t[2], t, []] for t in tails]
     free_cap = sum(max(0, chunk_size - slot[0]) for slot in slots)
     extra_slots = max(0, math.ceil(max(0, sum(short_lengths) - free_cap) / chunk_size))
     for _ in range(extra_slots):
@@ -248,8 +149,6 @@ def build_chunks(
 
 
 def group_of(chunks: Sequence[Chunk]) -> dict[int, list[Chunk]]:
-    """Gather dependent chunks by group id, each group sorted ascending by
-    ``group_idx``."""
     groups: dict[int, list[Chunk]] = {}
     for c in chunks:
         if c.is_dependent:
@@ -259,171 +158,10 @@ def group_of(chunks: Sequence[Chunk]) -> dict[int, list[Chunk]]:
     return groups
 
 
-# ---------------------------------------------------------------------------
-# Op-sequence generation (Algorithm 2, paper-prose semantics only)
-# ---------------------------------------------------------------------------
-
-
-def build_group_schedule(group: Sequence[Chunk], keep_last_k: int) -> list[Op]:
-    """Ascending-forward / descending-backward op sequence for one dependency
-    group.
-
-    If the group has at most ``keep_last_k`` chunks, every chunk simply
-    keeps its activation from the first forward (no recompute needed).
-    Otherwise, only the *last* ``keep_last_k`` chunks keep their activation;
-    the earlier ``N - keep_last_k`` are recomputed (``Fr``) immediately
-    before their own backward, processed in descending order — this is what
-    keeps the overall backward order strictly descending (see module
-    docstring for why the alternative, ascending-order reading, produces
-    incomplete gradients).
-    """
-    group = sorted(group, key=lambda c: c.group_idx)
-    n = len(group)
-
-    if n <= keep_last_k:
-        ops: list[Op] = [("F", c.chunk_id) for c in group]
-        ops.extend(("B", c.chunk_id) for c in reversed(group))
-        return ops
-
-    keep_ids = {c.chunk_id for c in group[n - keep_last_k :]}
-    drop_descending = list(reversed(group[: n - keep_last_k]))
-
-    ops = [(("F" if c.chunk_id in keep_ids else "Fp"), c.chunk_id) for c in group]
-    ops.extend(("B", c.chunk_id) for c in reversed(group) if c.chunk_id in keep_ids)
-    for c in drop_descending:
-        ops.append(("Fr", c.chunk_id))
-        ops.append(("B", c.chunk_id))
-    return ops
-
-
-def build_schedule(chunks: Sequence[Chunk], keep_last_k: int) -> list[Op]:
-    """Combine standalone chunks and every dependency group's schedule into one
-    PP=1-view op sequence."""
-    ops: list[Op] = []
-    for c in chunks:
-        if not c.is_dependent:
-            ops.append(("F", c.chunk_id))
-            ops.append(("B", c.chunk_id))
-    for _, group in sorted(group_of(chunks).items()):
-        ops.extend(build_group_schedule(group, keep_last_k))
-    return ops
-
-
-# ---------------------------------------------------------------------------
-# Validators — the offline counterpart to StateStore's runtime assertions
-# ---------------------------------------------------------------------------
-
-
-def validate_forward_order(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[str]:
-    """Every dependent chunk's forward must come after all lower-``group_idx``
-    chunks in its group."""
-    by_id = {c.chunk_id: c for c in chunks}
-    seen_fwd: set[int] = set()
-    problems: list[str] = []
-    for kind, cid in ops:
-        c = by_id[cid]
-        if kind in FORWARD_KINDS:
-            if c.is_dependent:
-                predecessors = [o.chunk_id for o in chunks if o.group == c.group and o.group_idx < c.group_idx]
-                missing = [x for x in predecessors if x not in seen_fwd]
-                if missing:
-                    problems.append(
-                        f"forward order violated: chunk {cid} (group {c.group}, idx {c.group_idx}) "
-                        f"forwarded before predecessor chunk(s) {missing}"
-                    )
-            seen_fwd.add(cid)
-    return problems
-
-
-def validate_backward_order(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[str]:
-    """Every dependent chunk's backward must come after all
-    higher-``group_idx`` chunks in its group.
-
-    A violation means dK/dV accumulation for the lower chunk is incomplete
-    (some later query chunk's contribution hasn't landed yet) — a silent wrong-
-    gradient bug, not a crash.
-    """
-    by_id = {c.chunk_id: c for c in chunks}
-    done_bwd: set[int] = set()
-    problems: list[str] = []
-    for kind, cid in ops:
-        c = by_id[cid]
-        if kind == "B":
-            if c.is_dependent:
-                successors = [o.chunk_id for o in chunks if o.group == c.group and o.group_idx > c.group_idx]
-                missing = [x for x in successors if x not in done_bwd]
-                if missing:
-                    problems.append(
-                        f"backward order violated: chunk {cid} (group {c.group}, idx {c.group_idx}) "
-                        f"backwarded before successor chunk(s) {missing} -> incomplete gradient"
-                    )
-            done_bwd.add(cid)
-    return problems
-
-
-def validate_completeness(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[str]:
-    """Every chunk must backward exactly once, and only after a graph-building
-    forward (F or Fr, not just Fp)."""
-    problems: list[str] = []
-    graph_fwd: set[int] = set()
-    bwd_count: dict[int, int] = {}
-    for kind, cid in ops:
-        if kind in ("F", "Fr"):
-            graph_fwd.add(cid)
-        elif kind == "B":
-            if cid not in graph_fwd:
-                problems.append(
-                    f"chunk {cid} backwarded without a prior graph-building forward (Fp alone isn't enough)"
-                )
-            bwd_count[cid] = bwd_count.get(cid, 0) + 1
-    for c in chunks:
-        count = bwd_count.get(c.chunk_id, 0)
-        if count != 1:
-            problems.append(f"chunk {c.chunk_id} backwarded {count} time(s) (expected exactly 1)")
-    return problems
-
-
-def validate_schedule(chunks: Sequence[Chunk], ops: Sequence[Op]) -> list[str]:
-    """Run all three checks; empty return means the schedule is safe to
-    execute."""
-    return (
-        validate_forward_order(chunks, ops) + validate_backward_order(chunks, ops) + validate_completeness(chunks, ops)
-    )
-
-
-# ---------------------------------------------------------------------------
-# Multi-stage view: how one stage's op sequence is laid out across a pipeline
-# ---------------------------------------------------------------------------
-#
-# Everything above is the single-GPU (PP=1) view. The functions below answer
-# "which ops does *this* stage execute, in what order" for a real pipeline —
-# the layer the module docstring calls "a separate, later layer".
-#
-# They are pure functions of the chunk list, and the chunk list is built from
-# sequence lengths, which every PP stage receives. That is what makes the
-# schedule derivable independently on each stage: the p2p send/recv pairs stay
-# aligned without anyone broadcasting the plan.
-#
-# Strategies control where a recompute op (``Fr``) lands, mirroring the paper's
-# Figure 6 discussion:
-#
-#   eager — Fr issued early (``fr_lead = 2*(pp - 1 - stage)``); crosses stage
-#           boundaries, so it overlaps.
-#   lazy  — Fr right before its own B but still waiting on the previous stage's
-#           Fr; serialises badly across stages.
-#   local — Fr right before its own B, recomputed from this stage's own Fp
-#           only; keeps eager's speed and lazy's activation peak.
-
 STRATEGIES = ("eager", "lazy", "local")
 
 
 def classify_chunks(chunks: Sequence[Chunk], keep_last_k: int) -> tuple[set[int], set[int]]:
-    """Split chunks into those that keep their first-pass activation and those
-    that must be recomputed (``Fr``) before their own backward.
-
-    Per Algorithm 2's paper-prose semantics: the *last* ``K`` chunks of each
-    dependency group keep; standalone chunks always keep (their N is 1).
-    """
     keep: set[int] = set()
     need_fr: set[int] = set()
     for _, members in sorted(group_of(chunks).items()):
@@ -439,31 +177,6 @@ def classify_chunks(chunks: Sequence[Chunk], keep_last_k: int) -> tuple[set[int]
     return keep, need_fr
 
 
-def make_bwd_order(chunks: Sequence[Chunk], fwd_order: Sequence[int]) -> list[int]:
-    """Global backward order for a given forward order.
-
-    A standalone chunk backwards immediately after its own forward. A
-    dependency group backwards (descending) only once every member has appeared
-    in ``fwd_order`` — that is the condition for the group's dK/dV accumulation
-    to be complete when its lowest chunk runs (see
-    ``validate_backward_order``).
-    """
-    by_id = {c.chunk_id: c for c in chunks}
-    groups = {g: [c.chunk_id for c in members] for g, members in group_of(chunks).items()}
-    seen: set[int] = set()
-    out: list[int] = []
-    for cid in fwd_order:
-        seen.add(cid)
-        c = by_id[cid]
-        if not c.is_dependent:
-            out.append(cid)
-            continue
-        members = groups[c.group]
-        if all(m in seen for m in members):
-            out.extend(reversed(members))
-    return out
-
-
 def interleave_1f1b(
     fwd_order: Sequence[int],
     bwd_order: Sequence[int],
@@ -472,13 +185,6 @@ def interleave_1f1b(
     stage: int,
     bwd_lag: int | None = None,
 ) -> list[Op]:
-    """Standard 1F1B warmup/steady interleave of two global orders.
-
-    Shared by the chunk-level and unit-level schedules rather than written
-    twice: the interleave does not care what the ids name, only that both
-    orders are global (every stage derives the same ones) and that
-    ``bwd_order`` is a permutation of ``fwd_order``.
-    """
     m, nb = len(fwd_order), len(bwd_order)
     base: list[Op] = []
     fi = bi = 0
@@ -504,20 +210,11 @@ def interleave_1f1b(
             base.append(("B", ub))
             bi += 1
         elif fi >= m and ub not in fpos:
-            break  # bwd_order isn't a permutation of fwd_order -- caller bug
+            break
     return base
 
 
 def splice_recomputes(base: Sequence[Op], need_fr: set[int], fr_lead: int) -> list[Op]:
-    """Insert an ``Fr`` for each dropped id, ``fr_lead`` ops ahead of its
-    ``B``.
-
-    ``fr_lead`` is how far ahead of the backward the recompute is issued — 0
-    for the local/lazy strategies (immediately before), larger for eager (so it
-    can overlap across a stage boundary). A recompute is only ever emitted
-    after the forward that produced this id's K/V; without that there would be
-    nothing to reuse and the recompute would be a wasted extra forward.
-    """
     out: list[Op] = []
     emitted: set[int] = set()
     fp_seen: set[int] = set()
@@ -531,36 +228,3 @@ def splice_recomputes(base: Sequence[Op], need_fr: set[int], fr_lead: int) -> li
         if op[0] == "Fp":
             fp_seen.add(op[1])
     return out
-
-
-def gen_state_aware_1f1b_ops(
-    chunks: Sequence[Chunk],
-    keep_last_k: int,
-    pp: int,
-    stage: int,
-    strategy: str = "local",
-    fr_lead: int | None = None,
-    bwd_lag: int | None = None,
-) -> list[Op]:
-    """The op sequence *one stage* executes, in order.
-
-    Four steps: classify chunks into keep (``F``) vs drop (``Fp``); build the
-    global backward order; run the standard 1F1B warmup/steady interleave over
-    it; splice an ``Fr`` in ``fr_lead`` ops ahead of each ``B`` that needs one.
-
-    Every stage must call this with the same ``chunks``/``keep_last_k``/``pp``
-    and with its own ``stage`` — that is what keeps p2p pairs aligned.
-    """
-    if strategy not in STRATEGIES:
-        raise ValueError(f"unknown strategy: {strategy!r}")
-    keep, need_fr = classify_chunks(chunks, keep_last_k)
-    fwd_order = [c.chunk_id for c in chunks]
-    bwd_order = make_bwd_order(chunks, fwd_order)
-
-    if fr_lead is None:
-        fr_lead = 2 * max(0, pp - stage - 1) if strategy == "eager" else 0
-
-    base = interleave_1f1b(fwd_order, bwd_order, keep, pp, stage, bwd_lag)
-    if not need_fr:
-        return base
-    return splice_recomputes(base, need_fr, fr_lead)

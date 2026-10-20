@@ -1,12 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU-only, row-weighted timeline model of blocking non-interleaved PP.
-
-Each stage has one compute stream. Communication is a FIFO rendezvous with
-separate shape/data phases, matching the executor's blocking calls. Network
-latency is zero; F costs padded_rows/128, B costs twice F, and Fr costs F.
-These are declared relative costs, not measured GPU time or a paper oracle.
-"""
+"""Relative costs: F=rows/128, B=2F, Fr=F; zero network latency."""
 
 from __future__ import annotations
 
@@ -26,7 +20,6 @@ if TYPE_CHECKING:
 def pipeline_plan(
     units: Sequence[Unit], chunks: Sequence[Chunk], keep_last_k: int
 ) -> tuple[list[int], list[int], set[int], int]:
-    """Orders and dependency delay shared by the executor and predictor."""
     standalone = [u.unit_id for u in units if not u.is_dependent]
     dependent = sorted((u for u in units if u.is_dependent), key=lambda u: u.round)
     fwd_seq = standalone + [u.unit_id for u in dependent]
@@ -66,8 +59,6 @@ def make_model_plan(units: Sequence[Unit], chunks: Sequence[Chunk], keep_last_k:
 
 
 def simulate(plans: Sequence[ModelPlan], pp_size: int) -> dict[str, Any]:
-    """Build the blocking execution DAG and return its critical-path
-    timeline."""
     if pp_size < 1:
         raise ValueError("pp_size must be positive")
     for plan in plans:
@@ -196,7 +187,6 @@ def simulate(plans: Sequence[ModelPlan], pp_size: int) -> dict[str, Any]:
 
 
 def predict_step(plans: Sequence[PlanTelemetry], pp_size: int) -> dict[str, Any]:
-    """Predict a whole step; baseline drains once, CF drains each parent."""
     if not plans or any(plan.model_plan is None for plan in plans):
         raise ValueError("schedule prediction needs nonempty plans captured with include_schedule=True")
     baseline_rows = {i: plan.input_rows for i, plan in enumerate(plans)}

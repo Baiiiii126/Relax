@@ -1,11 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Non-interleaved 1F1B over ChunkFlow execution units for PP>1.
-
-Each dependency group must finish forwarding before descending backward folds
-all later dK/dV contributions into its earlier chunks. Shared CPU plans add the
-dependency delay to pipeline warmup and align all stages' P2P calls.
-"""
 
 from __future__ import annotations
 
@@ -34,12 +28,6 @@ from relax.backends.megatron.chunkflow.units import completed_groups
 
 
 def _no_loss_step_func(forward_step_func):
-    """``forward_step_func`` with the loss replaced by a no-op.
-
-    An Fp unit needs its stage's output (the next stage computes its own
-    layers' K/V from it) but no loss -- nothing will backward it, and the
-    ``Fr`` pass is what recomputes a graph when one is needed.
-    """
 
     def no_loss(output_tensor):
         return output_tensor.reshape(-1)[0] * 0.0, torch.tensor(0, dtype=torch.int), {}
@@ -52,7 +40,6 @@ def _no_loss_step_func(forward_step_func):
 
 
 def _pipeline_schedule(units, chunks, keep_last_k, pp, stage):
-    """The per-stage plan: forward order, backward order, warmup depth."""
     fwd_seq, bwd_seq, need_fr, C = pipeline_plan(units, chunks, keep_last_k)
     W = min(C + (pp - stage - 1), len(fwd_seq))
     return fwd_seq, bwd_seq, need_fr, W
@@ -76,7 +63,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     force_all_reduce: Optional[bool] = False,
     **kwargs,
 ):
-    """Standard 1F1B structure, chunkflow units and order."""
     if forward_only:
         raise NotImplementedError("chunkflow pipeline schedule is training-only")
     if isinstance(model, list):
@@ -153,7 +139,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(recv_tensor_shapes, send_tensor_shapes)
 
-    # All passes run under no_sync; one grad sync at the end of the step.
+    # Synchronize gradients once, after all units.
     no_sync_func = config.no_sync_func or contextlib.nullcontext
 
     forward_data_store: list = []
@@ -207,62 +193,37 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
             n = len(fwd_seq)
 
             def do_forward(unit_id, input_tensor, mb_idx):
-                """One unit's forward through this stage.
-
-                Fp runs under no_grad (K/V only) and keeps the input for the
-                later recompute; F and Fr build a graph and take a loss.
-                """
                 nonlocal first_forward
                 unit = by_id[unit_id]
                 batch = slice_parent_batch(parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args)
                 batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
-                if unit_id in need_fr:
+                recompute = unit_id in need_fr
+                if recompute:
                     batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, False)
-                    with torch.no_grad():
-                        output_tensor, _ = forward_step(
-                            fp_step_func,
-                            iter([(batch, {})]),
-                            model,
-                            1,
-                            input_tensor,
-                            discarded,
-                            config,
-                            cp_group_size=cp_size,
-                            collect_non_loss_data=False,
-                            is_first_microbatch=first_forward,
-                            current_microbatch=mb_idx,
-                            is_last_stage=is_last,
-                        )
-                    first_forward = False
-                    return output_tensor, input_tensor, None
-                output_tensor, num_tokens = forward_step(
-                    forward_step_func,
-                    iter([(batch, {})]),
-                    model,
-                    1,
-                    input_tensor,
-                    forward_data_store,
-                    config,
-                    cp_group_size=cp_size,
-                    collect_non_loss_data=False,
-                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, first_forward),
-                    current_microbatch=mb_idx,
-                    is_last_stage=is_last,
-                )
+                with torch.no_grad() if recompute else contextlib.nullcontext():
+                    output_tensor, num_tokens = forward_step(
+                        fp_step_func if recompute else forward_step_func,
+                        iter([(batch, {})]),
+                        model,
+                        1,
+                        input_tensor,
+                        discarded if recompute else forward_data_store,
+                        config,
+                        cp_group_size=cp_size,
+                        collect_non_loss_data=False,
+                        is_first_microbatch=first_forward
+                        if recompute
+                        else check_first_val_step(first_val_step, forward_only, first_forward),
+                        current_microbatch=mb_idx,
+                        is_last_stage=is_last,
+                    )
                 first_forward = False
-                return output_tensor, input_tensor, num_tokens
+                return output_tensor, input_tensor, None if recompute else num_tokens
 
-            # (input, output) of keep units still owing a backward, and the input
-            # of recompute units until their Fr rebuilds a graph.
             in_flight: dict[int, tuple] = {}
             fp_inputs: dict[int, torch.Tensor] = {}
 
             def backward(unit_id, output_tensor_grad):
-                """One unit's backward.
-
-                A recompute unit rebuilds its graph first (Fr), reusing the K/V
-                leaf the Fp pass stored.
-                """
                 fr_num_tokens = None
                 if unit_id in need_fr:
                     input_tensor = fp_inputs.pop(unit_id)
@@ -286,9 +247,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         current_microbatch=mb_idx,
                         is_last_stage=is_last,
                     )
-                    # A keep unit's output was pseudo-freed right after it was
-                    # sent; the recompute's is fresh, so free it the same way
-                    # before backward_step -- custom_backward asserts on it.
+                    # Megatron custom_backward requires pseudo-freed outputs, including Fr.
                     deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
                 else:
                     input_tensor, output_tensor = in_flight.pop(unit_id)
@@ -297,7 +256,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                     runtime.release_group(group)
                 return input_tensor_grad, fr_num_tokens
 
-            # ── Warmup ────────────────────────────────────────────────────
             for i in range(W):
                 input_tensor = None if is_first else p2p_communicator.recv_forward(recv_tensor_shapes, is_first)
                 output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[i], input_tensor, mb_idx)
@@ -310,7 +268,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                     p2p_communicator.send_forward(output_tensor, is_last)
                 deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
-            # ── Steady 1F1B ────────────────────────────────────────────────
             n_steady = n - W
             input_tensor = None
             if n_steady > 0 and not is_first:
@@ -338,7 +295,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         input_tensor_grad, recv_tensor_shapes, is_first
                     )
 
-            # ── Cooldown ──────────────────────────────────────────────────
             for i in range(n_steady, n):
                 output_tensor_grad = None if is_last else p2p_communicator.recv_backward(send_tensor_shapes, is_last)
                 input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)

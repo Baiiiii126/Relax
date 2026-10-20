@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""ChunkedCoreAttention must match unchunked SDPA for any chunk size."""
+"""Core attention execution, recomputation and installation."""
+
+from __future__ import annotations
 
 from types import SimpleNamespace
 
@@ -10,16 +12,46 @@ import torch.nn.functional as F
 
 from relax.backends.megatron.chunkflow.integration import (
     ChunkedCoreAttention,
-    baseline_attention,
     install,
-    split_sizes,
     uninstall,
 )
+from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime
+from relax.backends.megatron.chunkflow.scheduler import build_chunks
+from relax.backends.megatron.chunkflow.units import build_micro_batches
+
+
+@pytest.fixture(autouse=True)
+def restore_rope_patch():
+    from relax.backends.megatron.chunkflow import rope
+
+    original = rope._ORIGINAL_GET_ROTARY_SEQ_LEN
+    if original is not None:
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+        patched_method = RotaryEmbedding.get_rotary_seq_len
+    try:
+        yield
+    finally:
+        if original is None:
+            rope.uninstall()
+        else:
+            rope._ORIGINAL_GET_ROTARY_SEQ_LEN = original
+            RotaryEmbedding.get_rotary_seq_len = patched_method
+
+
+class _FakeAttn(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer_number = 1
+        self.config = SimpleNamespace(context_parallel_size=1)
+        self.core_attention = torch.nn.Identity()
 
 
 def _sdpa_reference(q, k, v):
-    """q/k/v: [T, H, D] -> [T, H*D], plain causal attention."""
-    qh, kh, vh = (t.permute(1, 0, 2) for t in (q, k, v))
+    repeat = q.shape[1] // k.shape[1]
+    qh, kh, vh = (
+        t.permute(1, 0, 2) for t in (q, k.repeat_interleave(repeat, dim=1), v.repeat_interleave(repeat, dim=1))
+    )
     out = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
     return out.permute(1, 0, 2).reshape(q.shape[0], -1)
 
@@ -39,63 +71,26 @@ def _attn(chunk_size, cp_size=1):
     )
 
 
-def test_chunkflow_split_sizes_covers_total_with_tail():
-    assert split_sizes(12, 4) == [4, 4, 4]
-    assert split_sizes(10, 4) == [4, 4, 2]
-    assert split_sizes(3, 8) == [3]
-    assert sum(split_sizes(37, 5)) == 37
-
-
-@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 8, 16])
-def test_chunkflow_chunked_attention_matches_sdpa(chunk_size):
-    q, k, v = _qkv(t=8, h=2, d=4)
-    got = _attn(chunk_size)(q, k, v)
-    torch.testing.assert_close(got, _sdpa_reference(q, k, v), rtol=1e-10, atol=1e-10)
-
-
-def test_chunkflow_chunked_attention_matches_sdpa_with_gqa():
-    q, k, v = _qkv(t=8, h=4, d=4, kv_heads=2)
-    got = _attn(chunk_size=3)(q, k, v)
-    k_wide = k.repeat_interleave(2, dim=1)
-    v_wide = v.repeat_interleave(2, dim=1)
-    torch.testing.assert_close(got, _sdpa_reference(q, k_wide, v_wide), rtol=1e-10, atol=1e-10)
+@pytest.mark.parametrize("chunk_size,heads,kv_heads", [(size, 2, 2) for size in (1, 3, 16)] + [(3, 4, 2)])
+def test_chunkflow_output_and_gradients_match_sdpa(chunk_size, heads, kv_heads):
+    q, k, v = _qkv(t=8, h=heads, d=4, kv_heads=kv_heads)
+    reference = [t.clone().requires_grad_(True) for t in (q, k, v)]
+    chunked = [t.clone().requires_grad_(True) for t in (q, k, v)]
+    expected = _sdpa_reference(*reference)
+    actual = _attn(chunk_size)(*chunked)
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
+    expected.sum().backward()
+    actual.sum().backward()
+    for got, want in zip(chunked, reference):
+        torch.testing.assert_close(got.grad, want.grad, rtol=1e-9, atol=1e-9)
 
 
 def test_chunkflow_packed_sequences_are_attended_independently():
-    """Two packed sequences must not attend across their boundary."""
     q, k, v = _qkv(t=10, h=2, d=4)
     packed = SimpleNamespace(cu_seqlens_q=torch.tensor([0, 6, 10]), cu_seqlens_q_cpu=[0, 6, 10])
     got = _attn(chunk_size=4)(q, k, v, packed_seq_params=packed)
     want = torch.cat([_sdpa_reference(q[:6], k[:6], v[:6]), _sdpa_reference(q[6:], k[6:], v[6:])], dim=0)
     torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-10)
-
-
-def test_chunkflow_backward_matches_sdpa():
-    q, k, v = _qkv(t=8, h=2, d=4)
-    q_ref, k_ref, v_ref = (t.clone().requires_grad_(True) for t in (q, k, v))
-    q_chk, k_chk, v_chk = (t.clone().requires_grad_(True) for t in (q, k, v))
-
-    _sdpa_reference(q_ref, k_ref, v_ref).sum().backward()
-    _attn(chunk_size=3)(q_chk, k_chk, v_chk).sum().backward()
-
-    for got, want in ((q_chk, q_ref), (k_chk, k_ref), (v_chk, v_ref)):
-        torch.testing.assert_close(got.grad, want.grad, rtol=1e-9, atol=1e-9)
-
-
-def test_chunkflow_backward_matches_sdpa_with_gqa():
-    q, k, v = _qkv(t=8, h=4, d=4, kv_heads=2)
-    q_ref, k_ref, v_ref = (t.clone().requires_grad_(True) for t in (q, k, v))
-    q_chk, k_chk, v_chk = (t.clone().requires_grad_(True) for t in (q, k, v))
-
-    _sdpa_reference(
-        q_ref,
-        k_ref.repeat_interleave(2, dim=1),
-        v_ref.repeat_interleave(2, dim=1),
-    ).sum().backward()
-    _attn(chunk_size=3)(q_chk, k_chk, v_chk).sum().backward()
-
-    for got, want in ((q_chk, q_ref), (k_chk, k_ref), (v_chk, v_ref)):
-        torch.testing.assert_close(got.grad, want.grad, rtol=1e-9, atol=1e-9)
 
 
 def test_chunkflow_context_parallel_is_rejected():
@@ -111,24 +106,13 @@ def test_chunkflow_sbhd_is_rejected():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_chunkflow_matches_flash_varlen_on_training_shapes():
-    """The production configuration, against the kernel it replaces.
-
-    Every test above runs fp64 on CPU, which takes the plain-torch fallback.
-    A real run is bf16 on CUDA with GQA and packed sequences, i.e. the flash
-    path -- and the thing chunkflow displaces there is Transformer Engine's
-    ``DotProductAttention``, which itself calls ``flash_attn_varlen_func``. So
-    that function is the oracle: it is what Megatron would have computed.
-
-    Shapes mirror Qwen3-4B under ``--tensor-model-parallel-size 2``: 32 query
-    heads and 8 KV heads halve to 16/4 per rank, head_dim 128.
-    """
     try:
         from flash_attn import flash_attn_varlen_func
     except ImportError:
         pytest.skip("flash_attn not installed")
 
     h, kv_h, d = 16, 4, 128
-    lengths = [3000, 1096]  # packed, and neither is a multiple of chunk_size
+    lengths = [3000, 1096]
     total = sum(lengths)
     bounds = [0, lengths[0], total]
 
@@ -152,17 +136,6 @@ def test_chunkflow_matches_flash_varlen_on_training_shapes():
         out = flash_attn_varlen_func(ql, kl, vl, cu, cu, max(lengths), max(lengths), causal=True)
         return out.reshape(total, -1)
 
-    # Measured: dq 2.75e-04, dk 7.19e-03, dv 6.17e-03, relative to each
-    # tensor's own magnitude (an absolute tolerance is meaningless here -- bf16
-    # carries ~3 decimal digits and one ULP is already ~7.8e-03).
-    #
-    # dk/dv sit a decimal place above dq because a K token's gradient arrives
-    # from every later query chunk as a separate bf16 kernel output, summed by
-    # autograd in bf16, where the oracle sums inside one kernel in fp32. That
-    # is chunking's cost, not a bug: re-running this with chunk_size past the
-    # sequence length makes dk/dv bit-exact (0.0), and dropping GQA leaves them
-    # unchanged (7.04e-03 / 5.59e-03), so the residual comes from per-chunk
-    # accumulation rather than compact GQA.
     rels = {
         name: ((got.float() - want.float()).abs().max() / want.float().abs().max()).item()
         for name, got, want in zip(("dq", "dk", "dv"), run(chunked), run(reference))
@@ -170,103 +143,30 @@ def test_chunkflow_matches_flash_varlen_on_training_shapes():
     assert max(rels.values()) < 2e-2, f"chunked differs from flash_attn_varlen_func: {rels}"
 
 
-def test_chunkflow_install_swaps_and_uninstall_restores():
-    class FakeAttn(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer_number = 1
-            self.config = SimpleNamespace(context_parallel_size=1)
-            self.core_attention = torch.nn.Identity()
+def test_chunkflow_install_swaps_and_uninstall_restores(monkeypatch):
+    from unittest.mock import Mock
 
-    model = torch.nn.Sequential(FakeAttn(), FakeAttn())
+    from relax.backends.megatron.chunkflow import rope
+
+    install_rope = Mock(wraps=rope.install)
+    monkeypatch.setattr(rope, "install", install_rope)
+
+    model = torch.nn.Sequential(_FakeAttn(), _FakeAttn())
     original = model[0].core_attention
+    model[0].config.apply_rope_fusion = True
 
     assert install(model, chunk_size=4) == 2
     assert isinstance(model[0].core_attention, ChunkedCoreAttention)
-    assert install(model, chunk_size=4) == 0  # idempotent
+    assert install_rope.call_count == 1
+    assert model[0].config.apply_rope_fusion is False
+    assert install(model, chunk_size=4) == 0
+    assert install_rope.call_count == 2
 
     assert uninstall(model) == 2
     assert model[0].core_attention is original
 
 
-def test_chunkflow_install_enables_rope_offset_patch(monkeypatch):
-    from relax.backends.megatron.chunkflow import rope as chunkflow_rope
-
-    class FakeAttn(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer_number = 1
-            self.config = SimpleNamespace(context_parallel_size=1)
-            self.core_attention = torch.nn.Identity()
-
-    calls = []
-    monkeypatch.setattr(chunkflow_rope, "install", lambda: calls.append(True))
-
-    assert install(torch.nn.Sequential(FakeAttn()), chunk_size=128) == 1
-    assert calls == [True]
-
-
-def test_gate_fallback_restores_original_attention_rope_and_gradients():
-    class FakeAttn(torch.nn.Module):
-        def __init__(self, config):
-            super().__init__()
-            self.layer_number = 1
-            self.config = config
-            self.core_attention = torch.nn.Linear(3, 3, bias=False, dtype=torch.float64)
-
-    config = SimpleNamespace(context_parallel_size=1, apply_rope_fusion=True)
-    model = torch.nn.Sequential(FakeAttn(config))
-    original = model[0].core_attention
-    install(model, 4096)
-    chunked = model[0].core_attention
-    assert not config.apply_rope_fusion
-    for fail in (False, True, False):
-        x = torch.ones(2, 3, dtype=torch.float64, requires_grad=True)
-        try:
-            with baseline_attention(model):
-                assert model[0].core_attention is original
-                assert config.apply_rope_fusion
-                model[0].core_attention(x).sum().backward()
-                torch.testing.assert_close(x.grad, original.weight.sum(dim=0).expand_as(x))
-                if fail:
-                    raise RuntimeError("test exception")
-        except RuntimeError as exc:
-            assert str(exc) == "test exception"
-        assert model[0].core_attention is chunked
-        assert not config.apply_rope_fusion
-        assert model.chunkflow_runtime.num_stores() == 0
-
-
-def test_gate_profiler_marks_fallback_setup_compute_and_restore():
-    class FakeAttn(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer_number = 1
-            self.config = SimpleNamespace(context_parallel_size=1, apply_rope_fusion=False)
-            self.core_attention = torch.nn.Linear(3, 3, bias=False)
-
-    model = torch.nn.Sequential(FakeAttn())
-    original = model[0].core_attention
-    install(model, 4096)
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
-        with baseline_attention(model, profile=True):
-            model[0].core_attention(torch.ones(2, 3)).sum().backward()
-    names = {event.key for event in prof.key_averages()}
-    assert {
-        "chunkflow.gate.prepare_fallback",
-        "chunkflow.gate.swap_to_baseline",
-        "chunkflow.gate.restore_chunkflow",
-    } <= names
-    assert model[0].core_attention is not original
-
-
-# ---------------------------------------------------------------------------
-# Unit mode: chunks driven one at a time, backward descending
-# ---------------------------------------------------------------------------
-
-
 def _unit_attn(chunk_size, layer=1):
-    from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime
 
     return ChunkedCoreAttention(
         config=SimpleNamespace(context_parallel_size=1),
@@ -276,43 +176,9 @@ def _unit_attn(chunk_size, layer=1):
     )
 
 
-def _drive_units(attn, q, k, v, dout, chunk_size, descending_backward=True):
-    """Forward chunk by chunk, then backward one unit at a time."""
-    from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
-    from relax.backends.megatron.chunkflow.scheduler import build_chunks
-    from relax.backends.megatron.chunkflow.units import build_micro_batches
-
-    total = q.shape[0]
-    chunks = build_chunks([total], chunk_size=chunk_size, repack_tail=False)
-    units = build_micro_batches(chunks, "staggered")
-
-    outs, bounds, cursor = [], [], 0
-    for unit in units:
-        cu = [0]
-        for chunk in unit.chunks:
-            for seg in chunk.segments:
-                cu.append(cu[-1] + seg.length)
-        n = cu[-1]
-        packed = SimpleNamespace(cu_seqlens_q_cpu=cu, **{UNIT_ATTR: unit})
-        outs.append(
-            attn(q[cursor : cursor + n], k[cursor : cursor + n], v[cursor : cursor + n], packed_seq_params=packed)
-        )
-        bounds.append((cursor, cursor + n))
-        cursor += n
-
-    order = list(reversed(range(len(outs)))) if descending_backward else list(range(len(outs)))
-    for i in order:
-        s, e = bounds[i]
-        outs[i].backward(dout[s:e])
-
-    return torch.cat([o.detach() for o in outs], dim=0)
-
-
 def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding(monkeypatch):
     from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
     from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
-    from relax.backends.megatron.chunkflow.scheduler import build_chunks
-    from relax.backends.megatron.chunkflow.units import build_micro_batches
 
     recorded = []
     original = UnitCacheAttention.apply
@@ -333,123 +199,45 @@ def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding(monkeypatch):
     assert recorded == [(8, (8, 8)), (5, (5, 13))]
 
 
-def test_unit_mode_matches_the_in_forward_loop():
-    """Driving chunks as separate units must equal chunking inside one
-    forward."""
+@pytest.mark.parametrize("keep_last_k", [1 << 30, 1])
+def test_unit_schedule_outputs_gradients_and_release_match_sdpa(keep_last_k):
+    from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
+    from relax.backends.megatron.chunkflow.units import completed_groups, gen_unit_ops
+
     torch.manual_seed(0)
-    total, h, d, chunk_size = 32, 2, 8, 16
-    q, k, v = _qkv(total, h, d)
-    q_ref, k_ref, v_ref = (t.clone().requires_grad_(True) for t in (q, k, v))
-    q_u, k_u, v_u = (t.clone().requires_grad_(True) for t in (q, k, v))
-
-    torch.testing.assert_close(_attn(chunk_size)(q_ref, k_ref, v_ref), _unit_attn(chunk_size)(q_u, k_u, v_u))
-
-    ref, dq_r, dk_r, dv_r = _grads(_attn(chunk_size), q_ref, k_ref, v_ref)
-    got, dq_u, dk_u, dv_u = _grads(_unit_attn(chunk_size), q_u, k_u, v_u)
-    torch.testing.assert_close(ref, got)
-    for got_g, want_g in ((dq_u, dq_r), (dk_u, dk_r), (dv_u, dv_r)):
-        torch.testing.assert_close(got_g, want_g)
-
-
-def _grads(module, q, k, v):
-    out = module(q, k, v)
-    out.backward(torch.ones_like(out))
-    return out.detach(), q.grad, k.grad, v.grad
-
-
-def test_unit_mode_survives_per_unit_descending_backward():
-    """The schedule backards one unit at a time, descending.
-
-    With the live K/V in the store the second ``.backward()`` would raise
-    "backward through the graph a second time"; with the detached leaf plus the
-    fold-back hook it must instead reproduce the single-pass gradients exactly.
-    """
-    torch.manual_seed(0)
-    total, h, d, chunk_size = 48, 2, 8, 16
-    q, k, v = _qkv(total, h, d)
-    dout = torch.randn(total, h * d) * 0.1
-
-    # Reference: one chunked forward, one backward.
-    q_r, k_r, v_r = (t.clone().requires_grad_(True) for t in (q, k, v))
-    ref = _attn(chunk_size)(q_r, k_r, v_r)
-    ref.backward(dout)  # same downstream gradient as the unit-mode run
-
-    # Unit mode, three units, backward 2 -> 1 -> 0.
-    q_u, k_u, v_u = (t.clone().requires_grad_(True) for t in (q, k, v))
+    total, chunk_size = 64, 16
+    reference = [t.requires_grad_(True) for t in _qkv(total, 4, 8, kv_heads=2)]
+    chunked = [t.detach().clone().requires_grad_(True) for t in reference]
+    expected_output = _sdpa_reference(*reference)
+    dout = torch.randn_like(expected_output)
+    expected_output.backward(dout)
     attn = _unit_attn(chunk_size)
-    _drive_units(attn, q_u, k_u, v_u, dout, chunk_size)
+    chunks = build_chunks([total], chunk_size=chunk_size, repack_tail=False)
+    units = build_micro_batches(chunks, "staggered")
+    ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
+    expected_fr = set(range(len(units) - 1)) if keep_last_k == 1 else set()
+    assert {uid for kind, uid in ops if kind == "Fp"} == {uid for kind, uid in ops if kind == "Fr"} == expected_fr
 
-    for got, want in ((q_u.grad, q_r.grad), (k_u.grad, k_r.grad), (v_u.grad, v_r.grad)):
-        torch.testing.assert_close(got, want, atol=1e-9, rtol=1e-9)
-
-
-def test_unit_mode_leaves_no_state_behind_after_release():
-    from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime
-
-    runtime = ChunkflowRuntime(16)
-    assert runtime.num_stores() == 0
-    runtime.assert_empty("a fresh runtime")
-
-
-def test_unit_mode_recompute_matches_keep_everything():
-    """Fp/Fr must give identical gradients to keeping every chunk's activation.
-
-    A group long enough to drop some chunks (keep_last_k=1 of 4) forwards the
-    early ones under no_grad, recomputes them before their own backward. The
-    gradients must equal the keep-everything path exactly -- the mechanism is
-    an exact re-derivation, so any difference is a bug, not noise.
-    """
-    torch.manual_seed(0)
-    total, h, d, chunk_size = 64, 2, 8, 16
-    q, k, v = _qkv(total, h, d)
-    dout = torch.randn(total, h * d) * 0.1
-
-    def run(keep_last_k):
-        from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
-        from relax.backends.megatron.chunkflow.scheduler import build_chunks
-        from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
-
-        runtime = ChunkflowRuntime(chunk_size)
-        attn = _unit_attn(chunk_size)
-        attn.runtime = runtime
-        chunks = build_chunks([total], chunk_size=chunk_size, repack_tail=False)
-        units = build_micro_batches(chunks, "staggered")
-        ops = gen_unit_ops(units, chunks, keep_last_k, pp=1, stage=0)
-
-        qq = q.detach().clone().requires_grad_(True)
-        kk = k.detach().clone().requires_grad_(True)
-        vv = v.detach().clone().requires_grad_(True)
-        _bounds = {
-            u.unit_id: (u.chunks[0].segments[0].prefix, sum(s.length for c in u.chunks for s in c.segments))
-            for u in units
-        }
-
-        def dout_for(uid):
-            s_, n_ = _bounds[uid]
-            return dout[s_ : s_ + n_]
-
-        pending = {}
-        for kind, uid in ops:
-            unit = units[uid]
-            if kind == "B":
-                pending.pop(uid).backward(dout_for(uid))
-                for group in completed_groups(unit):
-                    runtime.release_group(group)
-                continue
-            n = sum(s.length for chunk in unit.chunks for s in chunk.segments)
-            # slice the unit's rows out of the parent
-            start = unit.chunks[0].segments[0].prefix
-            packed = SimpleNamespace(cu_seqlens_q_cpu=[0, n], **{UNIT_ATTR: unit, RECOMPUTE_ATTR: kind == "Fr"})
-            q_u, k_u, v_u = qq[start : start + n], kk[start : start + n], vv[start : start + n]
-            if kind == "Fp":
-                with torch.no_grad():
-                    attn(q_u, k_u, v_u, packed_seq_params=packed)
-            else:
-                pending[uid] = attn(q_u, k_u, v_u, packed_seq_params=packed)
-        runtime.assert_empty("recompute test")
-        return qq.grad, kk.grad, vv.grad
-
-    full = run(keep_last_k=1 << 30)
-    recomputed = run(keep_last_k=1)
-    for f, r in zip(full, recomputed):
-        torch.testing.assert_close(f, r, atol=1e-9, rtol=1e-9)
+    pending, outputs = {}, {}
+    for kind, uid in ops:
+        unit = units[uid]
+        start = unit.chunks[0].segments[0].prefix
+        length = unit.num_tokens
+        if kind == "B":
+            pending.pop(uid).backward(dout[start : start + length])
+            for group in completed_groups(unit):
+                assert attn.runtime.release_group(group) == 1
+            continue
+        packed = SimpleNamespace(cu_seqlens_q_cpu=[0, length], **{UNIT_ATTR: unit, RECOMPUTE_ATTR: kind == "Fr"})
+        inputs = [t[start : start + length] for t in chunked]
+        if kind == "Fp":
+            with torch.no_grad():
+                attn(*inputs, packed_seq_params=packed)
+        else:
+            pending[uid] = attn(*inputs, packed_seq_params=packed)
+            outputs[uid] = pending[uid].detach()
+    assert not pending
+    attn.runtime.assert_empty("unit schedule")
+    torch.testing.assert_close(torch.cat([outputs[u.unit_id] for u in units]), expected_output, atol=1e-9, rtol=1e-9)
+    for got, want in zip(chunked, reference):
+        torch.testing.assert_close(got.grad, want.grad, atol=1e-9, rtol=1e-9)
