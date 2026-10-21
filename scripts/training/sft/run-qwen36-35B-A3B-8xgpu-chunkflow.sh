@@ -21,6 +21,11 @@ LOGITS_CHUNK_SIZE="${LOGITS_CHUNK_SIZE:-2048}"
 CHUNK_SIZE="${CHUNK_SIZE:-4096}"
 KEEP_LAST_K="${KEEP_LAST_K:-0}"
 TRAIN_SEED="${TRAIN_SEED:-1235}"
+EP_SIZE="${EP_SIZE:-1}"
+if [ "${EP_SIZE}" != 1 ] && [ "${EP_SIZE}" != 2 ]; then
+   echo "ERROR: EP_SIZE must be 1 or 2 for TP2 / PP4 / ETP1 on 8 GPUs" >&2
+   exit 2
+fi
 for key in GBS NUM_ROLLOUT SEQ_LENGTH MAX_TOKENS_PER_GPU LOGITS_CHUNK_SIZE CHUNK_SIZE; do
    if ! [[ "${!key}" =~ ^[1-9][0-9]*$ ]]; then
       echo "ERROR: ${key} must be a positive integer" >&2
@@ -51,7 +56,7 @@ case "${CHUNKFLOW_PROFILE:-0}" in
 esac
 if [ "${NUM_GPUS:-8}" != 8 ] || [ "${TP_SIZE:-2}" != 2 ] || [ "${PP_SIZE:-4}" != 4 ] ||
    [ "${PACK_POLICY:-staggered}" != staggered ]; then
-   echo "ERROR: this example requires 8 GPUs, TP2 / PP4 / CP1 / EP1 and staggered packing" >&2
+   echo "ERROR: this example requires 8 GPUs, TP2 / PP4 / CP1 and staggered packing" >&2
    exit 2
 fi
 if [ "${MAX_TOKENS_PER_GPU}" -lt "${SEQ_LENGTH}" ]; then
@@ -81,7 +86,7 @@ if [ "${MODE}" = chunkflow ]; then
 fi
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/chunkflow-qwen36}"
-EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-${ARM}-gbs${GBS}-cap${MAX_TOKENS_PER_GPU}-s${NUM_ROLLOUT}}"
+EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-${ARM}-ep${EP_SIZE}-gbs${GBS}-cap${MAX_TOKENS_PER_GPU}-s${NUM_ROLLOUT}}"
 RUN_NAME="${RUN_NAME:-${EXP_NAME}-${now}}"
 LOG_FILE="${LOG_FILE:-log/${RUN_NAME}.log}"
 
@@ -132,7 +137,7 @@ TRAIN_ARGS=(
    --sequence-parallel
    --pipeline-model-parallel-size 4
    --context-parallel-size 1
-   --expert-model-parallel-size 1
+   --expert-model-parallel-size "${EP_SIZE}"
    --expert-tensor-parallel-size 1
    --recompute-granularity selective
    --recompute-modules gdn
@@ -169,7 +174,7 @@ if [ -n "${WORKING_DIR:-}" ]; then
    SUBMIT_ARGS+=(--working-dir "${WORKING_DIR}")
 fi
 mkdir -p "$(dirname -- "${LOG_FILE}")"
-echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=1 GBS=${GBS} STEPS=${NUM_ROLLOUT} SEED=${TRAIN_SEED} ARM=${ARM}"
+echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=${EP_SIZE} GBS=${GBS} STEPS=${NUM_ROLLOUT} SEED=${TRAIN_SEED} ARM=${ARM}"
 echo "LOG_FILE=${LOG_FILE}"
 if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
    echo "PROFILE_ROLLOUTS=${PROFILE_START}..${PROFILE_END} (0-based; includes profiler overhead)"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 from typing import Iterator, List, Optional, Union
 
 import torch
@@ -25,6 +26,34 @@ from relax.backends.megatron.chunkflow.schedule_model import pipeline_plan
 from relax.backends.megatron.chunkflow.telemetry import summarize_plan
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import completed_groups
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
+
+
+def _unit_shapes(unit, config, tp_group, cp_group, pp_group):
+    rows = (unit.num_tokens + 127) // 128 * 128
+    return tuple(
+        get_tensor_shapes(
+            seq_length=rows,
+            micro_batch_size=1,
+            decoder_seq_length=None,
+            config=config,
+            tp_group=tp_group,
+            cp_group=cp_group,
+            pp_group=pp_group,
+            is_recv=is_recv,
+        )
+        for is_recv in (True, False)
+    )
+
+
+def _check_tensor_shapes(tensors, expected) -> None:
+    tensors = tensors if isinstance(tensors, list) else [tensors]
+    shapes = [tuple(tensor.shape) for tensor in tensors]
+    if shapes != expected:
+        raise RuntimeError(f"ChunkFlow planned P2P shapes {expected} do not match tensor shapes {shapes}")
 
 
 def _no_loss_step_func(forward_step_func):
@@ -111,6 +140,19 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
 
     is_first = p2p_communicator.is_pp_first_stage
     is_last = p2p_communicator.is_pp_last_stage
+    planned_shapes = (
+        cp_size == 1
+        and adjust_tensor_shapes_fn is None
+        and not getattr(config, "mtp_standalone", False)
+        and not getattr(config, "enable_hyper_connections", False)
+    )
+    if planned_shapes:
+        p2p_communicator = copy.copy(p2p_communicator)
+        p2p_communicator.config = copy.copy(config)
+        p2p_communicator.config.variable_seq_lengths = False
+        if not getattr(runtime, "_planned_p2p_logged", False):
+            logger.info("chunkflow: planned P2P shapes enabled; skipping per-unit shape exchange")
+            runtime._planned_p2p_logged = True
 
     embedding_module = None
     if config.finalize_model_grads_func is not None:
@@ -164,6 +206,14 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
             parent = next_parent()
             chunks, units = _plan(parent, chunk_size, policy)
             by_id = {u.unit_id: u for u in units}
+            unit_shapes = {
+                unit.unit_id: _unit_shapes(
+                    unit, p2p_communicator.config, tp_group, cp_group, getattr(p2p_communicator, "pp_group", None)
+                )
+                if planned_shapes
+                else (recv_tensor_shapes, send_tensor_shapes)
+                for unit in units
+            }
             fwd_seq, bwd_seq, need_fr, dependency_delay = pipeline_plan(units, chunks, keep_last_k)
             warmup_depths = [
                 min(
@@ -218,6 +268,8 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         is_last_stage=is_last,
                     )
                 first_forward = False
+                if planned_shapes and not is_last:
+                    _check_tensor_shapes(output_tensor, unit_shapes[unit_id][1])
                 return output_tensor, input_tensor, None if recompute else num_tokens
 
             in_flight: dict[int, tuple] = {}
@@ -252,12 +304,16 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 else:
                     input_tensor, output_tensor = in_flight.pop(unit_id)
                 input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                if planned_shapes and not is_first:
+                    _check_tensor_shapes(input_tensor_grad, unit_shapes[unit_id][0])
                 for group in completed_groups(by_id[unit_id]):
                     runtime.release_group(group)
                 return input_tensor_grad, fr_num_tokens
 
             for i in range(W):
-                input_tensor = None if is_first else p2p_communicator.recv_forward(recv_tensor_shapes, is_first)
+                input_tensor = (
+                    None if is_first else p2p_communicator.recv_forward(unit_shapes[fwd_seq[i]][0], is_first)
+                )
                 output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[i], input_tensor, mb_idx)
                 if num_tokens is not None:
                     total_num_tokens += num_tokens
@@ -271,7 +327,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
             n_steady = n - W
             input_tensor = None
             if n_steady > 0 and not is_first:
-                input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes, is_first)
+                input_tensor = p2p_communicator.recv_forward(unit_shapes[fwd_seq[W]][0], is_first)
             for i in range(n_steady):
                 last_iter = i == n_steady - 1
                 output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[W + i], input_tensor, mb_idx)
@@ -281,7 +337,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 else:
                     fp_inputs[fwd_seq[W + i]] = fwd_input
                 output_tensor_grad = p2p_communicator.send_forward_recv_backward(
-                    output_tensor, send_tensor_shapes, is_last
+                    output_tensor, unit_shapes[bwd_seq[i]][1], is_last
                 )
                 deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
                 input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
@@ -292,11 +348,13 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         p2p_communicator.send_backward(input_tensor_grad, is_first)
                 else:
                     input_tensor = p2p_communicator.send_backward_recv_forward(
-                        input_tensor_grad, recv_tensor_shapes, is_first
+                        input_tensor_grad, unit_shapes[fwd_seq[W + i + 1]][0], is_first
                     )
 
             for i in range(n_steady, n):
-                output_tensor_grad = None if is_last else p2p_communicator.recv_backward(send_tensor_shapes, is_last)
+                output_tensor_grad = (
+                    None if is_last else p2p_communicator.recv_backward(unit_shapes[bwd_seq[i]][1], is_last)
+                )
                 input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
                 if fr_num_tokens is not None:
                     total_num_tokens += fr_num_tokens

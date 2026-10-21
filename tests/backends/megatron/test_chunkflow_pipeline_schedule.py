@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 
@@ -161,3 +162,132 @@ def test_pipeline_plan_is_complete_dependency_valid_and_deadlock_free(lengths, p
             assert forward_positions == sorted(forward_positions)
             assert backward_positions == sorted(backward_positions)
     _simulate(calls)
+
+
+@pytest.mark.parametrize("stage", range(4))
+@pytest.mark.parametrize("keep_last_k", [0, 1])
+def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k):
+    import torch
+    from megatron.training import global_vars
+
+    from relax.backends.megatron.chunkflow import pipeline_schedules as executor
+    from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
+    from relax.backends.megatron.chunkflow.schedules import _plan
+    from relax.backends.megatron.data import PrepackedBatch
+
+    config = SimpleNamespace(
+        variable_seq_lengths=True,
+        sequence_parallel=True,
+        hidden_size=4,
+        overlap_p2p_comm=False,
+        no_sync_func=None,
+        deallocate_pipeline_outputs=False,
+        grad_sync_func=None,
+        finalize_model_grads_func=None,
+    )
+    args = SimpleNamespace(
+        chunkflow_chunk_size=256,
+        chunkflow_pack_policy="staggered",
+        chunkflow_keep_last_k=keep_last_k,
+        data_pad_size_multiplier=128,
+        qkv_format="thd",
+        allgather_cp=False,
+    )
+    parents, forward_shapes, backward_shapes = [], [], []
+    for lengths in ([600, 350, 200, 129, 1], [513, 128, 33]):
+        cu = [0]
+        for length in lengths:
+            cu.append(cu[-1] + length)
+        tokens = torch.arange(cu[-1]).view(1, -1)
+        parent = PrepackedBatch(
+            tokens=tokens,
+            full_loss_masks=torch.ones_like(tokens),
+            total_lengths=lengths,
+            packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=cu),
+        )
+        parents.append(parent)
+        chunks, units = _plan(parent, 256, "staggered")
+        fwd, bwd, _, _ = _pipeline_schedule(units, chunks, keep_last_k or 1 << 30, 4, stage)
+        shapes = {u.unit_id: ((u.num_tokens + 127) // 128 * 64, 1, 4) for u in units}
+        forward_shapes.extend(shapes[uid] for uid in fwd)
+        backward_shapes.extend(shapes[uid] for uid in bwd)
+    assert len(set(forward_shapes)) > 1
+
+    class Communicator:
+        total_stages, current_stage = 4, stage
+        is_pp_first_stage, is_pp_last_stage = stage == 0, stage == 3
+        pp_group = SimpleNamespace(size=lambda: 4, rank=lambda: stage)
+
+        def __init__(self):
+            self.config = config
+            self.positions = defaultdict(int)
+
+        def receive(self, shapes, order, key):
+            assert self.config.variable_seq_lengths is False
+            expected = order[self.positions[key]]
+            self.positions[key] += 1
+            assert shapes == [expected]
+            return [torch.ones(expected)]
+
+        def send(self, tensors, order, key):
+            assert self.config.variable_seq_lengths is False
+            tensors = tensors if isinstance(tensors, list) else [tensors]
+            assert [tuple(t.shape) for t in tensors] == [order[self.positions[key]]]
+            self.positions[key] += 1
+
+        def recv_forward(self, shapes, first):
+            return None if first else self.receive(shapes, forward_shapes, "rf")
+
+        def recv_backward(self, shapes, last):
+            return None if last else self.receive(shapes, backward_shapes, "rb")
+
+        def send_forward(self, tensors, last):
+            if not last:
+                self.send(tensors, forward_shapes, "sf")
+
+        def send_backward(self, tensors, first):
+            if not first:
+                self.send(tensors, backward_shapes, "sb")
+
+        def send_forward_recv_backward(self, tensors, shapes, last):
+            self.send_forward(tensors, last)
+            return self.recv_backward(shapes, last)
+
+        def send_backward_recv_forward(self, tensors, shapes, first):
+            self.send_backward(tensors, first)
+            return self.recv_forward(shapes, first)
+
+    def forward(_callback, iterator, *_args, **_kwargs):
+        batch, _ = next(iterator)
+        unit = getattr(batch["packed_seq_params"], UNIT_ATTR)
+        shape = ((unit.num_tokens + 127) // 128 * 64, 1, 4)
+        return torch.ones(()) if stage == 3 else torch.ones(shape), torch.tensor(1)
+
+    real_zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: real_zeros(*a, **dict(kw, device="cpu")))
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(executor, "get_model_config", lambda _: config)
+    monkeypatch.setattr(executor, "forward_step", forward)
+    monkeypatch.setattr(executor, "deallocate_output_tensor", lambda *a: None)
+    monkeypatch.setattr(executor, "check_first_val_step", lambda *a: False)
+    monkeypatch.setattr(
+        executor,
+        "backward_step",
+        lambda inputs, *_: None if inputs is None else [torch.ones_like(t) for t in inputs],
+    )
+    model = SimpleNamespace(chunkflow_runtime=ChunkflowRuntime(256))
+    comm = Communicator()
+    executor.chunkflow_forward_backward_pipelining_without_interleaving(
+        forward_step_func=None,
+        data_iterator=iter((p, {}) for p in parents),
+        model=model,
+        num_microbatches=2,
+        seq_length=32768,
+        decoder_seq_length=32768,
+        micro_batch_size=1,
+        p2p_communicator=comm,
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1), tp=SimpleNamespace(size=lambda: 2)),
+    )
+    assert config.variable_seq_lengths is True and comm.config is config
+    for key, expected in (("sf", stage != 3), ("rf", stage != 0), ("sb", stage != 0), ("rb", stage != 3)):
+        assert comm.positions[key] == (len(forward_shapes) if expected else 0)
