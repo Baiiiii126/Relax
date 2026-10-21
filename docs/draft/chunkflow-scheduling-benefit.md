@@ -93,11 +93,15 @@ Megatron 须提供 `GatedDeltaNet._forward_compute`，FLA 的两个算子须支�
 在已同步代码的训练容器、仓库根目录运行：
 
 ```bash
+export MEGATRON="${MEGATRON:-/root/Megatron-LM}"
+export PYTHONPATH="${MEGATRON}:${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
 python3 -m pytest tests/backends/megatron/test_chunkflow_gdn.py -q -rs
 ```
 
 CPU 检查用独立 Torch 卷积和递推计算比较整段与分块的输出、输入梯度、参数梯度，
-覆盖仅末块有 loss、重计算、多序列隔离和 padding。需要 PyTorch 和 Megatron。
+覆盖仅末块有 loss、重计算、多序列隔离和 padding。fixture 模拟 Megatron 的 GDN 模块入口；
+这些状态桥接检查不依赖真实 Megatron 实现。训练仍需要镜像提供兼容的 Megatron，
+其路径由训练入口设置；直接运行 pytest 时需按上面命令设置。
 CUDA 检查使用真实 FLA 卷积与 GDN 算子、bf16 小型投影测试壳，覆盖 Fp/Fr 与仅末块 loss；
 按张量最大幅值设置 2% 相对/绝对容差。未检测到 GPU 时显式跳过。
 通过该检查仅代表 GDN 状态接口对齐；整模型、MoE、TP/PP 与优化器 step 仍须分别验证。

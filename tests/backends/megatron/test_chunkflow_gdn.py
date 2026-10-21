@@ -131,12 +131,12 @@ class GatedDeltaNet(torch.nn.Module):
 
 @pytest.fixture
 def kernels(monkeypatch):
-    import megatron.core.ssm
-
+    ssm = ModuleType("megatron.core.ssm")
     module = ModuleType("megatron.core.ssm.gated_delta_net")
     module.causal_conv1d, module.rule = _conv, _rule
+    ssm.gated_delta_net = module
+    monkeypatch.setitem(sys.modules, ssm.__name__, ssm)
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(megatron.core.ssm, "gated_delta_net", module, raising=False)
     return module
 
 
