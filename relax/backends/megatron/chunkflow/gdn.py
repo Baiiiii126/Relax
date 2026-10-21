@@ -51,7 +51,17 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
     @wraps(kernel)
     def call(*args, **kwargs):
         context = _ACTIVE.get()
-        if context is None or context.current is None:
+        if context is None:
+            return kernel(*args, **kwargs)
+        if context.current is None:
+            if "cu_seqlens_cpu" in signature.parameters:
+                bound = signature.bind(*args, **kwargs)
+                lengths = context.packed._chunkflow_gdn_lengths
+                if bound.arguments.get("cu_seqlens") is not None and (
+                    name != "conv" or bound.arguments["x"].shape[1] == lengths[0]
+                ):
+                    bound.arguments["cu_seqlens_cpu"] = lengths[2]
+                    return kernel(*bound.args, **bound.kwargs)
             return kernel(*args, **kwargs)
         bound = signature.bind(*args, **kwargs)
         if bound.arguments.get("cp_context") is not None:
@@ -100,13 +110,23 @@ def _wrap_forward(module: Any, original: Callable, runtime: ChunkflowRuntime, *,
             if getattr(packed, "qkv_format", None) != "thd":
                 raise NotImplementedError("ChunkFlow GDN requires packed THD inputs")
             total = bound.arguments["hidden_states"].shape[0] * module.sp_size
-            cu = list(packed.cu_seqlens_q_cpu)
-            if cu[0] != 0 or cu[-1] != unit.num_tokens or cu[-1] > total:
-                raise ValueError("GDN unit lengths do not match its packed input")
-            if cu[-1] < total:
-                cu.append(total)
+            lengths = getattr(packed, "_chunkflow_gdn_lengths", None)
+            if lengths is None:
+                cu = list(packed.cu_seqlens_q_cpu)
+                if cu[0] != 0 or cu[-1] != unit.num_tokens or cu[-1] > total:
+                    raise ValueError("GDN unit lengths do not match its packed input")
+                if cu[-1] < total:
+                    cu.append(total)
+                lengths = (
+                    total,
+                    torch.tensor(cu, dtype=torch.int32, device=packed.cu_seqlens_q.device),
+                    torch.tensor(cu, dtype=torch.int64),
+                )
+                packed._chunkflow_gdn_lengths = lengths
+            if lengths[0] != total:
+                raise ValueError("GDN physical unit length changed between layers")
             packed = copy.copy(packed)
-            packed.cu_seqlens_q = torch.tensor(cu, dtype=torch.int32, device=packed.cu_seqlens_q.device)
+            packed.cu_seqlens_q = lengths[1]
             packed.cu_seqlens_kv = packed.cu_seqlens_q
             packed.cu_seqlens_q_padded = packed.cu_seqlens_kv_padded = None
             packed._chunkflow_gdn_total = total

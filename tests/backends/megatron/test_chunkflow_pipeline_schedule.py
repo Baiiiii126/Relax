@@ -177,6 +177,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
 
     config = SimpleNamespace(
         variable_seq_lengths=True,
+        batch_p2p_comm=True,
         sequence_parallel=True,
         hidden_size=4,
         overlap_p2p_comm=False,
@@ -224,6 +225,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
 
         def receive(self, shapes, order, key):
             assert self.config.variable_seq_lengths is False
+            assert self.config.batch_p2p_comm is False
             expected = order[self.positions[key]]
             self.positions[key] += 1
             assert shapes == [expected]
@@ -231,6 +233,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
 
         def send(self, tensors, order, key):
             assert self.config.variable_seq_lengths is False
+            assert self.config.batch_p2p_comm is False
             tensors = tensors if isinstance(tensors, list) else [tensors]
             assert [tuple(t.shape) for t in tensors] == [order[self.positions[key]]]
             self.positions[key] += 1
@@ -289,5 +292,6 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1), tp=SimpleNamespace(size=lambda: 2)),
     )
     assert config.variable_seq_lengths is True and comm.config is config
+    assert config.batch_p2p_comm is True
     for key, expected in (("sf", stage != 3), ("rf", stage != 0), ("sb", stage != 0), ("rb", stage != 3)):
         assert comm.positions[key] == (len(forward_shapes) if expected else 0)

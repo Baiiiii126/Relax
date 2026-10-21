@@ -29,7 +29,11 @@ def _conv(
     activation=None,
     cu_seqlens=None,
     cp_context=None,
+    cu_seqlens_cpu=None,
 ):
+    if cu_seqlens_cpu is not None:
+        assert cu_seqlens_cpu.device.type == "cpu"
+        torch.testing.assert_close(cu_seqlens_cpu, cu_seqlens.cpu().long())
     outputs, states = [], []
     for index, (lo, hi) in enumerate(zip(_bounds(x, cu_seqlens)[:-1], _bounds(x, cu_seqlens)[1:])):
         state = (
@@ -45,7 +49,21 @@ def _conv(
     return torch.stack(outputs, dim=1), torch.cat(states) if output_final_state else None
 
 
-def _rule(q, k, v, g, beta, initial_state=None, output_final_state=False, cu_seqlens=None, cp_context=None):
+def _rule(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    initial_state=None,
+    output_final_state=False,
+    cu_seqlens=None,
+    cp_context=None,
+    cu_seqlens_cpu=None,
+):
+    if cu_seqlens_cpu is not None:
+        assert cu_seqlens_cpu.device.type == "cpu"
+        torch.testing.assert_close(cu_seqlens_cpu, cu_seqlens.cpu().long())
     outputs, states = [], []
     bounds = _bounds(q, cu_seqlens)
     for index, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
@@ -247,6 +265,44 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4):
 )
 def test_gdn_state_outputs_and_gradients_match_full_sequence(kernels, mode, chunk_size):
     _alignment(kernels, mode, chunk_size)
+
+
+def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels):
+    import inspect
+    from functools import wraps
+
+    received = []
+
+    @wraps(_rule)
+    def rule(*args, **kwargs):
+        received.append(inspect.signature(_rule).bind(*args, **kwargs).arguments.get("cu_seqlens_cpu"))
+        return _rule(*args, **kwargs)
+
+    kernels.rule = rule
+    model = GatedDeltaNet(kernels)
+    gdn.install(model, ChunkflowRuntime(4))
+    unit = build_micro_batches(build_chunks([2, 1], 4, repack_tail=False), "staggered")[0]
+    packed = _packed([2, 1], unit)
+    x = torch.randn(6, 1, 8)
+    first = model(x, packed_seq_params=packed)
+    metadata = packed._chunkflow_gdn_lengths
+    second = model(x, packed_seq_params=packed)
+    assert packed._chunkflow_gdn_lengths is metadata
+    assert len(received) == 2 and all(value is metadata[2] for value in received)
+    assert metadata[2].tolist() == [0, 2, 3, 6]
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    token = gdn._ACTIVE.set(gdn._Context(model, SimpleNamespace(_chunkflow_gdn_lengths=metadata)))
+    try:
+        conv = gdn._wrap_kernel(_conv, "conv")
+        # Matching physical boundaries can share CPU metadata; extra conv padding must bypass it.
+        for length in (6, 9):
+            cu = metadata[1].clone()
+            cu[-1] = length
+            conv(torch.randn(1, length, 24), model.weight, model.bias, cu_seqlens=cu)
+    finally:
+        gdn._ACTIVE.reset(token)
+    with pytest.raises(ValueError, match="physical unit length changed"):
+        model(torch.randn(7, 1, 8), packed_seq_params=packed)
 
 
 @pytest.mark.parametrize(

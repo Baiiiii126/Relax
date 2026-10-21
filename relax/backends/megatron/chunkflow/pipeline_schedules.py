@@ -150,8 +150,10 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
         p2p_communicator = copy.copy(p2p_communicator)
         p2p_communicator.config = copy.copy(config)
         p2p_communicator.config.variable_seq_lengths = False
+        # Native individual P2P waits on requests without the batched API's device-wide sync.
+        p2p_communicator.config.batch_p2p_comm = False
         if not getattr(runtime, "_planned_p2p_logged", False):
-            logger.info("chunkflow: planned P2P shapes enabled; skipping per-unit shape exchange")
+            logger.info("chunkflow: planned P2P shapes enabled; individual P2P skips shape exchange and batched sync")
             runtime._planned_p2p_logged = True
 
     embedding_module = None
