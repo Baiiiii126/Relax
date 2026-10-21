@@ -158,8 +158,12 @@ def install(model, chunk_size: int) -> int:
         flash3_varlen_ops()
     logger.info(f"chunkflow: flash attention backend={backend}")
     runtime = attach_runtime(model, chunk_size)
+    from relax.backends.megatron.chunkflow import gdn
     from relax.backends.megatron.chunkflow import rope as chunkflow_rope
 
+    gdn_layers = gdn.install(model, runtime)
+    if gdn_layers:
+        logger.info("chunkflow: stateful GDN installed on %d layer(s)", gdn_layers)
     chunkflow_rope.install()
 
     # Chunk-local offsets require unfused RoPE.
@@ -190,6 +194,9 @@ def install(model, chunk_size: int) -> int:
 
 
 def uninstall(model) -> int:
+    from relax.backends.megatron.chunkflow import gdn
+
+    gdn.uninstall(model)
     n = 0
     for attn in _attention_modules(model):
         original = getattr(attn, _ORIG_ATTR, None)
