@@ -51,7 +51,7 @@ def _num_microbatches(num_microbatches) -> int:
 def _forward_kwargs(batch: dict) -> dict:
     return {
         "input_ids": batch["tokens"],
-        "position_ids": None,
+        "position_ids": batch.get("position_ids"),
         "attention_mask": None,
         "labels": None,
         "packed_seq_params": batch["packed_seq_params"],

@@ -1098,7 +1098,7 @@ def train_one_step(
 
             forward_kwargs = {
                 "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
-                "position_ids": None,
+                "position_ids": batch.get("position_ids"),
                 "attention_mask": None,
                 "labels": None,
                 "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -123,6 +124,61 @@ def test_lockstep_dependent_units_fail_closed_until_per_segment_rope_exists():
 
     with pytest.raises(NotImplementedError, match="per-segment RoPE offsets"):
         _rope_offsets(merged)
+
+
+def test_bridge_chunk_positions_and_padding_match_full_sequence():
+    bridge_rope = pytest.importorskip("megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope")
+    from relax.backends.megatron.chunkflow.schedules import _forward_kwargs
+
+    parent = _parent([301, 301, 11, 13])
+    units, _ = _units(parent["total_lengths"], 128)
+    full_positions, _ = bridge_rope.get_rope_index(
+        1, -1, -2, -3, parent["tokens"], packed_seq_params=parent["packed_seq_params"]
+    )
+    rope = bridge_rope.Qwen3VLMultimodalRotaryEmbedding.__new__(bridge_rope.Qwen3VLMultimodalRotaryEmbedding)
+    torch.nn.Module.__init__(rope)
+    rope.inv_freq = 1 / (1_000_000 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
+    rope.seq_len_interpolation_factor = None
+    rope.cp_group = SimpleNamespace(size=lambda: 1)
+    rope.is_thd_format = True
+    config = SimpleNamespace(apply_rope_fusion=False, apply_rotary_pos_emb_in_fp32=True, rotary_interleaved=False)
+    full_input = torch.randn(parent["tokens"].numel(), 2, 64, requires_grad=True)
+    full_output = bridge_rope.apply_rotary_pos_emb_absolute(
+        full_input, rope(full_positions, [11, 11, 10]), config, parent["packed_seq_params"].cu_seqlens_q
+    )
+    full_output.sum().backward()
+    saw_packed = saw_prefix = saw_padding = False
+    for unit in units:
+        batch = slice_parent_batch(parent, unit, pad_token_id=PAD, args=SimpleNamespace(uses_unsplit_forward=True))
+        packed = batch["packed_seq_params"]
+        rows = _rows_for_unit(parent["packed_seq_params"].cu_seqlens_q_cpu, unit)
+        real = sum(end - start for start, end in rows)
+        physical = batch["tokens"].numel()
+        expected = torch.cat([full_positions[..., start:end] for start, end in rows], dim=-1)
+        torch.testing.assert_close(batch["position_ids"][..., :real], expected)
+        assert batch["position_ids"].shape == (3, 1, physical)
+        assert (batch["position_ids"][..., real:] == 1).all()
+        assert _forward_kwargs(batch)["position_ids"] is batch["position_ids"]
+        physical_cu = packed.cu_seqlens_q_padded.tolist()
+        assert physical_cu == [*packed.cu_seqlens_q_cpu[:-1], physical]
+        assert packed.max_seqlen_q == max(b - a for a, b in zip(physical_cu[:-1], physical_cu[1:]))
+        mask = bridge_rope.get_packed_seq_attention_mask(batch["tokens"], packed)
+        assert mask.sum() == real
+        assert not mask[..., real:].any()
+        chunk_input = torch.cat([full_input.detach()[start:end] for start, end in rows])
+        chunk_input = torch.cat([chunk_input, chunk_input.new_zeros(physical - real, 2, 64)]).requires_grad_()
+        output = bridge_rope.apply_rotary_pos_emb_absolute(
+            chunk_input, rope(batch["position_ids"], [11, 11, 10], packed), config, packed.cu_seqlens_q_padded
+        )
+        torch.testing.assert_close(output[:real], torch.cat([full_output[start:end] for start, end in rows]))
+        output[:real].sum().backward()
+        torch.testing.assert_close(
+            chunk_input.grad[:real], torch.cat([full_input.grad[start:end] for start, end in rows])
+        )
+        saw_packed |= len(rows) > 1
+        saw_prefix |= any(_rope_offsets(unit))
+        saw_padding |= physical > real
+    assert saw_packed and saw_prefix and saw_padding
 
 
 HEAD_DIM = 64

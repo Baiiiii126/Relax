@@ -78,7 +78,10 @@ def slice_parent_batch(
 
     # RoPE uses sequence-local prefixes, not packed row offsets.
     offsets = _rope_offsets(unit)
-    packed = _build_packed_seq_params(unit_tokens, lengths, offsets)
+    use_mrope = getattr(args, "uses_unsplit_forward", False)
+    if use_mrope and parent.get("multimodal_train_inputs"):
+        raise NotImplementedError("ChunkFlow explicit MRoPE positions currently support text-only batches")
+    packed = _build_packed_seq_params(unit_tokens, lengths, [0] * len(offsets) if use_mrope else offsets)
 
     from relax.backends.megatron.data import PrepackedBatch
 
@@ -96,6 +99,22 @@ def slice_parent_batch(
             "packed_seq_params": packed,
         }
     )
+    if use_mrope:
+        # Bridge consumes physical packing boundaries and explicit [3, B, T] positions separately.
+        physical_cu = list(packed.cu_seqlens_q_cpu)
+        physical_cu[-1] = unit_tokens.size(0)
+        packed.cu_seqlens_q_padded = torch.tensor(physical_cu, dtype=torch.int32, device=unit_tokens.device)
+        packed.cu_seqlens_kv_padded = packed.cu_seqlens_q_padded
+        packed.max_seqlen_q = packed.max_seqlen_kv = max([*lengths[:-1], lengths[-1] + pad])
+        positions = torch.cat(
+            [
+                torch.arange(offset, offset + length, device=unit_tokens.device)
+                for offset, length in zip(offsets, lengths)
+            ]
+        )
+        if pad:
+            positions = torch.cat([positions, positions.new_ones(pad)])
+        batch["position_ids"] = positions.view(1, 1, -1).expand(3, 1, -1)
 
     _slice_response_aligned_keys(parent, batch, rows)
     for key in ("__is_dummy__", "__loss_scale__", "replay_micro_batch_index"):
