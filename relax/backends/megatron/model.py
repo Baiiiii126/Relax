@@ -1068,6 +1068,10 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
+        if os.environ.get("RELAX_CHUNKFLOW_LAYER_TRACE") == "1":
+            from relax.backends.megatron.chunkflow.layer_diagnostics import set_batch
+
+            set_batch(batch)
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 

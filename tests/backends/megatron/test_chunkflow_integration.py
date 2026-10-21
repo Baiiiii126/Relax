@@ -176,6 +176,26 @@ def _unit_attn(chunk_size, layer=1):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
+def test_te_empty_expert_preserves_accumulated_gradient():
+    te = pytest.importorskip("transformer_engine.pytorch")
+    model = te.GroupedLinear(
+        2, 16, 16, bias=False, params_dtype=torch.float32, fuse_wgrad_accumulation=True, device="cuda"
+    )
+    weights = [model.weight0, model.weight1]
+    for weight in weights:
+        weight.main_grad = torch.zeros_like(weight)
+    inputs = [torch.arange(n * 16, device="cuda", dtype=torch.float32).reshape(n, 16) / 16 for n in (2, 3)]
+    outputs = [model(inputs[0], [2, 0], is_first_microbatch=None), model(inputs[1], [0, 3], is_first_microbatch=None)]
+    outputs[1].sum().backward()
+    accumulated = weights[1].main_grad.clone()
+    outputs[0].sum().backward()
+    torch.testing.assert_close(weights[1].main_grad, accumulated, rtol=0, atol=0)
+    for weight, x in zip(weights, inputs):
+        expected = x.sum(dim=0).expand_as(weight)
+        torch.testing.assert_close(weight.main_grad, expected, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("original_cache_disabled", [False, True])
 def test_reversed_backward_preserves_fused_weight_gradients(original_cache_disabled):
     class FusedLinear(torch.autograd.Function):

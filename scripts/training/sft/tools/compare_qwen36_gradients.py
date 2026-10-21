@@ -11,13 +11,13 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def compare(folder: Path) -> None:
+def compare(folder: Path, rollouts: tuple[int, ...] = (0, 1, 2, 8)) -> None:
     import torch
 
     base, chunk = (folder / arm / "diagnostics" for arm in ("baseline", "chunkflow"))
     files = {p.name for p in base.glob("grad_*.pt")} | {p.name for p in chunk.glob("grad_*.pt")}
     issues, rows = [], []
-    expected = {f"grad_r{rollout}_s0_rank{rank}.pt" for rollout in (0, 1, 2, 8) for rank in range(8)}
+    expected = {f"grad_r{rollout}_s0_rank{rank}.pt" for rollout in rollouts for rank in range(8)}
     issues.extend(f"Expected snapshot absent in both arms: {name}" for name in sorted(expected - files))
     for name in sorted(files):
         if not (base / name).exists() or not (chunk / name).exists():
@@ -30,6 +30,8 @@ def compare(folder: Path) -> None:
                 issues.append(f"Missing parameter: {name}: {key}")
                 continue
             x, y = b[key], c[key]
+            if y.get("overwrite_main_grad", False):
+                issues.append(f"ChunkFlow overwrite_main_grad is enabled: {name}: {key}")
             if any(x.get(k) != y.get(k) for k in ("shape", "group", "source", "dtype", "sample_count")):
                 issues.append(f"Metadata mismatch: {name}: {key}")
                 continue
@@ -125,4 +127,6 @@ def compare(folder: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
-    compare(parser.parse_args().folder)
+    parser.add_argument("--rollouts", default="0,1,2,8")
+    args = parser.parse_args()
+    compare(args.folder, tuple(int(value) for value in args.rollouts.split(",")))

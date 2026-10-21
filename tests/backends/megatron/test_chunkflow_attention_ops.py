@@ -191,7 +191,11 @@ def test_fa3_adapter_preserves_gqa_gradients_and_forward_backend(monkeypatch, ch
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 numeric validation requires a CUDA GPU")
-def test_unit_fa3_matches_cuda_reference(monkeypatch, fa3_backend):
+@pytest.mark.parametrize(
+    "bounds_q,bounds_k,heads,kv_heads,dim",
+    [([0, 17, 26], [0, 40, 53], 16, 4, 128), ([0, 6144, 8192], [0, 6144, 8192], 8, 1, 256)],
+)
+def test_unit_fa3_matches_cuda_reference(monkeypatch, fa3_backend, bounds_q, bounds_k, heads, kv_heads, dim):
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("requires the Hopper FA3 build used by this experiment")
     try:
@@ -208,26 +212,28 @@ def test_unit_fa3_matches_cuda_reference(monkeypatch, fa3_backend):
         if isinstance(exc.__cause__, ImportError):
             pytest.skip("optional FA3 interface is not installed")
         raise
-    bounds_q, bounds_k = [0, 17, 26], [0, 40, 53]
+    max_q = max(b - a for a, b in zip(bounds_q[:-1], bounds_q[1:]))
+    max_k = max(b - a for a, b in zip(bounds_k[:-1], bounds_k[1:]))
     cu_q = torch.tensor(bounds_q, device="cuda", dtype=torch.int32)
     cu_k = torch.tensor(bounds_k, device="cuda", dtype=torch.int32)
     generator = torch.Generator(device="cuda").manual_seed(1234)
     q, k, v = (
-        torch.randn(n, h, 128, device="cuda", dtype=torch.bfloat16, generator=generator, requires_grad=True)
-        for n, h in ((26, 16), (53, 4), (53, 4))
+        torch.randn(n, h, dim, device="cuda", dtype=torch.bfloat16, generator=generator, requires_grad=True)
+        for n, h in ((bounds_q[-1], heads), (bounds_k[-1], kv_heads), (bounds_k[-1], kv_heads))
     )
     qr, kr, vr = (tensor.detach().clone().requires_grad_(True) for tensor in (q, k, v))
     parts = [k[a:b] for a, b in zip(bounds_k[:-1], bounds_k[1:])]
     values = [v[a:b] for a, b in zip(bounds_k[:-1], bounds_k[1:])]
     from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
 
-    result, _ = UnitCacheAttention.apply(q, True, 128**-0.5, cu_q, cu_k, *parts, *values, (17, 40))
-    expected = flash_attn_varlen_func(qr, kr, vr, cu_q, cu_k, 17, 40, causal=True)
+    result, _ = UnitCacheAttention.apply(q, True, dim**-0.5, cu_q, cu_k, *parts, *values, (max_q, max_k))
+    expected = flash_attn_varlen_func(qr, kr, vr, cu_q, cu_k, max_q, max_k, causal=True)
     dout = torch.randn_like(result)
     result.backward(dout)
     expected.backward(dout)
     for actual, wanted in ((result, expected), (q.grad, qr.grad), (k.grad, kr.grad), (v.grad, vr.grad)):
         torch.testing.assert_close(actual, wanted, atol=0.02, rtol=0.02)
+        assert (actual.float() - wanted.float()).norm() / wanted.float().norm() < 0.03
 
 
 def test_schedule_reuses_runtime_installed_below_model_wrappers():

@@ -72,6 +72,10 @@ def trace_gdn_calls(models: Any, rollout_id: int) -> Iterator[None]:
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"backend_rank{_rank()}.jsonl"
     with ExitStack() as restore:
+        if os.environ.get("RELAX_CHUNKFLOW_LAYER_TRACE") == "1":
+            from relax.backends.megatron.chunkflow.layer_diagnostics import trace_layers
+
+            restore.enter_context(trace_layers(models, folder, rollout_id, _rank()))
         token = _ACTIVE.set((path, rollout_id, set()))
         restore.callback(_ACTIVE.reset, token)
         for index, model in enumerate(models):
@@ -131,7 +135,13 @@ def capture_gradients(models: Any, rollout_id: int, step_id: int) -> None:
                 grad, source = parameter.grad, "grad"
             prefixes = [prefix for prefix in groups if not prefix or name.startswith(prefix + ".")]
             group = groups[max(prefixes, key=len)] if prefixes else "other"
-            row = {"group": group, "shape": list(parameter.shape), "source": source, "missing": grad is None}
+            row = {
+                "group": group,
+                "shape": list(parameter.shape),
+                "source": source,
+                "missing": grad is None,
+                "overwrite_main_grad": bool(getattr(parameter, "overwrite_main_grad", False)),
+            }
             if grad is not None:
                 flat = grad.detach().reshape(-1)
                 count = min(64, flat.numel())

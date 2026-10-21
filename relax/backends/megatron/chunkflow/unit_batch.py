@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 
 import torch
@@ -117,6 +118,10 @@ def slice_parent_batch(
         batch["position_ids"] = positions.view(1, 1, -1).expand(3, 1, -1)
 
     _slice_response_aligned_keys(parent, batch, rows)
+    if os.environ.get("RELAX_CHUNKFLOW_LAYER_TRACE") == "1":
+        from relax.backends.megatron.chunkflow.layer_diagnostics import unit_layout
+
+        unit_layout(parent, batch, rows)
     for key in ("__is_dummy__", "__loss_scale__", "replay_micro_batch_index"):
         if key in parent:
             batch[key] = parent[key]

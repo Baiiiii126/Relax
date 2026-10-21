@@ -32,7 +32,7 @@ for arm in baseline chunkflow; do
    if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
       export RELAX_CHUNKFLOW_DIAGNOSTIC_DIR="${RESULT_DIR}/${arm}/diagnostics"
    else
-      unset RELAX_CHUNKFLOW_DIAGNOSTIC_DIR RELAX_CHUNKFLOW_GRAD_ROLLOUTS
+      unset RELAX_CHUNKFLOW_DIAGNOSTIC_DIR RELAX_CHUNKFLOW_GRAD_ROLLOUTS RELAX_CHUNKFLOW_LAYER_TRACE
    fi
    RUN_NAME="${RUN_ID}-${arm}" LOG_FILE="${RESULT_DIR}/${arm}.log" \
       bash scripts/entrypoint/ray-job.sh \
@@ -41,6 +41,9 @@ for arm in baseline chunkflow; do
 done
 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}"
 if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
-   python3 scripts/training/sft/tools/compare_qwen36_gradients.py "${RESULT_DIR}"
+   python3 scripts/training/sft/tools/compare_qwen36_gradients.py "${RESULT_DIR}" --rollouts "${RELAX_CHUNKFLOW_GRAD_ROLLOUTS:-0,1,2,8}"
+   if [ "${RELAX_CHUNKFLOW_LAYER_TRACE:-0}" = 1 ]; then
+      python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}"
+   fi
 fi
 echo "Comparison complete: ${RESULT_DIR}"

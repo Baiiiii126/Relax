@@ -64,3 +64,70 @@ def test_gradient_comparison_detects_direction_error_at_equal_norm(tmp_path, mon
     diagnostics.capture_gradients(None, 0, 0)
     with diagnostics.trace_gdn_calls(None, 0):
         pass
+
+
+def test_layer_trace_pairs_repacked_tokens_and_captures_router_changes(tmp_path):
+    from relax.backends.megatron.chunkflow import layer_diagnostics as ld
+
+    class TopKRouter(torch.nn.Module):
+        def forward(self, input):
+            probs = input[:, 0, :2].softmax(-1)
+            return probs, probs == probs.max(dim=-1, keepdim=True).values
+
+    class TransformerLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_number = 1
+            self.router = TopKRouter()
+
+        def forward(self, hidden_states):
+            self.router(hidden_states)
+            return hidden_states * 2
+
+    parent = {"tokens": torch.arange(6).reshape(1, 6), "total_lengths": [6]}
+    model = TransformerLayer()
+    for arm in ("baseline", "chunkflow"):
+        x = torch.arange(24, dtype=torch.float32).reshape(6, 1, 4).requires_grad_()
+        with ld.trace_layers([model], tmp_path / arm / "diagnostics", 0, 0):
+            if arm == "baseline":
+                ld.set_batch(parent)
+                model(hidden_states=x).sum().backward()
+            else:
+                for start, end in ((3, 6), (0, 3)):
+                    batch = {"tokens": parent["tokens"][:, start:end]}
+                    ld.unit_layout(parent, batch, [(start, end)])
+                    ld.set_batch(batch)
+                    model(x[start:end]).sum().backward()
+    assert ld._TRACE.get() is None and ld._BATCH.get() is None
+    path = Path(__file__).resolve().parents[3] / "scripts/training/sft/tools/compare_qwen36_layers.py"
+    spec = importlib.util.spec_from_file_location("compare_layers", path)
+    comparison = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(comparison)
+    comparison.compare(tmp_path)
+    rows = list(csv.DictReader((tmp_path / "layers.csv").open()))
+    assert {r["event"] for r in rows} >= {"input", "output", "input_grad", "output_grad", "router_map"}
+    assert all(float(r["max_abs"]) == 0 and int(r["tokens"]) == 6 for r in rows)
+    file = tmp_path / "chunkflow/diagnostics/layers_r0_rank0.pt"
+    events = torch.load(file, weights_only=True)
+    next(e for e in events if e["kind"] == "router_map")["values"][0].logical_not_()
+    torch.save(events, file)
+    comparison.compare(tmp_path)
+    rows = list(csv.DictReader((tmp_path / "layers.csv").open()))
+    assert next(r for r in rows if r["event"] == "router_map")["changed_tokens"] == "1"
+
+
+def test_layer_trace_tracks_sequence_parallel_row_placement(monkeypatch):
+    from megatron.core import parallel_state as ps
+
+    from relax.backends.megatron.chunkflow import layer_diagnostics as ld
+
+    monkeypatch.setattr(ps, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(ps, "get_tensor_model_parallel_rank", lambda: 1)
+    token = ld._BATCH.set({"rows": [6, 7, 0, 1, 2, 3, 4, 5], "selected": {0, 2, 4, 6}, "parent": "test"})
+    try:
+        _, indices, rows = ld._selection(torch.ones(4, 1, 8))
+        assert indices == [0, 2] and rows == [2, 4]
+        _, indices, rows = ld._selection(torch.ones(4, 1, 8), all_tokens=True)
+        assert indices == [0, 1, 2, 3] and rows == [2, 3, 4, 5]
+    finally:
+        ld._BATCH.reset(token)
