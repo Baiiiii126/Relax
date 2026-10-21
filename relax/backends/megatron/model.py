@@ -55,6 +55,7 @@ from .model_provider import (
     validate_mtp_only_trainable_params,
     wrap_model_provider_with_freeze,
 )
+from .training_profile import profile_forward_step, profile_train_step, train_phase
 
 
 logger = get_logger(__name__)
@@ -1003,9 +1004,10 @@ def train_one_step(
     capture_hooks.begin_step_for(args, rollout_id, step_id)
 
     # Set grad to zero.
-    for model_chunk in model:
-        model_chunk.zero_grad_buffer()
-    optimizer.zero_grad()
+    with train_phase("zero_grad"):
+        for model_chunk in model:
+            model_chunk.zero_grad_buffer()
+        optimizer.zero_grad()
 
     if args.custom_megatron_before_train_step_hook_path:
         from relax.utils.misc import load_function
@@ -1216,9 +1218,9 @@ def train_one_step(
         if getattr(args, "use_pytorch_profiler", False)
         else nullcontext()
     )
-    with compute_context:
+    with train_phase("forward_backward"), compute_context:
         losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
+            forward_step_func=profile_forward_step(forward_step),
             data_iterator=data_iterator,
             model=model,
             num_microbatches=num_microbatches,
@@ -1289,9 +1291,10 @@ def train_one_step(
     maybe_verify_critic_value_head_movement(model, optimizer, bool(update_successful))
 
     # release grad
-    for model_chunk in model:
-        model_chunk.zero_grad_buffer()
-    optimizer.zero_grad()
+    with train_phase("release_grad"):
+        for model_chunk in model:
+            model_chunk.zero_grad_buffer()
+        optimizer.zero_grad()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
@@ -1482,7 +1485,10 @@ def train(
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
         # Run training step.
-        with timer(f"train_micro_batch_{step_id}", keep=False):
+        with (
+            timer(f"train_micro_batch_{step_id}", keep=False),
+            profile_train_step(args, rollout_id, step_id, model, optimizer, config),
+        ):
             loss_dict, grad_norm = train_one_step(
                 args,
                 rollout_id,

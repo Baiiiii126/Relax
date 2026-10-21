@@ -33,6 +33,22 @@ for key in KEEP_LAST_K TRAIN_SEED; do
       exit 2
    fi
 done
+PROFILE_ARGS=()
+case "${CHUNKFLOW_PROFILE:-0}" in
+   0) ;;
+   1)
+      PROFILE_START="${PROFILE_START:-34}"
+      PROFILE_END="${PROFILE_END:-36}"
+      if ! [[ "${PROFILE_START}" =~ ^(0|[1-9][0-9]*)$ && "${PROFILE_END}" =~ ^(0|[1-9][0-9]*)$ ]] ||
+         [ "${PROFILE_END}" -lt "${PROFILE_START}" ] || [ "${NUM_ROLLOUT}" -le "$((PROFILE_END + 1))" ]; then
+         echo "ERROR: require 0 <= PROFILE_START <= PROFILE_END and NUM_ROLLOUT > PROFILE_END + 1" >&2
+         exit 2
+      fi
+      PROFILE_ARGS=(--use-pytorch-profiler --profile-target train_overall
+         --profile-step-start "${PROFILE_START}" --profile-step-end "${PROFILE_END}")
+      ;;
+   *) echo "ERROR: CHUNKFLOW_PROFILE must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ "${NUM_GPUS:-8}" != 8 ] || [ "${TP_SIZE:-2}" != 2 ] || [ "${PP_SIZE:-4}" != 4 ] ||
    [ "${PACK_POLICY:-staggered}" != staggered ]; then
    echo "ERROR: this example requires 8 GPUs, TP2 / PP4 / CP1 / EP1 and staggered packing" >&2
@@ -87,6 +103,8 @@ env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND",
             "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS", "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY"):
     env.setdefault("env_vars", {})[key] = os.environ[key]
+if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
+    env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
 print(json.dumps(env))
 ')
 export RUNTIME_ENV_JSON
@@ -153,9 +171,13 @@ fi
 mkdir -p "$(dirname -- "${LOG_FILE}")"
 echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=1 GBS=${GBS} STEPS=${NUM_ROLLOUT} SEED=${TRAIN_SEED} ARM=${ARM}"
 echo "LOG_FILE=${LOG_FILE}"
+if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
+   echo "PROFILE_ROLLOUTS=${PROFILE_START}..${PROFILE_END} (0-based; includes profiler overhead)"
+   echo "Worker output: ${RELAX_TRAIN_PROFILE_DIR:-traces/${RUN_NAME}/train_trace}/{*.pt.trace.json.gz,segments_*.jsonl}"
+fi
 ray job submit "${SUBMIT_ARGS[@]}" --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train --resource '{"sft": [1, 0], "actor": [1, 8]}' \
-   "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" "${CHUNKFLOW_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+   "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" "${PROFILE_ARGS[@]}" "${CHUNKFLOW_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
 
 if [ "${RAY_NO_WAIT:-0}" != 1 ]; then
    if ! grep -q "Actor training completed step $((NUM_ROLLOUT - 1))/${NUM_ROLLOUT}" "${LOG_FILE}"; then

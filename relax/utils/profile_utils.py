@@ -96,8 +96,9 @@ def _get_train_trace_dir(args):
     """Return the output directory for training profiler traces.
 
     Uses ``./traces/<tb_experiment_name>/train_trace`` as the default location.
+    ``RELAX_TRAIN_PROFILE_DIR`` overrides it for a shared output directory.
     """
-    return os.path.join(_get_trace_base_dir(args), "train_trace")
+    return os.environ.get("RELAX_TRAIN_PROFILE_DIR") or os.path.join(_get_trace_base_dir(args), "train_trace")
 
 
 def _create_torch_profiler(args, name):
