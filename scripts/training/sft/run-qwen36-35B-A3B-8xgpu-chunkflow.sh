@@ -124,6 +124,11 @@ for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND"
     env.setdefault("env_vars", {})[key] = os.environ[key]
 if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
+for key in ("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR", "RELAX_CHUNKFLOW_GRAD_ROLLOUTS"):
+    if os.environ.get(key):
+        env.setdefault("env_vars", {})[key] = os.environ[key]
+    else:
+        env.setdefault("env_vars", {}).pop(key, None)
 print(json.dumps(env))
 ')
 export RUNTIME_ENV_JSON

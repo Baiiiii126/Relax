@@ -10,6 +10,7 @@ if [ "$#" -ne 0 ] || [ "${RAY_NO_WAIT:-0}" != 0 ]; then
    exit 2
 fi
 export CHUNKFLOW_PROFILE=1
+unset RELAX_CHUNKFLOW_GRAD_ROLLOUTS
 export PROFILE_START="${PROFILE_START:-34}"
 export PROFILE_END="${PROFILE_END:-36}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
@@ -27,6 +28,7 @@ TP2 / PP4 / EP${EP_SIZE:-1}; chunk=${CHUNK_SIZE:-4096}; GBS=${GBS:-8}.
 LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
 Both arms use the same training script and environment; only ChunkFlow is toggled.
 These runs include profiler overhead and are for attribution, not speedup claims.
+GDN Python-call logging runs only on rollout 0; no gradient snapshots are collected.
 
 Shared outputs (all 8 ranks):
 - ${REPORT_DIR}/baseline/train_trace/
@@ -41,8 +43,10 @@ EOF
 for arm in baseline chunkflow; do
    RUN_NAME="${PROFILE_RUN_ID}-${arm}" LOG_FILE="${REPORT_DIR}/${arm}.log" \
       RELAX_TRAIN_PROFILE_DIR="${REPORT_DIR}/${arm}/train_trace" \
+      RELAX_CHUNKFLOW_DIAGNOSTIC_DIR="${REPORT_DIR}/${arm}/diagnostics" \
       bash scripts/entrypoint/ray-job.sh \
       scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${arm}"
    echo "${arm}: complete" >> "${REPORT_DIR}/profile.md"
 done
+python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${REPORT_DIR}"
 echo "Profile comparison complete: ${REPORT_DIR}/profile.md"

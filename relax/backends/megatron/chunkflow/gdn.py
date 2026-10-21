@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
@@ -65,6 +66,10 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
         for key in ("cu_seqlens_cpu", "chunk_indices"):
             if key in signature.parameters:
                 bound.arguments[key] = None
+        if os.environ.get("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR"):
+            from relax.backends.megatron.chunkflow.diagnostics import record_kernel
+
+            record_kernel(kernel, dict(bound.arguments), f"{context.module.layer_number}:{name}:state_kernel")
         output, final_state = kernel(*bound.args, **bound.kwargs)
         if not isinstance(final_state, torch.Tensor):
             raise RuntimeError(f"GDN {name} kernel did not return its final state")

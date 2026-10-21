@@ -29,10 +29,18 @@ Profiler and schedule prediction are disabled. Compare paired steps after the fi
 Both arms must be rerun for this topology; previous EP1 measurements are not this baseline.
 EOF
 for arm in baseline chunkflow; do
+   if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
+      export RELAX_CHUNKFLOW_DIAGNOSTIC_DIR="${RESULT_DIR}/${arm}/diagnostics"
+   else
+      unset RELAX_CHUNKFLOW_DIAGNOSTIC_DIR RELAX_CHUNKFLOW_GRAD_ROLLOUTS
+   fi
    RUN_NAME="${RUN_ID}-${arm}" LOG_FILE="${RESULT_DIR}/${arm}.log" \
       bash scripts/entrypoint/ray-job.sh \
       scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${arm}"
    echo "${arm}: complete" >> "${RESULT_DIR}/comparison.md"
 done
 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}"
+if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
+   python3 scripts/training/sft/tools/compare_qwen36_gradients.py "${RESULT_DIR}"
+fi
 echo "Comparison complete: ${RESULT_DIR}"

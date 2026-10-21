@@ -1251,6 +1251,10 @@ def train_one_step(
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
     valid_step = True
+    if os.environ.get("RELAX_CHUNKFLOW_GRAD_ROLLOUTS"):
+        from relax.backends.megatron.chunkflow.diagnostics import capture_gradients
+
+        capture_gradients(model, rollout_id, step_id)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
@@ -1484,8 +1488,14 @@ def train(
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
+        diagnostic_context = nullcontext()
+        if os.environ.get("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR"):
+            from relax.backends.megatron.chunkflow.diagnostics import trace_gdn_calls
+
+            diagnostic_context = trace_gdn_calls(model, rollout_id)
         # Run training step.
         with (
+            diagnostic_context,
             timer(f"train_micro_batch_{step_id}", keep=False),
             profile_train_step(args, rollout_id, step_id, model, optimizer, config),
         ):
