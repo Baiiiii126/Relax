@@ -48,7 +48,7 @@ MODEL_ARGS=(
    --num-experts 256
    --moe-grouped-gemm
    --moe-token-drop-policy probs
-   --moe-router-dtype fp32
+   --moe-router-dtype "${QWEN36_ROUTER_DTYPE:-fp32}"
    --moe-permute-fusion
    --moe-aux-loss-coeff 0
 

@@ -70,8 +70,11 @@ def test_layer_trace_pairs_repacked_tokens_and_captures_router_changes(tmp_path)
     from relax.backends.megatron.chunkflow import layer_diagnostics as ld
 
     class TopKRouter(torch.nn.Module):
+        def gating(self, input):
+            return input[:, 0, :2].double()
+
         def forward(self, input):
-            probs = input[:, 0, :2].softmax(-1)
+            probs = self.gating(input).softmax(-1)
             return probs, probs == probs.max(dim=-1, keepdim=True).values
 
     class TransformerLayer(torch.nn.Module):
@@ -79,26 +82,30 @@ def test_layer_trace_pairs_repacked_tokens_and_captures_router_changes(tmp_path)
             super().__init__()
             self.layer_number = 1
             self.router = TopKRouter()
+            self.self_attention = torch.nn.Identity()
+            self.mlp = torch.nn.Identity()
 
         def forward(self, hidden_states):
+            hidden_states = self.self_attention(hidden_states)
             self.router(hidden_states)
-            return hidden_states * 2
+            return self.mlp(hidden_states) * 2
 
-    parent = {"tokens": torch.arange(6).reshape(1, 6), "total_lengths": [6]}
+    parent = {"tokens": torch.arange(64).reshape(1, 64), "total_lengths": [64]}
     model = TransformerLayer()
     for arm in ("baseline", "chunkflow"):
-        x = torch.arange(24, dtype=torch.float32).reshape(6, 1, 4).requires_grad_()
+        x = torch.arange(256, dtype=torch.float32).reshape(64, 1, 4).requires_grad_()
         with ld.trace_layers([model], tmp_path / arm / "diagnostics", 0, 0):
             if arm == "baseline":
                 ld.set_batch(parent)
                 model(hidden_states=x).sum().backward()
             else:
-                for start, end in ((3, 6), (0, 3)):
+                for start, end in ((32, 64), (0, 32)):
                     batch = {"tokens": parent["tokens"][:, start:end]}
                     ld.unit_layout(parent, batch, [(start, end)])
                     ld.set_batch(batch)
                     model(x[start:end]).sum().backward()
     assert ld._TRACE.get() is None and ld._BATCH.get() is None
+    assert "gating" not in vars(model.router)
     path = Path(__file__).resolve().parents[3] / "scripts/training/sft/tools/compare_qwen36_layers.py"
     spec = importlib.util.spec_from_file_location("compare_layers", path)
     comparison = importlib.util.module_from_spec(spec)
@@ -106,9 +113,11 @@ def test_layer_trace_pairs_repacked_tokens_and_captures_router_changes(tmp_path)
     comparison.compare(tmp_path)
     rows = list(csv.DictReader((tmp_path / "layers.csv").open()))
     assert {r["event"] for r in rows} >= {"input", "output", "input_grad", "output_grad", "router_map"}
-    assert all(float(r["max_abs"]) == 0 and int(r["tokens"]) == 6 for r in rows)
+    assert {r["event"] for r in rows} >= {"self_attention_output", "mlp_output", "router_logits"}
+    assert all(float(r["max_abs"]) == 0 and int(r["tokens"]) == 64 for r in rows)
     file = tmp_path / "chunkflow/diagnostics/layers_r0_rank0.pt"
     events = torch.load(file, weights_only=True)
+    assert next(e for e in events if e["kind"] == "router_logits")["values"].dtype == torch.float64
     next(e for e in events if e["kind"] == "router_map")["values"][0].logical_not_()
     torch.save(events, file)
     comparison.compare(tmp_path)

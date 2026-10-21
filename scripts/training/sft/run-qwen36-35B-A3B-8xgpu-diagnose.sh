@@ -5,7 +5,7 @@ set -eo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 cd "${SCRIPT_DIR}/../../.."
 if [ "$#" != 1 ]; then
-   echo "Usage: bash $0 {numerics|profile|localize|performance}" >&2
+   echo "Usage: bash $0 {numerics|profile|localize|router64|performance}" >&2
    exit 2
 fi
 export EP_SIZE="${EP_SIZE:-2}" CHUNK_SIZE="${CHUNK_SIZE:-8192}" GBS="${GBS:-8}"
@@ -18,7 +18,8 @@ case "$1" in
       export RELAX_CHUNKFLOW_GRAD_ROLLOUTS=0
       exec bash "${SCRIPT_DIR}/run-qwen36-35B-A3B-8xgpu-benefit.sh"
       ;;
-   localize)
+   localize|router64)
+      if [ "$1" = router64 ]; then export QWEN36_ROUTER_DTYPE=fp64; fi
       export NUM_ROLLOUT=1 LEARNING_RATE=0 QWEN36_DIAGNOSTICS=1 KEEP_LAST_K=0
       export RELAX_CHUNKFLOW_GRAD_ROLLOUTS=0 RELAX_CHUNKFLOW_LAYER_TRACE=1
       exec bash "${SCRIPT_DIR}/run-qwen36-35B-A3B-8xgpu-benefit.sh"
@@ -36,5 +37,5 @@ case "$1" in
       export REPORT_DIR="$(pwd)/analysis/${PROFILE_RUN_ID}"
       exec bash "${SCRIPT_DIR}/run-qwen36-35B-A3B-8xgpu-profile.sh"
       ;;
-   *) echo "ERROR: mode must be numerics, profile, localize or performance" >&2; exit 2 ;;
+   *) echo "ERROR: mode must be numerics, profile, localize, router64 or performance" >&2; exit 2 ;;
 esac

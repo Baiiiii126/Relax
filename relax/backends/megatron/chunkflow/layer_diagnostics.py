@@ -64,7 +64,7 @@ def _selection(tensor: torch.Tensor, *, all_tokens: bool = False) -> tuple[dict,
 
 def _tap(tensor: torch.Tensor, layer: int, kind: str, *, backward: bool = False, full: bool = False) -> None:
     trace = _TRACE.get()
-    layout, positions, rows = _selection(tensor, all_tokens=kind == "router_map")
+    layout, positions, rows = _selection(tensor, all_tokens=layer == 1 or kind == "router_map")
     if not positions:
         return
     indices = torch.tensor(positions, device=tensor.device)
@@ -72,7 +72,7 @@ def _tap(tensor: torch.Tensor, layer: int, kind: str, *, backward: bool = False,
 
     def record(value: torch.Tensor, event: str) -> None:
         selected = value.detach().index_select(0, indices).reshape(len(rows), -1)
-        if not full:
+        if not full and layer != 1:
             features = torch.arange(min(64, selected.shape[1]), device=value.device)
             features = features * max(0, selected.shape[1] - 1) // max(1, features.numel() - 1)
             selected = selected.index_select(1, features)
@@ -82,7 +82,7 @@ def _tap(tensor: torch.Tensor, layer: int, kind: str, *, backward: bool = False,
                 "kind": event,
                 "parent": parent,
                 "rows": rows,
-                "values": selected.clone() if kind == "router_map" else selected.float().clone(),
+                "values": selected.clone(),
             }
         )
 
@@ -120,6 +120,22 @@ def trace_layers(models: Any, folder: Path, rollout: int, rank: int) -> Iterator
 
                 restore.callback(module.register_forward_pre_hook(pre, with_kwargs=True).remove)
                 restore.callback(module.register_forward_hook(post).remove)
+                if layer == 1:
+                    for name in ("self_attention", "mlp"):
+                        child = getattr(module, name, None)
+                        if child is None:
+                            continue
+
+                        def component_pre(module: Any, args: tuple, kwargs: dict, name: str = name) -> None:
+                            value = args[0] if args else kwargs["hidden_states"]
+                            _tap(value, 1, name + "_input", backward=True)
+
+                        def component_post(module: Any, args: tuple, output: Any, name: str = name) -> None:
+                            value = output[0] if isinstance(output, tuple) else output
+                            _tap(value, 1, name + "_output", backward=True)
+
+                        restore.callback(child.register_forward_pre_hook(component_pre, with_kwargs=True).remove)
+                        restore.callback(child.register_forward_hook(component_post).remove)
                 for child in module.modules():
                     if not any(cls.__name__ == "TopKRouter" for cls in type(child).__mro__):
                         continue
@@ -135,6 +151,20 @@ def trace_layers(models: Any, folder: Path, rollout: int, rank: int) -> Iterator
 
                     restore.callback(child.register_forward_pre_hook(router_pre, with_kwargs=True).remove)
                     restore.callback(child.register_forward_hook(router_post).remove)
+                    if layer == 1 and hasattr(child, "gating"):
+                        gating = child.gating
+                        had_gating = "gating" in vars(child)
+
+                        def measured_gating(*args: Any, original: Any = gating, **kwargs: Any) -> torch.Tensor:
+                            logits = original(*args, **kwargs)
+                            _tap(logits, 1, "router_logits", full=True)
+                            return logits
+
+                        child.gating = measured_gating
+                        if had_gating:
+                            restore.callback(setattr, child, "gating", gating)
+                        else:
+                            restore.callback(delattr, child, "gating")
         yield
         folder.mkdir(parents=True, exist_ok=True)
         for event in events:
