@@ -22,6 +22,20 @@ CHUNK_SIZE="${CHUNK_SIZE:-4096}"
 KEEP_LAST_K="${KEEP_LAST_K:-0}"
 TRAIN_SEED="${TRAIN_SEED:-1235}"
 EP_SIZE="${EP_SIZE:-1}"
+LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+GDN_RECOMPUTE="${GDN_RECOMPUTE:-1}"
+CPU_OPTIMIZER_OVERLAP="${CPU_OPTIMIZER_OVERLAP:-1}"
+DIAGNOSTIC_ARGS=()
+case "${GDN_RECOMPUTE}" in
+   1) DIAGNOSTIC_ARGS+=(--recompute-granularity selective --recompute-modules gdn) ;;
+   0) ;;
+   *) echo "ERROR: GDN_RECOMPUTE must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${CPU_OPTIMIZER_OVERLAP}" in
+   1) DIAGNOSTIC_ARGS+=(--overlap-cpu-optimizer-d2h-h2d) ;;
+   0) ;;
+   *) echo "ERROR: CPU_OPTIMIZER_OVERLAP must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ "${EP_SIZE}" != 1 ] && [ "${EP_SIZE}" != 2 ]; then
    echo "ERROR: EP_SIZE must be 1 or 2 for TP2 / PP4 / ETP1 on 8 GPUs" >&2
    exit 2
@@ -139,16 +153,13 @@ TRAIN_ARGS=(
    --context-parallel-size 1
    --expert-model-parallel-size "${EP_SIZE}"
    --expert-tensor-parallel-size 1
-   --recompute-granularity selective
-   --recompute-modules gdn
    --no-rope-fusion
    --moe-router-load-balancing-type none
    --moe-aux-loss-coeff 0
    --optimizer adam
    --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
-   --lr 1e-5
+   --lr "${LEARNING_RATE}"
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
@@ -175,6 +186,7 @@ if [ -n "${WORKING_DIR:-}" ]; then
 fi
 mkdir -p "$(dirname -- "${LOG_FILE}")"
 echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=${EP_SIZE} GBS=${GBS} STEPS=${NUM_ROLLOUT} SEED=${TRAIN_SEED} ARM=${ARM}"
+echo "LR=${LEARNING_RATE} GDN_RECOMPUTE=${GDN_RECOMPUTE} CPU_OPTIMIZER_OVERLAP=${CPU_OPTIMIZER_OVERLAP}"
 echo "LOG_FILE=${LOG_FILE}"
 if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
    echo "PROFILE_ROLLOUTS=${PROFILE_START}..${PROFILE_END} (0-based; includes profiler overhead)"
@@ -182,7 +194,7 @@ if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
 fi
 ray job submit "${SUBMIT_ARGS[@]}" --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train --resource '{"sft": [1, 0], "actor": [1, 8]}' \
-   "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" "${PROFILE_ARGS[@]}" "${CHUNKFLOW_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+   "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" "${DIAGNOSTIC_ARGS[@]}" "${PROFILE_ARGS[@]}" "${CHUNKFLOW_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
 
 if [ "${RAY_NO_WAIT:-0}" != 1 ]; then
    if ! grep -q "Actor training completed step $((NUM_ROLLOUT - 1))/${NUM_ROLLOUT}" "${LOG_FILE}"; then

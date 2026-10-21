@@ -91,7 +91,7 @@ class GatedDeltaNet(torch.nn.Module):
 
         return (
             checkpoint(compute, hidden_states, use_reentrant=True)
-            if self.mode == "selective"
+            if self.mode in ("selective", "selective_last")
             else compute(hidden_states)
         )
 
@@ -176,7 +176,7 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4):
     full_packed = packed
     expected = reference(ref_x, packed_seq_params=packed)
     dout = torch.randn_like(expected)
-    if mode == "last":
+    if mode in ("last", "selective_last"):
         dout.zero_()
         offset = 0
         for length in lengths:
@@ -242,7 +242,9 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4):
     assert model.state_dict().keys() == reference.state_dict().keys()
 
 
-@pytest.mark.parametrize("mode,chunk_size", [("keep", 2), ("last", 4), ("fr", 4), ("selective", 4), ("outer", 4)])
+@pytest.mark.parametrize(
+    "mode,chunk_size", [("keep", 2), ("last", 4), ("fr", 4), ("selective", 4), ("selective_last", 4), ("outer", 4)]
+)
 def test_gdn_state_outputs_and_gradients_match_full_sequence(kernels, mode, chunk_size):
     _alignment(kernels, mode, chunk_size)
 
@@ -261,7 +263,7 @@ def test_gdn_install_rejects_unsupported_configuration(kernels, setting, value):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and differentiable FLA state kernels")
-@pytest.mark.parametrize("mode", ["fr", "last"])
+@pytest.mark.parametrize("mode", ["fr", "last", "selective", "selective_last"])
 def test_gdn_fla_state_outputs_and_gradients_match_full_sequence(kernels, mode):
     from fla.modules.convolution import causal_conv1d
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule

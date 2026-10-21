@@ -176,6 +176,48 @@ def _unit_attn(chunk_size, layer=1):
     )
 
 
+@pytest.mark.parametrize("original_cache_disabled", [False, True])
+def test_reversed_backward_preserves_fused_weight_gradients(original_cache_disabled):
+    class FusedLinear(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, weight, first):
+            ctx.save_for_backward(x, weight)
+            ctx.first = first
+            return x @ weight.T
+
+        @staticmethod
+        def backward(ctx, grad):
+            x, weight = ctx.saved_tensors
+            wgrad = grad.T @ x
+            # Transformer Engine overwrites main_grad when first=True.
+            if ctx.first is True:
+                weight.main_grad.copy_(wgrad)
+            else:
+                weight.main_grad.add_(wgrad)
+            return grad @ weight, None, None
+
+    model = torch.nn.Linear(3, 2, bias=False, dtype=torch.float64)
+    model.disable_parameter_transpose_cache = original_cache_disabled
+    model.is_first_microbatch = True
+    model.weight.main_grad = torch.zeros_like(model.weight)
+    inputs = [torch.arange(12, dtype=torch.float64).reshape(4, 3) + offset for offset in (1, 3)]
+    reference = model.weight.detach().clone().requires_grad_()
+    sum((x @ reference.T).square().sum() for x in inputs).backward()
+
+    install(model, 4)
+    install(model, 4)
+    outputs = []
+    for x in inputs:
+        first = None if model.disable_parameter_transpose_cache else model.is_first_microbatch
+        outputs.append(FusedLinear.apply(x, model.weight, first))
+        model.is_first_microbatch = False
+    for out in reversed(outputs):
+        out.square().sum().backward()
+    torch.testing.assert_close(model.weight.main_grad, reference.grad)
+    uninstall(model)
+    assert model.disable_parameter_transpose_cache is original_cache_disabled
+
+
 def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding(monkeypatch):
     from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
     from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR

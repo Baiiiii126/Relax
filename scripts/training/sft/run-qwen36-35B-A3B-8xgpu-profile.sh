@@ -23,6 +23,8 @@ cat > "${REPORT_DIR}/profile.md" <<EOF
 
 Commit: $(git rev-parse HEAD)
 Seed: ${TRAIN_SEED}; steps: ${NUM_ROLLOUT}; profile rollouts: ${PROFILE_START}..${PROFILE_END} (0-based).
+TP2 / PP4 / EP${EP_SIZE:-1}; chunk=${CHUNK_SIZE:-4096}; GBS=${GBS:-8}.
+LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
 Both arms use the same training script and environment; only ChunkFlow is toggled.
 These runs include profiler overhead and are for attribution, not speedup claims.
 

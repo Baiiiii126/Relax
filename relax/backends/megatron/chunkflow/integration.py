@@ -18,6 +18,7 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 _ORIG_ATTR = "_chunkflow_original_core_attention"
+_TRANSPOSE_CACHE_ATTR = "_chunkflow_original_transpose_cache"
 
 
 def split_sizes(total: int, chunk_size: int) -> list[int]:
@@ -166,6 +167,13 @@ def install(model, chunk_size: int) -> int:
         logger.info("chunkflow: stateful GDN installed on %d layer(s)", gdn_layers)
     chunkflow_rope.install()
 
+    # TE's first-forward flag can overwrite gradients after a later chunk's backward.
+    for module in model.modules():
+        if hasattr(module, "disable_parameter_transpose_cache") and hasattr(module, "is_first_microbatch"):
+            if not hasattr(module, _TRANSPOSE_CACHE_ATTR):
+                setattr(module, _TRANSPOSE_CACHE_ATTR, module.disable_parameter_transpose_cache)
+            module.disable_parameter_transpose_cache = True
+
     # Chunk-local offsets require unfused RoPE.
     n = 0
     for attn in _attention_modules(model):
@@ -197,6 +205,10 @@ def uninstall(model) -> int:
     from relax.backends.megatron.chunkflow import gdn
 
     gdn.uninstall(model)
+    for module in model.modules():
+        if hasattr(module, _TRANSPOSE_CACHE_ATTR):
+            module.disable_parameter_transpose_cache = getattr(module, _TRANSPOSE_CACHE_ATTR)
+            delattr(module, _TRANSPOSE_CACHE_ATTR)
     n = 0
     for attn in _attention_modules(model):
         original = getattr(attn, _ORIG_ATTR, None)

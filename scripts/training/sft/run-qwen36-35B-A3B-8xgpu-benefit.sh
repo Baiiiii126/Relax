@@ -23,6 +23,7 @@ cat > "${RESULT_DIR}/comparison.md" <<EOF
 
 Commit: $(git rev-parse HEAD)
 TP2 / PP4 / EP${EP_SIZE} / ETP1; chunk=${CHUNK_SIZE}; GBS=${GBS:-8}; seed=${TRAIN_SEED}; steps=${NUM_ROLLOUT}.
+LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
 Both arms use the same data and training configuration; only ChunkFlow is toggled.
 Profiler and schedule prediction are disabled. Compare paired steps after the first 30 warmup steps using total-time ratios.
 Both arms must be rerun for this topology; previous EP1 measurements are not this baseline.
@@ -33,4 +34,5 @@ for arm in baseline chunkflow; do
       scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${arm}"
    echo "${arm}: complete" >> "${RESULT_DIR}/comparison.md"
 done
+python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}"
 echo "Comparison complete: ${RESULT_DIR}"
