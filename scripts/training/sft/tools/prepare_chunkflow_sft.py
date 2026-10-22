@@ -10,6 +10,7 @@ import json
 import random
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 
 def conversation(row: dict) -> list[dict[str, str]] | None:
@@ -28,6 +29,13 @@ def conversation(row: dict) -> list[dict[str, str]] | None:
     if any(m["role"] != ("user" if i % 2 == 0 else "assistant") for i, m in enumerate(turns)):
         return None
     return result
+
+
+def token_count(tokenizer: Any, messages: list[dict[str, str]]) -> int:
+    tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, return_dict=False)
+    if not isinstance(tokens, list) or not tokens or not isinstance(tokens[0], int):
+        raise TypeError("Expected a nonempty flat token-ID list from apply_chat_template(return_dict=False)")
+    return len(tokens)
 
 
 def main() -> None:
@@ -59,7 +67,8 @@ def main() -> None:
     ultralong_target = max(1, args.rows // 200)
     buckets: list[list[dict]] = [[], [], []]
     answers, identities = set(), set()
-    rejected = Counter()
+    rejected, observed = Counter(), Counter()
+    maximum_length = 0
     scanned = 0
     for scanned, row in enumerate(stream, 1):
         messages = conversation(row)
@@ -69,9 +78,12 @@ def main() -> None:
             answer = "\n".join(m["content"] for m in messages if m["role"] == "assistant")
             answer_hash = hashlib.sha256(" ".join(answer.split()).encode()).hexdigest()
             identity = hashlib.sha256(json.dumps(messages, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-            tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
-            length = len(tokens)
+            length = token_count(tokenizer, messages)
+            maximum_length = max(maximum_length, length)
             bucket = 0 if length <= 4096 else 1 if length <= 8192 else 2
+            observed[bucket] += 1
+            if scanned <= 3:
+                print(f"sample={scanned}; chat_tokens={length}", flush=True)
             if len(tokenizer.encode(answer, add_special_tokens=False)) < 64:
                 rejected["short_answer"] += 1
             elif length > args.max_length:
@@ -98,12 +110,19 @@ def main() -> None:
         if all(len(b) == target for b, target in zip(buckets, targets, strict=True)):
             break
         if scanned % 10000 == 0:
-            print(f"scanned={scanned}; bucket counts={[len(b) for b in buckets]}; targets={targets}", flush=True)
+            print(
+                f"scanned={scanned}; bucket counts={[len(b) for b in buckets]}; targets={targets}; "
+                f"observed={[observed[i] for i in range(3)]}; max_tokens={maximum_length}",
+                flush=True,
+            )
         if scanned >= args.max_scan:
             break
     counts = [len(b) for b in buckets]
     if counts != targets:
-        raise SystemExit(f"Insufficient natural-length samples: counts={counts}, targets={targets}, scanned={scanned}")
+        raise SystemExit(
+            f"Insufficient natural-length samples: counts={counts}, targets={targets}, scanned={scanned}; "
+            f"observed={[observed[i] for i in range(3)]}, max_tokens={maximum_length}, rejected={dict(rejected)}"
+        )
     rows = [row for bucket in buckets for row in bucket]
     random.Random(args.seed).shuffle(rows)
     validation = max(1, len(rows) // 20)
@@ -121,6 +140,8 @@ def main() -> None:
         "revision": revision,
         "seed": args.seed,
         "scanned": scanned,
+        "observed_bucket_counts": [observed[i] for i in range(3)],
+        "maximum_observed_tokens": maximum_length,
         "bucket_bounds": [4096, 8192, args.max_length],
         "bucket_counts_before_split": counts,
         "train_rows": len(rows) - validation,
