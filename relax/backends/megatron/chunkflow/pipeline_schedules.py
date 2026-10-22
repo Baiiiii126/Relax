@@ -119,8 +119,8 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     runtime = require_runtime(model)
     runtime.begin_step()
     parent_window = int(os.environ.get("RELAX_CHUNKFLOW_PARENT_WINDOW", "1"))
-    if parent_window not in (1, 2):
-        raise ValueError("RELAX_CHUNKFLOW_PARENT_WINDOW must be 1 or 2")
+    if parent_window not in (1, 2, 4):
+        raise ValueError("RELAX_CHUNKFLOW_PARENT_WINDOW must be 1, 2 or 4")
 
     if p2p_communicator is None and pg_collection is None:
         from megatron.core.pipeline_parallel.schedules import ProcessGroupCollection

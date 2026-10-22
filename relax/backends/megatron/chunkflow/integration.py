@@ -50,13 +50,14 @@ class ChunkedCoreAttention(nn.Module):
         cu = packed_seq_params.cu_seqlens_q_cpu
         meta = [(c.group, c.group_idx) for c in unit.chunks for _ in c.segments]
 
-        ks, vs = [], []
+        ks, vs, kv_lengths = [], [], []
         for i, (group, group_idx) in enumerate(meta):
             start, end = cu[i], cu[i + 1]
             k_own, v_own = key[start:end], value[start:end]
             if group is None:
                 ks.append(k_own)
                 vs.append(v_own)
+                kv_lengths.append(end - start)
                 continue
 
             store = self.runtime.store(self.layer_number, group)
@@ -70,18 +71,26 @@ class ChunkedCoreAttention(nn.Module):
             _fold_leaf_grad_into(v_own, states[-1].tensors["v"])
 
             earlier = states[:-1]
-            ks.append(torch.cat([*(s.tensors["k"] for s in earlier), k_own], dim=0))
-            vs.append(torch.cat([*(s.tensors["v"] for s in earlier), v_own], dim=0))
+            ks.extend([*(s.tensors["k"] for s in earlier), k_own])
+            vs.extend([*(s.tensors["v"] for s in earlier), v_own])
+            kv_lengths.append(sum(s.tensors["k"].shape[0] for s in earlier) + end - start)
 
-        device = query.device
         query = query[: cu[-1]]
-        cu_q = torch.tensor(cu, dtype=torch.int32, device=device)
-        cu_kv = torch.tensor([0, *itertools.accumulate(t.shape[0] for t in ks)], dtype=torch.int32, device=device)
+        metadata = getattr(packed_seq_params, "_chunkflow_attention_metadata", None)
+        if metadata is None:
+            cu_q = getattr(packed_seq_params, "cu_seqlens_q", None)
+            if cu_q is None:
+                cu_q = torch.tensor(cu, dtype=torch.int32, device=query.device)
+            q_lengths = [end - start for start, end in zip(cu[:-1], cu[1:])]
+            cu_kv = (
+                cu_q
+                if kv_lengths == q_lengths
+                else torch.tensor([0, *itertools.accumulate(kv_lengths)], dtype=torch.int32, device=query.device)
+            )
+            metadata = (cu_q, cu_kv, (max(q_lengths), max(kv_lengths)))
+            packed_seq_params._chunkflow_attention_metadata = metadata
+        cu_q, cu_kv, max_seqlens = metadata
         scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1] ** -0.5
-        max_seqlens = (
-            max(end - start for start, end in zip(cu[:-1], cu[1:])),
-            max(tensor.shape[0] for tensor in ks),
-        )
         out, _lse = UnitCacheAttention.apply(query, True, scale, cu_q, cu_kv, *ks, *vs, max_seqlens)
         return out
 

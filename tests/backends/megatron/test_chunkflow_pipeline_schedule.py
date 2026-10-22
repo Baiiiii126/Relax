@@ -164,7 +164,7 @@ def test_pipeline_plan_is_complete_dependency_valid_and_deadlock_free(lengths, p
     _simulate(calls)
 
 
-@pytest.mark.parametrize("parent_window", [1, 2])
+@pytest.mark.parametrize("parent_window", [1, 2, 4])
 @pytest.mark.parametrize("stage", range(4))
 @pytest.mark.parametrize("keep_last_k", [0, 1])
 def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k, parent_window):
@@ -197,7 +197,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         allgather_cp=False,
     )
     parents, forward_shapes, backward_shapes = [], [], []
-    for lengths in ([600, 350, 200, 129, 1], [513, 128, 33], [128]):
+    for lengths in ([600, 350, 200, 129, 1], [513, 128, 33], [128], [129], [700]):
         cu = [0]
         for length in lengths:
             cu.append(cu[-1] + length)
@@ -314,12 +314,12 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     )
     assert first_flags.count(True) == 1
     assert not groups
-    assert sorted(released) == [0, 0, 1]
+    assert sorted(released) == [0, 0, 1, 4]
     assert {mb: sum(values) for mb, values in seen_tokens.items()} == {
         i: p["tokens"].numel() for i, p in enumerate(parents)
     }
     metrics = model.chunkflow_runtime.consume_step_metrics(4)
-    assert metrics["num_microbatches"] == 3 and metrics["parent_window"] == parent_window
+    assert metrics["num_microbatches"] == 5 and metrics["parent_window"] == parent_window
     assert config.variable_seq_lengths is True and comm.config is config
     assert config.batch_p2p_comm is True
     for key, expected in (("sf", stage != 3), ("rf", stage != 0), ("sb", stage != 0), ("rb", stage != 3)):

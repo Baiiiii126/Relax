@@ -31,7 +31,7 @@ Commit: $(git rev-parse HEAD)
 TP2 / PP4 / EP${EP_SIZE} / ETP1; chunk=${CHUNK_SIZE}; GBS=${GBS:-8}; seed=${TRAIN_SEED}; steps=${NUM_ROLLOUT}.
 LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
-ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (1=previous schedule; 2=two parents per pipeline drain).
+ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (maximum parents per pipeline drain; 1=previous schedule).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
 Diagnostics and FP32 KV experiment disabled.
 Both arms use the same data, seed and optimizer settings; only ChunkFlow is toggled.

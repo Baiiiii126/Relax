@@ -243,22 +243,32 @@ def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding(monkeypatch):
     from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
 
     recorded = []
+    metadata = []
     original = UnitCacheAttention.apply
 
     def capture(*args):
         recorded.append((args[0].shape[0], args[-1]))
+        metadata.append(args[3:5])
+        fragments = args[5:-1]
+        assert len(fragments) == (2 if args[0].shape[0] == 8 else 4)
+        assert all(t.grad_fn is None or "CatBackward" not in t.grad_fn.name() for t in fragments)
         return original(*args)
 
     monkeypatch.setattr(UnitCacheAttention, "apply", capture)
-    attn = _unit_attn(8)
+    attn, next_layer = _unit_attn(8), _unit_attn(8, layer=2)
     units = build_micro_batches(build_chunks([13], chunk_size=8, repack_tail=False), "staggered")
     for unit in units:
         length = sum(seg.length for chunk in unit.chunks for seg in chunk.segments)
-        packed = SimpleNamespace(cu_seqlens_q_cpu=[0, length], **{UNIT_ATTR: unit})
-        q, k, v = _qkv(length + 3, 4, 8, kv_heads=2)
+        cu_q = torch.tensor([0, length], dtype=torch.int32)
+        packed = SimpleNamespace(cu_seqlens_q_cpu=[0, length], cu_seqlens_q=cu_q, **{UNIT_ATTR: unit})
+        q, k, v = (t.requires_grad_() for t in _qkv(length + 3, 4, 8, kv_heads=2))
         output = attn(q, k, v, packed_seq_params=packed)
+        other = next_layer(q, k, v, packed_seq_params=packed)
+        torch.testing.assert_close(output, other)
+        assert metadata[-1][0] is metadata[-2][0] is cu_q
+        assert metadata[-1][1] is metadata[-2][1]
         assert output.shape[0] == length + 3
-    assert recorded == [(8, (8, 8)), (5, (5, 13))]
+    assert recorded == [(8, (8, 8)), (8, (8, 8)), (5, (5, 13)), (5, (5, 13))]
 
 
 @pytest.mark.parametrize("keep_last_k", [1 << 30, 1])

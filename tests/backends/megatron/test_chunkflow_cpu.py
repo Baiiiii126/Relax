@@ -98,7 +98,7 @@ class ChunkflowPlanTests(unittest.TestCase):
         for pp in (2, 4):
             for keep in (1, 1 << 30):
                 plans = []
-                for lengths in ([2048], [2048], [513, 128]):
+                for lengths in ([2048], [2048], [513, 128], [1800], [513]):
                     chunks = self.cf.scheduler.build_chunks(lengths, 512, repack_tail=False)
                     units = self.cf.units.build_micro_batches(chunks, "staggered")
                     plans.append(
@@ -107,9 +107,10 @@ class ChunkflowPlanTests(unittest.TestCase):
                         )
                     )
                 old = model.predict_step(plans, pp)
-                new = model.predict_step([replace(p, parent_window=2) for p in plans], pp)
-                self.assertLess(new["chunkflow"]["makespan"], old["chunkflow"]["makespan"])
-                self.assertEqual(new["baseline"], old["baseline"])
+                for window in (2, 4):
+                    new = model.predict_step([replace(p, parent_window=window) for p in plans], pp)
+                    self.assertLess(new["chunkflow"]["makespan"], old["chunkflow"]["makespan"])
+                    self.assertEqual(new["baseline"], old["baseline"])
                 merged = model.merge_model_plans([p.model_plan for p in plans], pp)
                 offset = 0
                 for plan in plans:
