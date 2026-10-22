@@ -72,7 +72,11 @@ def trace_gdn_calls(models: Any, rollout_id: int) -> Iterator[None]:
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"backend_rank{_rank()}.jsonl"
     with ExitStack() as restore:
-        if os.environ.get("RELAX_CHUNKFLOW_LAYER_TRACE") == "1":
+        if os.environ.get("RELAX_CHUNKFLOW_CONV_TRACE") == "1":
+            from relax.backends.megatron.chunkflow.conv_diagnostics import trace_convolutions
+
+            restore.enter_context(trace_convolutions(models, folder, rollout_id, _rank()))
+        elif os.environ.get("RELAX_CHUNKFLOW_LAYER_TRACE") == "1":
             from relax.backends.megatron.chunkflow.layer_diagnostics import trace_layers
 
             restore.enter_context(trace_layers(models, folder, rollout_id, _rank()))
@@ -109,6 +113,10 @@ def capture_gradients(models: Any, rollout_id: int, step_id: int) -> None:
     selected = os.environ.get("RELAX_CHUNKFLOW_GRAD_ROLLOUTS", "")
     if not directory or str(rollout_id) not in selected.split(","):
         return
+    if os.environ.get("RELAX_CHUNKFLOW_CONV_TRACE") == "1":
+        from relax.backends.megatron.chunkflow.conv_diagnostics import capture_final_gradients
+
+        capture_final_gradients(models)
     rows = {}
     summaries = []
     for index, model in enumerate(models):

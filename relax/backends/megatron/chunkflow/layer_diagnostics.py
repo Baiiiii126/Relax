@@ -19,13 +19,27 @@ _LAYOUT = "__chunkflow_trace_layout__"
 def _layout(batch: dict) -> dict:
     if _LAYOUT not in batch:
         tokens = batch["tokens"].detach().reshape(-1)
-        valid = min(sum(batch["total_lengths"]), tokens.numel())
-        identity = hashlib.sha256(tokens[:valid].cpu().numpy().tobytes())
-        identity.update(str(tuple(batch["total_lengths"])).encode())
+        lengths = [int(n) for n in batch["total_lengths"]]
+        cu = getattr(batch.get("packed_seq_params"), "cu_seqlens_q_cpu", None)
+        if cu is None or len(cu) < len(lengths) + 1:
+            cu = [0]
+            for length in lengths:
+                cu.append(cu[-1] + length)
+        spans = [
+            (int(start), min(int(start) + length, int(end), tokens.numel()))
+            for start, end, length in zip(cu[: len(lengths)], cu[1 : len(lengths) + 1], lengths, strict=True)
+        ]
+        valid_rows = [row for start, end in spans for row in range(start, end)]
+        physical = [-1] * tokens.numel()
+        for row in valid_rows:
+            physical[row] = row
+        identity = hashlib.sha256(tokens[valid_rows].cpu().numpy().tobytes())
+        identity.update(str((tuple(lengths), tuple(int(n) for n in cu))).encode())
         batch[_LAYOUT] = {
             "parent": identity.hexdigest(),
-            "rows": list(range(valid)) + [-1] * (tokens.numel() - valid),
-            "selected": {i * (valid - 1) // 31 for i in range(32)} if valid else set(),
+            "rows": physical,
+            "spans": spans,
+            "selected": {valid_rows[i * (len(valid_rows) - 1) // 31] for i in range(32)} if valid_rows else set(),
         }
     return batch[_LAYOUT]
 

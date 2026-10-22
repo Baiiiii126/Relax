@@ -44,6 +44,14 @@ class _StateGradient(torch.autograd.Function):
         return grad_output, ctx.leaf.grad, None
 
 
+def _invoke_kernel(kernel: Callable, name: str, *args: Any, **kwargs: Any) -> Any:
+    if name == "conv" and os.environ.get("RELAX_CHUNKFLOW_CONV_TRACE") == "1":
+        from relax.backends.megatron.chunkflow.conv_diagnostics import call_convolution
+
+        return call_convolution(kernel, *args, **kwargs)
+    return kernel(*args, **kwargs)
+
+
 def _wrap_kernel(kernel: Callable, name: str) -> Callable:
     signature = inspect.signature(kernel)
     fields = ("x",) if name == "conv" else ("q", "k", "v", "g", "beta")
@@ -52,7 +60,7 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
     def call(*args, **kwargs):
         context = _ACTIVE.get()
         if context is None:
-            return kernel(*args, **kwargs)
+            return _invoke_kernel(kernel, name, *args, **kwargs)
         if context.current is None:
             if "cu_seqlens_cpu" in signature.parameters:
                 bound = signature.bind(*args, **kwargs)
@@ -61,8 +69,8 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
                     name != "conv" or bound.arguments["x"].shape[1] == lengths[0]
                 ):
                     bound.arguments["cu_seqlens_cpu"] = lengths[2]
-                    return kernel(*bound.args, **bound.kwargs)
-            return kernel(*args, **kwargs)
+                    return _invoke_kernel(kernel, name, *bound.args, **bound.kwargs)
+            return _invoke_kernel(kernel, name, *args, **kwargs)
         bound = signature.bind(*args, **kwargs)
         if bound.arguments.get("cp_context") is not None:
             raise NotImplementedError("ChunkFlow GDN state transfer requires CP=1")
@@ -80,7 +88,7 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
             from relax.backends.megatron.chunkflow.diagnostics import record_kernel
 
             record_kernel(kernel, dict(bound.arguments), f"{context.module.layer_number}:{name}:state_kernel")
-        output, final_state = kernel(*bound.args, **bound.kwargs)
+        output, final_state = _invoke_kernel(kernel, name, *bound.args, **bound.kwargs)
         if not isinstance(final_state, torch.Tensor):
             raise RuntimeError(f"GDN {name} kernel did not return its final state")
         if torch.is_grad_enabled() and output.requires_grad and not final_state.requires_grad:
