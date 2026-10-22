@@ -1068,7 +1068,10 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
-        if os.environ.get("RELAX_CHUNKFLOW_LAYER_TRACE") == "1" or os.environ.get("RELAX_CHUNKFLOW_CONV_TRACE") == "1":
+        if any(
+            os.environ.get(key) == "1"
+            for key in ("RELAX_CHUNKFLOW_LAYER_TRACE", "RELAX_CHUNKFLOW_CONV_TRACE", "RELAX_CHUNKFLOW_TAIL_TRACE")
+        ):
             from relax.backends.megatron.chunkflow.layer_diagnostics import set_batch
 
             set_batch(batch)

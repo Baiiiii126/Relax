@@ -118,7 +118,10 @@ def slice_parent_batch(
         batch["position_ids"] = positions.view(1, 1, -1).expand(3, 1, -1)
 
     _slice_response_aligned_keys(parent, batch, rows)
-    if os.environ.get("RELAX_CHUNKFLOW_LAYER_TRACE") == "1" or os.environ.get("RELAX_CHUNKFLOW_CONV_TRACE") == "1":
+    if any(
+        os.environ.get(key) == "1"
+        for key in ("RELAX_CHUNKFLOW_LAYER_TRACE", "RELAX_CHUNKFLOW_CONV_TRACE", "RELAX_CHUNKFLOW_TAIL_TRACE")
+    ):
         from relax.backends.megatron.chunkflow.layer_diagnostics import unit_layout
 
         unit_layout(parent, batch, rows)
