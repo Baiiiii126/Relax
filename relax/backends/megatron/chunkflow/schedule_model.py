@@ -58,6 +58,27 @@ def make_model_plan(units: Sequence[Unit], chunks: Sequence[Chunk], keep_last_k:
     )
 
 
+def merge_model_plans(plans: Sequence[ModelPlan], pp_size: int) -> ModelPlan:
+    """Join parent orders without interleaving their dependency groups."""
+    rows, forward, backward, recompute = {}, [], [], set()
+    delay = 0
+    for plan in plans:
+        ids = {uid: len(rows) + i for i, uid in enumerate(plan.rows)}
+        rows.update((ids[uid], size) for uid, size in plan.rows.items())
+        forward.extend(ids[uid] for uid in plan.forward)
+        backward.extend(ids[uid] for uid in plan.backward)
+        recompute.update(ids[uid] for uid in plan.recompute)
+        # Equal F/B offsets preserve each parent's dependency delay.
+        delay = max(delay, plan.warmups[-1])
+    return ModelPlan(
+        rows,
+        tuple(forward),
+        tuple(backward),
+        frozenset(recompute),
+        tuple(min(delay + pp_size - s - 1, len(forward)) for s in range(pp_size)),
+    )
+
+
 def simulate(plans: Sequence[ModelPlan], pp_size: int) -> dict[str, Any]:
     if pp_size < 1:
         raise ValueError("pp_size must be positive")
@@ -203,7 +224,14 @@ def predict_step(plans: Sequence[PlanTelemetry], pp_size: int) -> dict[str, Any]
         ],
         pp_size,
     )
-    chunkflow = simulate([plan.model_plan for plan in plans], pp_size)
+    window = plans[0].parent_window
+    chunkflow = simulate(
+        [
+            merge_model_plans([p.model_plan for p in plans[i : i + window]], pp_size)
+            for i in range(0, len(plans), window)
+        ],
+        pp_size,
+    )
     return {
         "baseline": baseline,
         "chunkflow": chunkflow,

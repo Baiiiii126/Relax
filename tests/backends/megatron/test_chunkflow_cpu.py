@@ -91,6 +91,36 @@ class ChunkflowPlanTests(unittest.TestCase):
         self.assertAlmostEqual(prediction["baseline"]["makespan"], 60)
         self.assertAlmostEqual(prediction["chunkflow"]["makespan"], 42)
 
+    def test_parent_window_preserves_orders_and_reduces_pipeline_restarts(self):
+        from dataclasses import replace
+
+        model = self.cf.schedule_model
+        for pp in (2, 4):
+            for keep in (1, 1 << 30):
+                plans = []
+                for lengths in ([2048], [2048], [513, 128]):
+                    chunks = self.cf.scheduler.build_chunks(lengths, 512, repack_tail=False)
+                    units = self.cf.units.build_micro_batches(chunks, "staggered")
+                    plans.append(
+                        self.cf.telemetry.summarize_plan(
+                            lengths, chunks, units, keep, pp, [0] * pp, include_schedule=True
+                        )
+                    )
+                old = model.predict_step(plans, pp)
+                new = model.predict_step([replace(p, parent_window=2) for p in plans], pp)
+                self.assertLess(new["chunkflow"]["makespan"], old["chunkflow"]["makespan"])
+                self.assertEqual(new["baseline"], old["baseline"])
+                merged = model.merge_model_plans([p.model_plan for p in plans], pp)
+                offset = 0
+                for plan in plans:
+                    local = plan.model_plan
+                    n = len(local.rows)
+                    self.assertEqual(merged.forward[offset : offset + n], tuple(u + offset for u in local.forward))
+                    self.assertEqual(merged.backward[offset : offset + n], tuple(u + offset for u in local.backward))
+                    offset += n
+                self.assertEqual(sum(merged.rows.values()), sum(sum(p.model_plan.rows.values()) for p in plans))
+                model.simulate([merged], pp)  # Blocking transfers must remain deadlock-free.
+
     def test_chunk_split_and_packing_preserve_tokens_and_prefixes(self):
         lengths = [2050, 300, 200]
         chunks = self.cf.scheduler.build_chunks(lengths, 1024, repack_tail=False)

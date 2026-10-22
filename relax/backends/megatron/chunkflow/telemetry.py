@@ -23,6 +23,7 @@ class PlanTelemetry:
     unit_padded_rows: int
     recompute_units: int
     model_plan: ModelPlan | None = None
+    parent_window: int = 1
 
 
 def summarize_plan(
@@ -67,6 +68,7 @@ class StepPlanTelemetry:
             return {}
         metrics = {
             "num_microbatches": len(self.plans),
+            "parent_window": self.plans[0].parent_window,
             "input_rows": sum(plan.input_rows for plan in self.plans),
             "source_rows": sum(plan.source_rows for plan in self.plans),
             "parent_padding_rows": sum(plan.parent_padding_rows for plan in self.plans),
@@ -86,7 +88,7 @@ class StepPlanTelemetry:
                     "schedule_model_baseline_bubble_fraction": prediction["baseline"]["bubble_fraction"],
                     "schedule_model_chunkflow_bubble_fraction": prediction["chunkflow"]["bubble_fraction"],
                     "schedule_model_analysis_time_s": time.perf_counter() - started,
-                    "schedule_model_version": 1,
+                    "schedule_model_version": 2,
                 }
             )
         return metrics

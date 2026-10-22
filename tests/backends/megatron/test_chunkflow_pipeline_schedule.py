@@ -164,9 +164,10 @@ def test_pipeline_plan_is_complete_dependency_valid_and_deadlock_free(lengths, p
     _simulate(calls)
 
 
+@pytest.mark.parametrize("parent_window", [1, 2])
 @pytest.mark.parametrize("stage", range(4))
 @pytest.mark.parametrize("keep_last_k", [0, 1])
-def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k):
+def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k, parent_window):
     import torch
     from megatron.training import global_vars
 
@@ -175,6 +176,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     from relax.backends.megatron.chunkflow.schedules import _plan
     from relax.backends.megatron.data import PrepackedBatch
 
+    monkeypatch.setenv("RELAX_CHUNKFLOW_PARENT_WINDOW", str(parent_window))
     config = SimpleNamespace(
         variable_seq_lengths=True,
         batch_p2p_comm=True,
@@ -195,11 +197,11 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         allgather_cp=False,
     )
     parents, forward_shapes, backward_shapes = [], [], []
-    for lengths in ([600, 350, 200, 129, 1], [513, 128, 33]):
+    for lengths in ([600, 350, 200, 129, 1], [513, 128, 33], [128]):
         cu = [0]
         for length in lengths:
             cu.append(cu[-1] + length)
-        tokens = torch.arange(cu[-1]).view(1, -1)
+        tokens = (torch.arange(cu[-1]) + len(parents) * 10000).view(1, -1)
         parent = PrepackedBatch(
             tokens=tokens,
             full_loss_masks=torch.ones_like(tokens),
@@ -260,9 +262,21 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
             self.send_backward(tensors, first)
             return self.recv_forward(shapes, first)
 
+    groups, released, first_flags, seen_tokens = {}, [], [], defaultdict(list)
+
     def forward(_callback, iterator, *_args, **_kwargs):
         batch, _ = next(iterator)
         unit = getattr(batch["packed_seq_params"], UNIT_ATTR)
+        mb = _kwargs["current_microbatch"]
+        first_flags.append(_kwargs["is_first_microbatch"])
+        assert (batch["tokens"][0, : unit.num_tokens] // 10000 == mb).all()
+        for chunk in unit.chunks:
+            if chunk.is_dependent:
+                owner = groups.setdefault(chunk.group, mb)
+                assert owner == mb, "two parents share a live dependency group"
+                model.chunkflow_runtime.store(1, chunk.group)
+        if not getattr(batch["packed_seq_params"], "chunkflow_recompute", False):
+            seen_tokens[mb].append(unit.num_tokens)
         shape = ((unit.num_tokens + 127) // 128 * 64, 1, 4)
         return torch.ones(()) if stage == 3 else torch.ones(shape), torch.tensor(1)
 
@@ -272,25 +286,40 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     monkeypatch.setattr(executor, "get_model_config", lambda _: config)
     monkeypatch.setattr(executor, "forward_step", forward)
     monkeypatch.setattr(executor, "deallocate_output_tensor", lambda *a: None)
-    monkeypatch.setattr(executor, "check_first_val_step", lambda *a: False)
+    monkeypatch.setattr(executor, "check_first_val_step", lambda *a: a[-1])
     monkeypatch.setattr(
         executor,
         "backward_step",
         lambda inputs, *_: None if inputs is None else [torch.ones_like(t) for t in inputs],
     )
     model = SimpleNamespace(chunkflow_runtime=ChunkflowRuntime(256))
+    real_release = model.chunkflow_runtime.release_group
+
+    def release(group):
+        released.append(groups.pop(group))
+        assert real_release(group) == 1
+
+    monkeypatch.setattr(model.chunkflow_runtime, "release_group", release)
     comm = Communicator()
     executor.chunkflow_forward_backward_pipelining_without_interleaving(
         forward_step_func=None,
         data_iterator=iter((p, {}) for p in parents),
         model=model,
-        num_microbatches=2,
+        num_microbatches=len(parents),
         seq_length=32768,
         decoder_seq_length=32768,
         micro_batch_size=1,
         p2p_communicator=comm,
         pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1), tp=SimpleNamespace(size=lambda: 2)),
     )
+    assert first_flags.count(True) == 1
+    assert not groups
+    assert sorted(released) == [0, 0, 1]
+    assert {mb: sum(values) for mb, values in seen_tokens.items()} == {
+        i: p["tokens"].numel() for i, p in enumerate(parents)
+    }
+    metrics = model.chunkflow_runtime.consume_step_metrics(4)
+    assert metrics["num_microbatches"] == 3 and metrics["parent_window"] == parent_window
     assert config.variable_seq_lengths is True and comm.config is config
     assert config.batch_p2p_comm is True
     for key, expected in (("sf", stage != 3), ("rf", stage != 0), ("sb", stage != 0), ("rb", stage != 3)):

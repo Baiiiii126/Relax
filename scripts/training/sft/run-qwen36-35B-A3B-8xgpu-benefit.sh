@@ -13,6 +13,12 @@ export CHUNK_SIZE="${CHUNK_SIZE:-8192}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
 export TRAIN_SEED="${TRAIN_SEED:-1235}"
 export CHUNKFLOW_PROFILE=0
+export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-2}"
+export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
+export QWEN36_ROUTER_DTYPE="${QWEN36_ROUTER_DTYPE:-fp64}"
+unset QWEN36_DIAGNOSTICS QWEN36_KV_GRAD_AB RELAX_TRAIN_PROFILE_DIR
+unset RELAX_CHUNKFLOW_DIAGNOSTIC_DIR RELAX_CHUNKFLOW_GRAD_ROLLOUTS RELAX_CHUNKFLOW_LAYER_TRACE
+unset RELAX_CHUNKFLOW_UPDATE_TRACE RELAX_CHUNKFLOW_CONV_TRACE RELAX_CHUNKFLOW_CONV_CHUNK_SIZE RELAX_CHUNKFLOW_TAIL_TRACE
 export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS=0
 export RELAX_CHUNKFLOW_FLASH_BACKEND="${RELAX_CHUNKFLOW_FLASH_BACKEND:-fa3}"
 RUN_ID="qwen36-benefit-$(date +%Y%m%d-%H%M%S)-$$"
@@ -25,64 +31,18 @@ Commit: $(git rev-parse HEAD)
 TP2 / PP4 / EP${EP_SIZE} / ETP1; chunk=${CHUNK_SIZE}; GBS=${GBS:-8}; seed=${TRAIN_SEED}; steps=${NUM_ROLLOUT}.
 LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
+ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (1=previous schedule; 2=two parents per pipeline drain).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
-Update trace: ${RELAX_CHUNKFLOW_UPDATE_TRACE:-0}; convolution trace: ${RELAX_CHUNKFLOW_CONV_TRACE:-0}; tail trace: ${RELAX_CHUNKFLOW_TAIL_TRACE:-0}.
-Diagnostics enabled: ${QWEN36_DIAGNOSTICS:-0}. Diagnostic timing is not performance evidence.
-All arms use the same data, seed and optimizer settings; ChunkFlow and the explicitly recorded diagnostic options may differ.
+Diagnostics and FP32 KV experiment disabled.
+Both arms use the same data, seed and optimizer settings; only ChunkFlow is toggled.
 Profiler and schedule prediction are disabled. For performance runs only, compare paired steps after the first 30 warmup steps using total-time ratios.
 Both arms must be rerun for this topology; previous EP1 measurements are not this baseline.
 EOF
-arms=(baseline chunkflow)
-if [ "${RELAX_CHUNKFLOW_UPDATE_TRACE:-0}" = 1 ] || [ "${RELAX_CHUNKFLOW_CONV_TRACE:-0}" = 1 ] || [ "${RELAX_CHUNKFLOW_TAIL_TRACE:-0}" = 1 ]; then
-   arms=(baseline baseline_repeat chunkflow)
-fi
-if [ "${QWEN36_KV_GRAD_AB:-0}" = 1 ]; then
-   if [ "${RELAX_CHUNKFLOW_TAIL_TRACE:-0}" != 1 ] || [ "${QWEN36_DIAGNOSTICS:-0}" != 1 ]; then
-      echo "ERROR: KV gradient comparison requires tail diagnostics" >&2; exit 2
-   fi
-   arms=(baseline chunkflow_control chunkflow)
-fi
-for arm in "${arms[@]}"; do
-   mode="${arm}"
-   if [ "${mode}" = baseline_repeat ]; then mode=baseline; fi
-   if [ "${mode}" = chunkflow_control ]; then mode=chunkflow; fi
-   if [ "${QWEN36_KV_GRAD_AB:-0}" = 1 ]; then
-      export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
-      if [ "${arm}" = chunkflow ]; then export RELAX_CHUNKFLOW_KV_GRAD_FP32=1; fi
-   fi
-   echo "${arm}: KV gradient FP32=${RELAX_CHUNKFLOW_KV_GRAD_FP32:-0}" >> "${RESULT_DIR}/comparison.md"
-   if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
-      export RELAX_CHUNKFLOW_DIAGNOSTIC_DIR="${RESULT_DIR}/${arm}/diagnostics"
-   else
-      unset RELAX_CHUNKFLOW_TAIL_TRACE RELAX_CHUNKFLOW_DIAGNOSTIC_DIR RELAX_CHUNKFLOW_GRAD_ROLLOUTS RELAX_CHUNKFLOW_LAYER_TRACE RELAX_CHUNKFLOW_UPDATE_TRACE RELAX_CHUNKFLOW_CONV_TRACE RELAX_CHUNKFLOW_CONV_CHUNK_SIZE
-   fi
+for arm in baseline chunkflow; do
    RUN_NAME="${RUN_ID}-${arm}" LOG_FILE="${RESULT_DIR}/${arm}.log" \
       bash scripts/entrypoint/ray-job.sh \
-      scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${mode}"
+      scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${arm}"
    echo "${arm}: complete" >> "${RESULT_DIR}/comparison.md"
 done
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}"
-if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
-   OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_gradients.py "${RESULT_DIR}" --rollouts "${RELAX_CHUNKFLOW_GRAD_ROLLOUTS:-0,1,2,8}"
-   if [ "${RELAX_CHUNKFLOW_CONV_TRACE:-0}" = 1 ]; then
-      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_convolutions.py "${RESULT_DIR}"
-      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_convolutions.py "${RESULT_DIR}" --candidate baseline_repeat
-   fi
-   if [ "${RELAX_CHUNKFLOW_UPDATE_TRACE:-0}" = 1 ]; then
-      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_updates.py "${RESULT_DIR}"
-      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_updates.py "${RESULT_DIR}" --candidate baseline_repeat
-   fi
-   if [ "${RELAX_CHUNKFLOW_TAIL_TRACE:-0}" = 1 ]; then
-      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}" --prefix tail
-      if [ -d "${RESULT_DIR}/baseline_repeat" ]; then
-         OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}" --prefix tail --candidate baseline_repeat
-      fi
-      if [ -d "${RESULT_DIR}/chunkflow_control" ]; then
-         OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}" --prefix tail --candidate chunkflow_control
-      fi
-   fi
-   if [ "${RELAX_CHUNKFLOW_LAYER_TRACE:-0}" = 1 ]; then
-      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}"
-   fi
-fi
 echo "Comparison complete: ${RESULT_DIR}"

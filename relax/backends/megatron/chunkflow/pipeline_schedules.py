@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import os
+from dataclasses import replace
 from typing import Iterator, List, Optional, Union
 
 import torch
@@ -22,10 +24,10 @@ from megatron.core.pipeline_parallel.schedules import (
 from megatron.core.utils import get_model_config
 
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
-from relax.backends.megatron.chunkflow.schedule_model import pipeline_plan
+from relax.backends.megatron.chunkflow.schedule_model import make_model_plan, merge_model_plans, pipeline_plan
 from relax.backends.megatron.chunkflow.telemetry import summarize_plan
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
-from relax.backends.megatron.chunkflow.units import completed_groups
+from relax.backends.megatron.chunkflow.units import Unit, completed_groups
 from relax.utils.logging_utils import get_logger
 
 
@@ -116,6 +118,9 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
     runtime = require_runtime(model)
     runtime.begin_step()
+    parent_window = int(os.environ.get("RELAX_CHUNKFLOW_PARENT_WINDOW", "1"))
+    if parent_window not in (1, 2):
+        raise ValueError("RELAX_CHUNKFLOW_PARENT_WINDOW must be 1 or 2")
 
     if p2p_communicator is None and pg_collection is None:
         from megatron.core.pipeline_parallel.schedules import ProcessGroupCollection
@@ -204,48 +209,63 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
         )
 
     with no_sync_func():
-        for mb_idx in range(_num_microbatches(num_microbatches)):
-            parent = next_parent()
-            chunks, units = _plan(parent, chunk_size, policy)
-            by_id = {u.unit_id: u for u in units}
+        num_parents = _num_microbatches(num_microbatches)
+        for mb_start in range(0, num_parents, parent_window):
+            by_id, owners, plans = {}, {}, []
+            group_offset = chunk_offset = 0
+            for mb_idx in range(mb_start, min(mb_start + parent_window, num_parents)):
+                parent = next_parent()
+                chunks, units = _plan(parent, chunk_size, policy)
+                plan = make_model_plan(units, chunks, keep_last_k, p2p_communicator.total_stages)
+                plans.append(plan)
+                cu = parent["packed_seq_params"].cu_seqlens_q_cpu
+                seq_lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
+                source_lengths = parent.get("total_lengths")
+                if source_lengths is None:
+                    source_lengths = seq_lengths
+                runtime.record_plan(
+                    replace(
+                        summarize_plan(
+                            seq_lengths,
+                            chunks,
+                            units,
+                            keep_last_k,
+                            p2p_communicator.total_stages,
+                            plan.warmups,
+                            include_schedule=runtime.schedule_analysis,
+                            source_rows=sum(int(length) for length in source_lengths),
+                        ),
+                        parent_window=parent_window,
+                    )
+                )
+                groups = {
+                    g: group_offset + i for i, g in enumerate(sorted({c.group for c in chunks if c.is_dependent}))
+                }
+                remapped = {
+                    c.chunk_id: replace(c, chunk_id=chunk_offset + i, group=groups.get(c.group))
+                    for i, c in enumerate(chunks)
+                }
+                for unit in units:
+                    uid = len(by_id)
+                    by_id[uid] = Unit(uid, [remapped[c.chunk_id] for c in unit.chunks])
+                    owners[uid] = (parent, mb_idx)
+                group_offset += len(groups)
+                chunk_offset += len(chunks)
+            plan = merge_model_plans(plans, p2p_communicator.total_stages)
+            fwd_seq, bwd_seq, need_fr = plan.forward, plan.backward, plan.recompute
+            W, n = plan.warmups[p2p_communicator.current_stage], len(fwd_seq)
             unit_shapes = {
-                unit.unit_id: _unit_shapes(
+                uid: _unit_shapes(
                     unit, p2p_communicator.config, tp_group, cp_group, getattr(p2p_communicator, "pp_group", None)
                 )
                 if planned_shapes
                 else (recv_tensor_shapes, send_tensor_shapes)
-                for unit in units
+                for uid, unit in by_id.items()
             }
-            fwd_seq, bwd_seq, need_fr, dependency_delay = pipeline_plan(units, chunks, keep_last_k)
-            warmup_depths = [
-                min(
-                    dependency_delay + (p2p_communicator.total_stages - plan_stage - 1),
-                    len(fwd_seq),
-                )
-                for plan_stage in range(p2p_communicator.total_stages)
-            ]
-            cu_seqlens = parent["packed_seq_params"].cu_seqlens_q_cpu
-            seq_lengths = [cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)]
-            source_lengths = parent.get("total_lengths")
-            runtime.record_plan(
-                summarize_plan(
-                    seq_lengths,
-                    chunks,
-                    units,
-                    keep_last_k,
-                    p2p_communicator.total_stages,
-                    warmup_depths,
-                    include_schedule=runtime.schedule_analysis,
-                    source_rows=sum(
-                        int(length) for length in (seq_lengths if source_lengths is None else source_lengths)
-                    ),
-                )
-            )
-            W = warmup_depths[p2p_communicator.current_stage]
-            n = len(fwd_seq)
 
-            def do_forward(unit_id, input_tensor, mb_idx):
+            def do_forward(unit_id, input_tensor):
                 nonlocal first_forward
+                parent, mb_idx = owners[unit_id]
                 unit = by_id[unit_id]
                 batch = slice_parent_batch(parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args)
                 batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
@@ -279,6 +299,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
 
             def backward(unit_id, output_tensor_grad):
                 fr_num_tokens = None
+                parent, mb_idx = owners.pop(unit_id)
                 if unit_id in need_fr:
                     input_tensor = fp_inputs.pop(unit_id)
                     unit = by_id[unit_id]
@@ -316,7 +337,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 input_tensor = (
                     None if is_first else p2p_communicator.recv_forward(unit_shapes[fwd_seq[i]][0], is_first)
                 )
-                output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[i], input_tensor, mb_idx)
+                output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[i], input_tensor)
                 if num_tokens is not None:
                     total_num_tokens += num_tokens
                     in_flight[fwd_seq[i]] = (fwd_input, output_tensor)
@@ -332,7 +353,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 input_tensor = p2p_communicator.recv_forward(unit_shapes[fwd_seq[W]][0], is_first)
             for i in range(n_steady):
                 last_iter = i == n_steady - 1
-                output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[W + i], input_tensor, mb_idx)
+                output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[W + i], input_tensor)
                 if num_tokens is not None:
                     total_num_tokens += num_tokens
                     in_flight[fwd_seq[W + i]] = (fwd_input, output_tensor)
@@ -363,12 +384,12 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 if not is_first:
                     p2p_communicator.send_backward(input_tensor_grad, is_first)
 
-            if in_flight or fp_inputs:
+            if owners or in_flight or fp_inputs:
                 raise RuntimeError(
-                    f"chunkflow pipeline: mb{mb_idx} ended with {len(in_flight)} forwarded and "
+                    f"chunkflow pipeline: parent window {mb_start} ended with {len(in_flight)} forwarded and "
                     f"{len(fp_inputs)} unrecomputed unit(s) -- schedule bug"
                 )
-            runtime.assert_empty(f"chunkflow PP={p2p_communicator.total_stages} micro-batch {mb_idx}")
+            runtime.assert_empty(f"chunkflow PP={p2p_communicator.total_stages} parent window {mb_start}")
 
     if config.grad_sync_func is not None:
         config.grad_sync_func(model.parameters())
