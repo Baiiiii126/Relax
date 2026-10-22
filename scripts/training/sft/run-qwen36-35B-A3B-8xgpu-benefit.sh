@@ -10,7 +10,7 @@ if [ "$#" -ne 0 ] || [ "${RAY_NO_WAIT:-0}" != 0 ]; then
 fi
 export EP_SIZE="${EP_SIZE:-2}"
 export CHUNK_SIZE="${CHUNK_SIZE:-8192}"
-export NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
+export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
 export TRAIN_SEED="${TRAIN_SEED:-1235}"
 export CHUNKFLOW_PROFILE=0
 export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS=0
@@ -27,8 +27,8 @@ LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer over
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
 Update trace: ${RELAX_CHUNKFLOW_UPDATE_TRACE:-0}; convolution trace: ${RELAX_CHUNKFLOW_CONV_TRACE:-0}; tail trace: ${RELAX_CHUNKFLOW_TAIL_TRACE:-0}.
-Diagnostic timing is not performance evidence.
-Both arms use the same data and training configuration; only ChunkFlow is toggled.
+Diagnostics enabled: ${QWEN36_DIAGNOSTICS:-0}. Diagnostic timing is not performance evidence.
+All arms use the same data, seed and optimizer settings; ChunkFlow and the explicitly recorded diagnostic options may differ.
 Profiler and schedule prediction are disabled. For performance runs only, compare paired steps after the first 30 warmup steps using total-time ratios.
 Both arms must be rerun for this topology; previous EP1 measurements are not this baseline.
 EOF
@@ -61,7 +61,7 @@ for arm in "${arms[@]}"; do
       scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${mode}"
    echo "${arm}: complete" >> "${RESULT_DIR}/comparison.md"
 done
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}"
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}"
 if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_gradients.py "${RESULT_DIR}" --rollouts "${RELAX_CHUNKFLOW_GRAD_ROLLOUTS:-0,1,2,8}"
    if [ "${RELAX_CHUNKFLOW_CONV_TRACE:-0}" = 1 ]; then

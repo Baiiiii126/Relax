@@ -37,9 +37,10 @@ case "$1" in
       exec bash "${SCRIPT_DIR}/run-qwen36-35B-A3B-8xgpu-benefit.sh"
       ;;
    performance)
-      unset RELAX_CHUNKFLOW_LAYER_TRACE
-      export NUM_ROLLOUT="${PERF_STEPS:-100}" LEARNING_RATE=1e-5 QWEN36_DIAGNOSTICS=1
-      export RELAX_CHUNKFLOW_GRAD_ROLLOUTS=0
+      unset RELAX_CHUNKFLOW_LAYER_TRACE RELAX_CHUNKFLOW_GRAD_ROLLOUTS RELAX_CHUNKFLOW_DIAGNOSTIC_DIR
+      unset RELAX_TRAIN_PROFILE_DIR
+      export NUM_ROLLOUT="${PERF_STEPS:-50}" LEARNING_RATE=1e-5 QWEN36_DIAGNOSTICS=0
+      export RELAX_CHUNKFLOW_KV_GRAD_FP32=0 QWEN36_ROUTER_DTYPE="${QWEN36_ROUTER_DTYPE:-fp64}"
       exec bash "${SCRIPT_DIR}/run-qwen36-35B-A3B-8xgpu-benefit.sh"
       ;;
    localize|router64)

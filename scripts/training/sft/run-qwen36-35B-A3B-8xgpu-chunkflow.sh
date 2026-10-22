@@ -124,6 +124,8 @@ for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND"
     env.setdefault("env_vars", {})[key] = os.environ[key]
 if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
+else:
+    env.setdefault("env_vars", {}).pop("RELAX_TRAIN_PROFILE_DIR", None)
 for key in ("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR", "RELAX_CHUNKFLOW_GRAD_ROLLOUTS", "RELAX_CHUNKFLOW_LAYER_TRACE",
             "RELAX_CHUNKFLOW_UPDATE_TRACE", "RELAX_CHUNKFLOW_KV_GRAD_FP32", "RELAX_CHUNKFLOW_TAIL_TRACE", "RELAX_CHUNKFLOW_CONV_TRACE", "RELAX_CHUNKFLOW_CONV_CHUNK_SIZE"):
     if os.environ.get(key):
