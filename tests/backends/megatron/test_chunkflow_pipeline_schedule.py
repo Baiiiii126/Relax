@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextvars import ContextVar
 from types import SimpleNamespace
 
 import pytest
@@ -208,6 +209,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     import torch
     from megatron.training import global_vars
 
+    from relax.backends.megatron import training_profile
     from relax.backends.megatron.chunkflow import pipeline_schedules as executor
     from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
     from relax.backends.megatron.chunkflow.schedules import _plan
@@ -343,6 +345,8 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
 
     monkeypatch.setattr(model.chunkflow_runtime, "release_group", release)
     comm = Communicator()
+    profile = training_profile._StepProfile()
+    monkeypatch.setattr(training_profile, "_ACTIVE", ContextVar("test_profile", default=profile))
     executor.chunkflow_forward_backward_pipelining_without_interleaving(
         forward_step_func=None,
         data_iterator=iter((p, {}) for p in parents),
@@ -364,5 +368,12 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     assert metrics["num_microbatches"] == 5 and metrics["parent_window"] == parent_window
     assert config.variable_seq_lengths is True and comm.config is config
     assert config.batch_p2p_comm is True
+    windows = [name for name in profile.host if name.startswith("chunkflow.window") and name.count(".") == 2]
+    assert len(windows) == (len(parents) + parent_window - 1) // parent_window
+    for window in windows:
+        assert profile.host[window]["calls"] == 1
+        for phase in ("prepare", "warmup", "steady", "drain"):
+            keys = [name for name in profile.host if name.startswith(f"{window}.{phase}")]
+            assert len(keys) == 1 and profile.host[keys[0]]["calls"] == 1
     for key, expected in (("sf", stage != 3), ("rf", stage != 0), ("sb", stage != 0), ("rb", stage != 3)):
         assert comm.positions[key] == (len(forward_shapes) if expected else 0)

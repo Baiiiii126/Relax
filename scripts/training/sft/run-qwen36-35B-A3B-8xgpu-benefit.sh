@@ -53,6 +53,11 @@ Configuration and completion: comparison.md. Profile steps: ${PROFILE_START:-34}
 Profiler timing is diagnostic only; do not use it to claim speedup.
 Each arm writes GPU traces (*.pt.trace.json.gz) and per-rank segments_*.jsonl below.
 Host intervals include nested calls and waits; do not sum them as GPU compute time.
+ChunkFlow window scopes identify parent ranges and prepare/warmup/steady/drain phases, with unit counts.
+Warmup/drain include useful work; measure GPU idle and communication waits inside them to assess bubbles.
+Both arms split MoE routing, dispatch, expert computation and combine; dispatcher DtoH synchronization is marked when available.
+Missing MoE scopes mean the method was not installed; zero calls mean it was installed but unused.
+MoE scopes describe forward calls; use autograd events and GPU kernels inside backward for backward costs.
 Use the GPU trace to distinguish GDN recomputation inside backward from the initial forward.
 CUDA allocator peaks are per profiled step and include profiler effects; they exclude allocations outside PyTorch.
 EOF

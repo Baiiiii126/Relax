@@ -28,6 +28,7 @@ from relax.backends.megatron.chunkflow.schedule_model import make_model_plan, me
 from relax.backends.megatron.chunkflow.telemetry import summarize_plan
 from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import Unit, completed_groups
+from relax.backends.megatron.training_profile import train_phase
 from relax.utils.logging_utils import get_logger
 
 
@@ -211,185 +212,201 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     with no_sync_func():
         num_parents = _num_microbatches(num_microbatches)
         for mb_start in range(0, num_parents, parent_window):
-            by_id, owners, plans = {}, {}, []
-            group_offset = chunk_offset = 0
-            for mb_idx in range(mb_start, min(mb_start + parent_window, num_parents)):
-                parent = next_parent()
-                chunks, units = _plan(parent, chunk_size, policy)
-                plan = make_model_plan(units, chunks, keep_last_k, p2p_communicator.total_stages)
-                plans.append(plan)
-                cu = parent["packed_seq_params"].cu_seqlens_q_cpu
-                seq_lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
-                source_lengths = parent.get("total_lengths")
-                if source_lengths is None:
-                    source_lengths = seq_lengths
-                runtime.record_plan(
-                    replace(
-                        summarize_plan(
-                            seq_lengths,
-                            chunks,
-                            units,
-                            keep_last_k,
-                            p2p_communicator.total_stages,
-                            plan.warmups,
-                            include_schedule=runtime.schedule_analysis,
-                            source_rows=sum(int(length) for length in source_lengths),
-                        ),
-                        parent_window=parent_window,
-                    )
-                )
-                groups = {
-                    g: group_offset + i for i, g in enumerate(sorted({c.group for c in chunks if c.is_dependent}))
-                }
-                remapped = {
-                    c.chunk_id: replace(c, chunk_id=chunk_offset + i, group=groups.get(c.group))
-                    for i, c in enumerate(chunks)
-                }
-                for unit in units:
-                    uid = len(by_id)
-                    by_id[uid] = Unit(uid, [remapped[c.chunk_id] for c in unit.chunks])
-                    owners[uid] = (parent, mb_idx)
-                group_offset += len(groups)
-                chunk_offset += len(chunks)
-            plan = merge_model_plans(plans, p2p_communicator.total_stages)
-            fwd_seq, bwd_seq, need_fr = plan.forward, plan.backward, plan.recompute
-            W, n = plan.warmups[p2p_communicator.current_stage], len(fwd_seq)
-            unit_shapes = {
-                uid: _unit_shapes(
-                    unit, p2p_communicator.config, tp_group, cp_group, getattr(p2p_communicator, "pp_group", None)
-                )
-                if planned_shapes
-                else (recv_tensor_shapes, send_tensor_shapes)
-                for uid, unit in by_id.items()
-            }
+            window = (
+                f"chunkflow.window{mb_start // parent_window}."
+                f"parents{mb_start}-{min(mb_start + parent_window, num_parents) - 1}"
+            )
+            with train_phase(window):
+                with train_phase(f"{window}.prepare"):
+                    by_id, owners, plans = {}, {}, []
+                    group_offset = chunk_offset = 0
+                    for mb_idx in range(mb_start, min(mb_start + parent_window, num_parents)):
+                        parent = next_parent()
+                        chunks, units = _plan(parent, chunk_size, policy)
+                        plan = make_model_plan(units, chunks, keep_last_k, p2p_communicator.total_stages)
+                        plans.append(plan)
+                        cu = parent["packed_seq_params"].cu_seqlens_q_cpu
+                        seq_lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
+                        source_lengths = parent.get("total_lengths")
+                        if source_lengths is None:
+                            source_lengths = seq_lengths
+                        runtime.record_plan(
+                            replace(
+                                summarize_plan(
+                                    seq_lengths,
+                                    chunks,
+                                    units,
+                                    keep_last_k,
+                                    p2p_communicator.total_stages,
+                                    plan.warmups,
+                                    include_schedule=runtime.schedule_analysis,
+                                    source_rows=sum(int(length) for length in source_lengths),
+                                ),
+                                parent_window=parent_window,
+                            )
+                        )
+                        groups = {
+                            g: group_offset + i
+                            for i, g in enumerate(sorted({c.group for c in chunks if c.is_dependent}))
+                        }
+                        remapped = {
+                            c.chunk_id: replace(c, chunk_id=chunk_offset + i, group=groups.get(c.group))
+                            for i, c in enumerate(chunks)
+                        }
+                        for unit in units:
+                            uid = len(by_id)
+                            by_id[uid] = Unit(uid, [remapped[c.chunk_id] for c in unit.chunks])
+                            owners[uid] = (parent, mb_idx)
+                        group_offset += len(groups)
+                        chunk_offset += len(chunks)
+                    plan = merge_model_plans(plans, p2p_communicator.total_stages)
+                    fwd_seq, bwd_seq, need_fr = plan.forward, plan.backward, plan.recompute
+                    W, n = plan.warmups[p2p_communicator.current_stage], len(fwd_seq)
+                    unit_shapes = {
+                        uid: _unit_shapes(
+                            unit,
+                            p2p_communicator.config,
+                            tp_group,
+                            cp_group,
+                            getattr(p2p_communicator, "pp_group", None),
+                        )
+                        if planned_shapes
+                        else (recv_tensor_shapes, send_tensor_shapes)
+                        for uid, unit in by_id.items()
+                    }
 
-            def do_forward(unit_id, input_tensor):
-                nonlocal first_forward
-                parent, mb_idx = owners[unit_id]
-                unit = by_id[unit_id]
-                batch = slice_parent_batch(parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args)
-                batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
-                recompute = unit_id in need_fr
-                if recompute:
-                    batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, False)
-                with torch.no_grad() if recompute else contextlib.nullcontext():
-                    output_tensor, num_tokens = forward_step(
-                        fp_step_func if recompute else forward_step_func,
-                        iter([(batch, {})]),
-                        model,
-                        1,
-                        input_tensor,
-                        discarded if recompute else forward_data_store,
-                        config,
-                        cp_group_size=cp_size,
-                        collect_non_loss_data=False,
-                        is_first_microbatch=first_forward
-                        if recompute
-                        else check_first_val_step(first_val_step, forward_only, first_forward),
-                        current_microbatch=mb_idx,
-                        is_last_stage=is_last,
-                    )
-                first_forward = False
-                if planned_shapes and not is_last:
-                    _check_tensor_shapes(output_tensor, unit_shapes[unit_id][1])
-                return output_tensor, input_tensor, None if recompute else num_tokens
-
-            in_flight: dict[int, tuple] = {}
-            fp_inputs: dict[int, torch.Tensor] = {}
-
-            def backward(unit_id, output_tensor_grad):
-                fr_num_tokens = None
-                parent, mb_idx = owners.pop(unit_id)
-                if unit_id in need_fr:
-                    input_tensor = fp_inputs.pop(unit_id)
+                def do_forward(unit_id, input_tensor):
+                    nonlocal first_forward
+                    parent, mb_idx = owners[unit_id]
                     unit = by_id[unit_id]
                     batch = slice_parent_batch(
                         parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args
                     )
                     batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
-                    batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, True)
-                    output_tensor, fr_num_tokens = forward_step(
-                        forward_step_func,
-                        iter([(batch, {})]),
-                        model,
-                        1,
-                        input_tensor,
-                        forward_data_store,
-                        config,
-                        cp_group_size=cp_size,
-                        collect_non_loss_data=False,
-                        is_first_microbatch=False,
-                        current_microbatch=mb_idx,
-                        is_last_stage=is_last,
+                    recompute = unit_id in need_fr
+                    if recompute:
+                        batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, False)
+                    with torch.no_grad() if recompute else contextlib.nullcontext():
+                        output_tensor, num_tokens = forward_step(
+                            fp_step_func if recompute else forward_step_func,
+                            iter([(batch, {})]),
+                            model,
+                            1,
+                            input_tensor,
+                            discarded if recompute else forward_data_store,
+                            config,
+                            cp_group_size=cp_size,
+                            collect_non_loss_data=False,
+                            is_first_microbatch=first_forward
+                            if recompute
+                            else check_first_val_step(first_val_step, forward_only, first_forward),
+                            current_microbatch=mb_idx,
+                            is_last_stage=is_last,
+                        )
+                    first_forward = False
+                    if planned_shapes and not is_last:
+                        _check_tensor_shapes(output_tensor, unit_shapes[unit_id][1])
+                    return output_tensor, input_tensor, None if recompute else num_tokens
+
+                in_flight: dict[int, tuple] = {}
+                fp_inputs: dict[int, torch.Tensor] = {}
+
+                def backward(unit_id, output_tensor_grad):
+                    fr_num_tokens = None
+                    parent, mb_idx = owners.pop(unit_id)
+                    if unit_id in need_fr:
+                        input_tensor = fp_inputs.pop(unit_id)
+                        unit = by_id[unit_id]
+                        batch = slice_parent_batch(
+                            parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args
+                        )
+                        batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
+                        batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, True)
+                        output_tensor, fr_num_tokens = forward_step(
+                            forward_step_func,
+                            iter([(batch, {})]),
+                            model,
+                            1,
+                            input_tensor,
+                            forward_data_store,
+                            config,
+                            cp_group_size=cp_size,
+                            collect_non_loss_data=False,
+                            is_first_microbatch=False,
+                            current_microbatch=mb_idx,
+                            is_last_stage=is_last,
+                        )
+                        # Megatron custom_backward requires pseudo-freed outputs, including Fr.
+                        deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                    else:
+                        input_tensor, output_tensor = in_flight.pop(unit_id)
+                    input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                    if planned_shapes and not is_first:
+                        _check_tensor_shapes(input_tensor_grad, unit_shapes[unit_id][0])
+                    for group in completed_groups(by_id[unit_id]):
+                        runtime.release_group(group)
+                    return input_tensor_grad, fr_num_tokens
+
+                with train_phase(f"{window}.warmup.units{W}.total{n}"):
+                    for i in range(W):
+                        input_tensor = (
+                            None if is_first else p2p_communicator.recv_forward(unit_shapes[fwd_seq[i]][0], is_first)
+                        )
+                        output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[i], input_tensor)
+                        if num_tokens is not None:
+                            total_num_tokens += num_tokens
+                            in_flight[fwd_seq[i]] = (fwd_input, output_tensor)
+                        else:
+                            fp_inputs[fwd_seq[i]] = fwd_input
+                        if not is_last:
+                            p2p_communicator.send_forward(output_tensor, is_last)
+                        deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+
+                with train_phase(f"{window}.steady.units{n - W}"):
+                    n_steady = n - W
+                    input_tensor = None
+                    if n_steady > 0 and not is_first:
+                        input_tensor = p2p_communicator.recv_forward(unit_shapes[fwd_seq[W]][0], is_first)
+                    for i in range(n_steady):
+                        last_iter = i == n_steady - 1
+                        output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[W + i], input_tensor)
+                        if num_tokens is not None:
+                            total_num_tokens += num_tokens
+                            in_flight[fwd_seq[W + i]] = (fwd_input, output_tensor)
+                        else:
+                            fp_inputs[fwd_seq[W + i]] = fwd_input
+                        output_tensor_grad = p2p_communicator.send_forward_recv_backward(
+                            output_tensor, unit_shapes[bwd_seq[i]][1], is_last
+                        )
+                        deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                        input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
+                        if fr_num_tokens is not None:
+                            total_num_tokens += fr_num_tokens
+                        if last_iter:
+                            if not is_first:
+                                p2p_communicator.send_backward(input_tensor_grad, is_first)
+                        else:
+                            input_tensor = p2p_communicator.send_backward_recv_forward(
+                                input_tensor_grad, unit_shapes[fwd_seq[W + i + 1]][0], is_first
+                            )
+
+                with train_phase(f"{window}.drain.units{W}"):
+                    for i in range(n_steady, n):
+                        output_tensor_grad = (
+                            None if is_last else p2p_communicator.recv_backward(unit_shapes[bwd_seq[i]][1], is_last)
+                        )
+                        input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
+                        if fr_num_tokens is not None:
+                            total_num_tokens += fr_num_tokens
+                        if not is_first:
+                            p2p_communicator.send_backward(input_tensor_grad, is_first)
+
+                if owners or in_flight or fp_inputs:
+                    raise RuntimeError(
+                        f"chunkflow pipeline: parent window {mb_start} ended with {len(in_flight)} forwarded and "
+                        f"{len(fp_inputs)} unrecomputed unit(s) -- schedule bug"
                     )
-                    # Megatron custom_backward requires pseudo-freed outputs, including Fr.
-                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
-                else:
-                    input_tensor, output_tensor = in_flight.pop(unit_id)
-                input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-                if planned_shapes and not is_first:
-                    _check_tensor_shapes(input_tensor_grad, unit_shapes[unit_id][0])
-                for group in completed_groups(by_id[unit_id]):
-                    runtime.release_group(group)
-                return input_tensor_grad, fr_num_tokens
-
-            for i in range(W):
-                input_tensor = (
-                    None if is_first else p2p_communicator.recv_forward(unit_shapes[fwd_seq[i]][0], is_first)
-                )
-                output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[i], input_tensor)
-                if num_tokens is not None:
-                    total_num_tokens += num_tokens
-                    in_flight[fwd_seq[i]] = (fwd_input, output_tensor)
-                else:
-                    fp_inputs[fwd_seq[i]] = fwd_input
-                if not is_last:
-                    p2p_communicator.send_forward(output_tensor, is_last)
-                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
-
-            n_steady = n - W
-            input_tensor = None
-            if n_steady > 0 and not is_first:
-                input_tensor = p2p_communicator.recv_forward(unit_shapes[fwd_seq[W]][0], is_first)
-            for i in range(n_steady):
-                last_iter = i == n_steady - 1
-                output_tensor, fwd_input, num_tokens = do_forward(fwd_seq[W + i], input_tensor)
-                if num_tokens is not None:
-                    total_num_tokens += num_tokens
-                    in_flight[fwd_seq[W + i]] = (fwd_input, output_tensor)
-                else:
-                    fp_inputs[fwd_seq[W + i]] = fwd_input
-                output_tensor_grad = p2p_communicator.send_forward_recv_backward(
-                    output_tensor, unit_shapes[bwd_seq[i]][1], is_last
-                )
-                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
-                input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
-                if fr_num_tokens is not None:
-                    total_num_tokens += fr_num_tokens
-                if last_iter:
-                    if not is_first:
-                        p2p_communicator.send_backward(input_tensor_grad, is_first)
-                else:
-                    input_tensor = p2p_communicator.send_backward_recv_forward(
-                        input_tensor_grad, unit_shapes[fwd_seq[W + i + 1]][0], is_first
-                    )
-
-            for i in range(n_steady, n):
-                output_tensor_grad = (
-                    None if is_last else p2p_communicator.recv_backward(unit_shapes[bwd_seq[i]][1], is_last)
-                )
-                input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
-                if fr_num_tokens is not None:
-                    total_num_tokens += fr_num_tokens
-                if not is_first:
-                    p2p_communicator.send_backward(input_tensor_grad, is_first)
-
-            if owners or in_flight or fp_inputs:
-                raise RuntimeError(
-                    f"chunkflow pipeline: parent window {mb_start} ended with {len(in_flight)} forwarded and "
-                    f"{len(fp_inputs)} unrecomputed unit(s) -- schedule bug"
-                )
-            runtime.assert_empty(f"chunkflow PP={p2p_communicator.total_stages} parent window {mb_start}")
+                runtime.assert_empty(f"chunkflow PP={p2p_communicator.total_stages} parent window {mb_start}")
 
     if config.grad_sync_func is not None:
         config.grad_sync_func(model.parameters())

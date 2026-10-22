@@ -38,6 +38,8 @@ class _StepProfile:
                 row["inclusive_s"] += perf_counter() - start
 
     def wrap_call(self, function: Any, name: str) -> Any:
+        self.host.setdefault(name, {"calls": 0, "inclusive_s": 0.0})
+
         @wraps(function)
         def measured(*args: Any, **kwargs: Any) -> Any:
             with self.phase(name):
@@ -100,6 +102,19 @@ class _StepProfile:
                     self.wrap(module, "_forward_compute", "model.gdn_compute")
                 elif "MoELayer" in names:
                     self.wrap(module, "forward", "model.moe_forward")
+                    for attribute in ("router", "experts", "shared_experts"):
+                        self.wrap(getattr(module, attribute, None), "forward", f"model.moe.{attribute}")
+                    dispatcher = getattr(module, "token_dispatcher", None)
+                    for method in (
+                        "dispatch_preprocess",
+                        "token_dispatch",
+                        "dispatch_postprocess",
+                        "combine_preprocess",
+                        "token_combine",
+                        "combine_postprocess",
+                        "_maybe_dtoh_and_synchronize",
+                    ):
+                        self.wrap(dispatcher, method, f"model.moe.{method}")
                 elif any(name.endswith("SelfAttention") for name in names):
                     self.wrap(module, "forward", "model.attention_forward")
 
