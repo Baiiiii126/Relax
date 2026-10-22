@@ -14,6 +14,7 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
 
     torch.set_num_threads(1)
     issues = []
+    supervised = {}
     suffix = prefix if candidate == "chunkflow" else prefix + "-baseline-repeat"
 
     def load(arm: str) -> dict:
@@ -24,8 +25,10 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
             issues.append(f"{arm}: expected 8 rank files, found {len(paths)}")
         for path in paths:
             for event in torch.load(path, map_location="cpu", weights_only=True):
-                for row, value in zip(event["rows"], event["values"], strict=True):
+                for index, (row, value) in enumerate(zip(event["rows"], event["values"], strict=True)):
                     key = (event["layer"], event["kind"], event["parent"], row)
+                    if "supervised" in event:
+                        supervised[arm, key] = bool(event["supervised"][index])
                     if key in records and not torch.equal(records[key], value):
                         issues.append(f"Conflicting repeated token: {arm}: {key}")
                         conflicts.add(key)
@@ -64,8 +67,26 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
                 "cosine": dot / (bn * cn) if bn and cn else None,
                 "max_abs": maximum,
                 "changed_tokens": int((b != c).any(dim=1).sum()),
+                "baseline_nonzero_tokens": int(b.ne(0).any(dim=1).sum()),
+                "candidate_nonzero_tokens": int(c.ne(0).any(dim=1).sum()),
+                "supervised_tokens": sum(
+                    supervised.get(("baseline", key), False) and supervised.get((candidate, key), False)
+                    for key in base.keys() & chunk.keys()
+                    if key[:2] == (layer, kind)
+                ),
             }
         )
+    if prefix == "tail":
+        for row in rows:
+            if row["event"] == "log_probs_grad":
+                if not row["baseline_nonzero_tokens"] or not row["candidate_nonzero_tokens"]:
+                    issues.append(
+                        "All sampled log-probability gradients are zero in at least one arm; upstream equality is inconclusive. Sample supervised answer tokens before locating an operator."
+                    )
+                if not row["supervised_tokens"]:
+                    issues.append(
+                        "No supervised-token metadata at the loss boundary; this trace cannot certify answer-token coverage."
+                    )
     if rows:
         with (folder / f"{suffix}.csv").open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
@@ -105,12 +126,12 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
         "Other layers sample 32 token positions and 64 activation/gradient features; sampled router inputs/probabilities retain all features.",
         "Small floating-point differences are not automatically bugs. Routing differences alone do not prove faulty backward.",
         "",
-        "| Layer | Event | Tokens | Relative L2 | Cosine | Max absolute difference | Changed tokens |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Layer | Event | Tokens | Relative L2 | Cosine | Max absolute difference | Changed tokens | Nonzero tokens B/C | Supervised tokens |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
     ]
     if prefix == "tail":
         lines[5:8] = [
-            "Tail probes retain all hidden features at 32 canonical token positions; padding excluded.",
+            "Tail probes retain all hidden features at 32 uniform parent positions plus up to 16 supervised positions per sequence; padding excluded.",
             "Head logits retain 64 fixed local-vocabulary coordinates plus the target coordinate (zero on non-owning TP rank).",
             "Head input gradients are before the dtype cast and kept separate by TP rank; logit gradients are at the CE input after temperature scaling.",
             "Read backward from log_probs_grad -> lm_head_logits_*_grad -> lm_head_input_*_grad -> final_norm_*_grad -> layer40 -> layer39.",
@@ -124,7 +145,7 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
         lines.append(
             f"| {row['layer']} | {row['event']} | {row['tokens']} | "
             + " | ".join(numbers)
-            + f" | {row['changed_tokens']} |"
+            + f" | {row['changed_tokens']} | {row['baseline_nonzero_tokens']}/{row['candidate_nonzero_tokens']} | {row['supervised_tokens']} |"
         )
     lines += ["", "## Coverage problems", *[f"- {issue}" for issue in issues]]
     if not rows:

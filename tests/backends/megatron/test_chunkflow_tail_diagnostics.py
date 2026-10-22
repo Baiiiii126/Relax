@@ -30,13 +30,16 @@ def test_tail_probes_pair_repacked_head_rows_and_preserve_backward(tmp_path, mon
 
     monkeypatch.setattr(ps, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(ps, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setenv("RELAX_CHUNKFLOW_TAIL_TRACE", "1")
     torch.manual_seed(1)
     model = torch.nn.Module()
     model.layers = torch.nn.Sequential(TransformerLayer(39), TransformerLayer(40))
     model.final_layernorm = torch.nn.LayerNorm(4)
     head = torch.nn.Linear(4, 8)
     x = torch.randn(64, 1, 4)
-    parent = {"tokens": torch.arange(64).view(1, 64), "total_lengths": [64]}
+    mask = torch.zeros(1, 64)
+    mask[0, 62] = 1  # Uniform 32-point sampling misses this sole supervised answer position.
+    parent = {"tokens": torch.arange(64).view(1, 64), "total_lengths": [64], "full_loss_masks": mask}
     gradients = []
     for arm in ("plain", "baseline", "baseline_repeat", "chunkflow"):
         model.zero_grad(set_to_none=True)
@@ -61,14 +64,16 @@ def test_tail_probes_pair_repacked_head_rows_and_preserve_backward(tmp_path, mon
                         targets = (torch.arange(logits.shape[0]) + start + offset) % 8
                         lp = logits.log_softmax(-1).gather(1, targets[:, None])
                         td.tap_head(source, h, logits, lp, targets)
-                        outputs.append(-lp.sum())
+                        outputs.append(-(lp * mask[0, start + offset : start + offset + logits.shape[0], None]).sum())
                     return sum(outputs)
 
                 measured_loss = td.bind_loss_probe(loss, batch)
                 loss_value = (
                     checkpoint(measured_loss, source, use_reentrant=True) if recompute else measured_loss(source)
                 )
-                ld.set_batch({"tokens": torch.tensor([[99]]), "total_lengths": [1]})
+                ld.set_batch(
+                    {"tokens": torch.tensor([[99]]), "total_lengths": [1], "full_loss_masks": torch.zeros(1, 1)}
+                )
                 loss_value.backward()
             if arm == "plain":
                 td._TRACE.reset(active)
@@ -101,6 +106,16 @@ def test_tail_probes_pair_repacked_head_rows_and_preserve_backward(tmp_path, mon
         "selected"
     ]
     assert next(e for e in captured if e["kind"] == "lm_head_logits_tp0")["values"].shape[1] == 9
+    loss_row = next(r for r in rows if r["event"] == "log_probs_grad")
+    assert loss_row["supervised_tokens"] == "1" and loss_row["baseline_nonzero_tokens"] == "1"
+    assert ld._layout(parent)["supervised"] == {62}
+    file = tmp_path / "chunkflow/diagnostics/tail_r0_rank0.pt"
+    for event in captured:
+        if event["kind"] == "log_probs_grad":
+            event["values"].zero_()
+    torch.save(captured, file)
+    compare(tmp_path, prefix="tail")
+    assert "All sampled log-probability gradients are zero" in (tmp_path / "tail.md").read_text()
 
 
 def test_tail_sequence_parallel_coordinates_and_cleanup_on_error(tmp_path, monkeypatch):

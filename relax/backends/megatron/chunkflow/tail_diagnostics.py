@@ -61,7 +61,14 @@ def _tap(
                 fixed = torch.cat((fixed, selected.gather(1, target_indices) * target_valid), dim=1)
             selected = fixed
         trace["events"].append(
-            {"layer": layer, "kind": event, "parent": layout["parent"], "rows": canonical, "values": selected.clone()}
+            {
+                "layer": layer,
+                "kind": event,
+                "parent": layout["parent"],
+                "rows": canonical,
+                "supervised": [row in layout.get("supervised", set()) for row in canonical],
+                "values": selected.clone(),
+            }
         )
 
     record(value, kind)

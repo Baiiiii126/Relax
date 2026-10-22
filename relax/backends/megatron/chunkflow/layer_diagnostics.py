@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -35,11 +36,24 @@ def _layout(batch: dict) -> dict:
             physical[row] = row
         identity = hashlib.sha256(tokens[valid_rows].cpu().numpy().tobytes())
         identity.update(str((tuple(lengths), tuple(int(n) for n in cu))).encode())
+        selected = {valid_rows[i * (len(valid_rows) - 1) // 31] for i in range(32)} if valid_rows else set()
+        supervised = set()
+        if os.environ.get("RELAX_CHUNKFLOW_TAIL_TRACE") == "1":
+            mask = batch.get("full_loss_masks")
+            if mask is None or mask.numel() != tokens.numel():
+                raise ValueError("Tail probes require the aligned full_loss_masks to sample supervised tokens")
+            active = mask.detach().reshape(-1).ne(0).cpu().tolist()
+            for start, end in spans:
+                candidates = [row for row in range(start, end) if active[row]]
+                count = min(16, len(candidates))
+                supervised.update(candidates)
+                selected.update(candidates[i * (len(candidates) - 1) // max(1, count - 1)] for i in range(count))
         batch[_LAYOUT] = {
             "parent": identity.hexdigest(),
             "rows": physical,
             "spans": spans,
-            "selected": {valid_rows[i * (len(valid_rows) - 1) // 31] for i in range(32)} if valid_rows else set(),
+            "selected": selected,
+            "supervised": supervised,
         }
     return batch[_LAYOUT]
 
