@@ -140,3 +140,90 @@ def test_layer_trace_tracks_sequence_parallel_row_placement(monkeypatch):
         assert indices == [0, 1, 2, 3] and rows == [2, 3, 4, 5]
     finally:
         ld._BATCH.reset(token)
+
+
+def test_first_update_captures_clipping_master_and_restores_methods(tmp_path, monkeypatch):
+    from relax.backends.megatron.chunkflow import update_diagnostics as ud
+
+    model = torch.nn.Linear(3, 2, bias=False)
+    parameter = model.weight
+    parameter.grad = torch.ones_like(parameter)
+    master = parameter.detach().float().clone()
+    shard = torch.nn.Parameter(parameter.detach().clone())
+    shard.decoupled_grad = torch.ones_like(shard)
+
+    class Hybrid:
+        def __init__(self):
+            self.param_to_inner_param = {shard: master}
+            self.param_groups = [{"params": [shard], "lr": 0.1}]
+            self.state = {}
+
+        def step(self):
+            master.sub_(shard.decoupled_grad * 0.1)
+            self.state[shard] = {"exp_avg": shard.decoupled_grad.clone(), "exp_avg_sq": shard.decoupled_grad.square()}
+
+    class Outer:
+        def __init__(self):
+            self.optimizer = Hybrid()
+            self.model_param_group_index_map = {parameter: (0, 0)}
+
+        def _get_model_param_range_map(self, parameter):
+            from types import SimpleNamespace
+
+            return {"param": SimpleNamespace(start=0, end=parameter.numel())}
+
+        def prepare_grads(self):
+            shard.decoupled_grad.mul_(2)
+
+        def step(self):
+            self.prepare_grads()
+            shard.decoupled_grad.mul_(0.25)
+            self.optimizer.step()
+            with torch.no_grad():
+                parameter.copy_(master)
+
+    optimizer = Outer()
+    monkeypatch.setenv("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR", str(tmp_path))
+    monkeypatch.setenv("RELAX_CHUNKFLOW_GRAD_ROLLOUTS", "0")
+    monkeypatch.setenv("RELAX_CHUNKFLOW_UPDATE_TRACE", "1")
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    before = master.clone()
+    with ud.trace_update([model], optimizer, 0, 0):
+        optimizer.step()
+    data = torch.load(tmp_path / "update_r0_s0_rank0.pt", weights_only=True)
+    assert not data["issues"]
+    record = data["optimizers"][0]
+    torch.testing.assert_close(data["prepared_grad"]["0.weight"], torch.full((64,), 2.0))
+    torch.testing.assert_close(record["clipped_grad"]["0.weight"], torch.full((64,), 0.5))
+    torch.testing.assert_close(
+        record["after_master"]["0.weight"] - record["before_master"]["0.weight"], torch.full((64,), -0.05)
+    )
+    torch.testing.assert_close(master, before - 0.05)
+    assert "step" not in vars(optimizer.optimizer) and "prepare_grads" not in vars(optimizer)
+    import runpy
+
+    for arm in ("baseline", "chunkflow"):
+        folder = tmp_path / arm / "diagnostics"
+        folder.mkdir(parents=True)
+        if arm == "chunkflow":
+            record["after_master"]["0.weight"].add_(0.01)
+        torch.save(data, folder / "update_r0_s0_rank0.pt")
+    path = Path(__file__).resolve().parents[3] / "scripts/training/sft/tools/compare_qwen36_updates.py"
+    runpy.run_path(str(path))["compare"](tmp_path)
+    rows = list(csv.DictReader((tmp_path / "updates.csv").open()))
+    delta = next(r for r in rows if r["field"] == "master_delta")
+    assert float(delta["relative_l2"]) == pytest.approx(0.2, abs=1e-5)
+    with pytest.raises(RuntimeError, match="stop"):
+        with ud.trace_update([model], optimizer, 0, 0):
+            raise RuntimeError("stop")
+    assert "step" not in vars(optimizer.optimizer) and "prepare_grads" not in vars(optimizer)
+
+    from types import SimpleNamespace
+
+    bad_owner = Outer()
+    bad_owner.model_param_group_index_map = {parameter: (99, 0)}
+    chain = SimpleNamespace(chained_optimizers=[optimizer, bad_owner])
+    with pytest.raises(IndexError):
+        with ud.trace_update([model], chain, 0, 0):
+            pass
+    assert "step" not in vars(optimizer.optimizer)

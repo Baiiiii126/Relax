@@ -124,7 +124,8 @@ for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND"
     env.setdefault("env_vars", {})[key] = os.environ[key]
 if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
-for key in ("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR", "RELAX_CHUNKFLOW_GRAD_ROLLOUTS", "RELAX_CHUNKFLOW_LAYER_TRACE"):
+for key in ("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR", "RELAX_CHUNKFLOW_GRAD_ROLLOUTS", "RELAX_CHUNKFLOW_LAYER_TRACE",
+            "RELAX_CHUNKFLOW_UPDATE_TRACE"):
     if os.environ.get(key):
         env.setdefault("env_vars", {})[key] = os.environ[key]
     else:
@@ -140,7 +141,6 @@ TRAIN_ARGS=(
    --loss-type sft
    --prompt-data "${PROMPT_DATA}"
    --input-key "${INPUT_KEY:-question}"
-   --label-key "${LABEL_KEY:-answer}"
    --num-rollout "${NUM_ROLLOUT}"
    --global-batch-size "${GBS}"
    --micro-batch-size 1
@@ -180,6 +180,9 @@ TRAIN_ARGS=(
    --tb-project-name "${PROJECT_NAME}"
    --tb-experiment-name "${RUN_NAME}"
 )
+if [ -n "${LABEL_KEY-answer}" ]; then
+   TRAIN_ARGS+=(--label-key "${LABEL_KEY-answer}")
+fi
 SUBMIT_ARGS=(--address="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}")
 case "${RAY_NO_WAIT:-0}" in
    0|"") ;;

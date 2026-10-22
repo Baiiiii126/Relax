@@ -1259,7 +1259,13 @@ def train_one_step(
         from relax.backends.megatron.chunkflow.diagnostics import capture_gradients
 
         capture_gradients(model, rollout_id, step_id)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if os.environ.get("RELAX_CHUNKFLOW_UPDATE_TRACE") == "1":
+        from relax.backends.megatron.chunkflow.update_diagnostics import trace_update
+
+        with trace_update(model, optimizer, rollout_id, step_id):
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
