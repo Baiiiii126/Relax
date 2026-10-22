@@ -262,7 +262,9 @@ def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding(monkeypatch):
 
 
 @pytest.mark.parametrize("keep_last_k", [1 << 30, 1])
-def test_unit_schedule_outputs_gradients_and_release_match_sdpa(keep_last_k):
+@pytest.mark.parametrize("fp32", [False, True])
+def test_unit_schedule_outputs_gradients_and_release_match_sdpa(keep_last_k, fp32, monkeypatch):
+    monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", str(int(fp32)))
     from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
     from relax.backends.megatron.chunkflow.units import completed_groups, gen_unit_ops
 
@@ -303,3 +305,32 @@ def test_unit_schedule_outputs_gradients_and_release_match_sdpa(keep_last_k):
     torch.testing.assert_close(torch.cat([outputs[u.unit_id] for u in units]), expected_output, atol=1e-9, rtol=1e-9)
     for got, want in zip(chunked, reference):
         torch.testing.assert_close(got.grad, want.grad, atol=1e-9, rtol=1e-9)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_kv_cache_fp32_accumulates_across_backward_without_changing_values(monkeypatch, dtype):
+    from relax.backends.megatron.chunkflow.integration import _cache_leaf, _fold_leaf_grad_into
+
+    monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", "1")
+    live = torch.zeros(2, 1, 4, dtype=dtype, requires_grad=True)
+    leaf = _cache_leaf(live)
+    assert leaf.dtype == dtype and torch.equal(leaf, live)
+    for coefficient in (256, 1, 1):
+        (leaf * coefficient).sum().backward()
+        assert leaf.grad is None
+    expected_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    assert leaf._chunkflow_grad_sum.dtype == expected_dtype
+    torch.testing.assert_close(leaf._chunkflow_grad_sum, torch.full_like(leaf._chunkflow_grad_sum, 258))
+    _fold_leaf_grad_into(live, leaf)
+    (live * 0).sum().backward()
+    torch.testing.assert_close(live.grad, torch.full_like(live, 258), rtol=0, atol=0)
+    monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", "0")
+    old_live = torch.zeros_like(live, requires_grad=True)
+    old_leaf = _cache_leaf(old_live)
+    for coefficient in (256, 1, 1):
+        (old_leaf * coefficient).sum().backward()
+    _fold_leaf_grad_into(old_live, old_leaf)
+    (old_live * 0).sum().backward()
+    torch.testing.assert_close(
+        old_live.grad, torch.full_like(old_live, 256 if dtype == torch.bfloat16 else 258), rtol=0, atol=0
+    )

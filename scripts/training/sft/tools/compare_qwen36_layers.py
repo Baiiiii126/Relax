@@ -15,7 +15,7 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
     torch.set_num_threads(1)
     issues = []
     supervised = {}
-    suffix = prefix if candidate == "chunkflow" else prefix + "-baseline-repeat"
+    suffix = prefix if candidate == "chunkflow" else prefix + "-" + candidate.replace("_", "-")
 
     def load(arm: str) -> dict:
         records = {}
@@ -110,6 +110,21 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
             (40, "lm_head_logits_tp1"),
             (40, "log_probs"),
         }
+        required.update({(40, "linear_proj_output"), (40, "linear_qkv_input")})
+        for tp_rank in range(2):
+            for kind in (
+                "linear_proj_input",
+                "linear_qkv_output",
+                "q_layernorm_input",
+                "q_layernorm_output",
+                "k_layernorm_input",
+                "k_layernorm_output",
+                "core_query",
+                "core_key",
+                "core_value",
+                "core_output",
+            ):
+                required.add((40, kind + f"_tp{tp_rank}"))
         for arm, events in (("baseline", base), (candidate, chunk)):
             present = {key[:2] for key in events}
             for layer, kind in sorted(required):
@@ -136,7 +151,7 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
             "Head input gradients are before the dtype cast and kept separate by TP rank; logit gradients are at the CE input after temperature scaling.",
             "Read backward from log_probs_grad -> lm_head_logits_*_grad -> lm_head_input_*_grad -> final_norm_*_grad -> layer40 -> layer39.",
             "Attention/MoE residual branches mean an increase in relative error alone does not prove the first faulty operator.",
-            "Compare with tail-baseline-repeat.md. Full loss equality or matching samples do not prove full gradient equality.",
+            "Compare with tail-baseline-repeat.md or tail-chunkflow-control.md. Full loss equality or matching samples do not prove full gradient equality.",
         ]
     for row in rows:
         numbers = [
@@ -156,7 +171,9 @@ def compare(folder: Path, candidate: str = "chunkflow", prefix: str = "layers") 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
-    parser.add_argument("--candidate", choices=("chunkflow", "baseline_repeat"), default="chunkflow")
+    parser.add_argument(
+        "--candidate", choices=("chunkflow", "baseline_repeat", "chunkflow_control"), default="chunkflow"
+    )
     parser.add_argument("--prefix", choices=("layers", "tail"), default="layers")
     args = parser.parse_args()
     compare(args.folder, args.candidate, args.prefix)

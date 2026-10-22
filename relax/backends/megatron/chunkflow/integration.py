@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 
 import torch
 from torch import nn
@@ -62,7 +63,7 @@ class ChunkedCoreAttention(nn.Module):
             if not recompute:
                 store.put(
                     group_idx,
-                    ChunkState({"k": k_own.detach().requires_grad_(True), "v": v_own.detach().requires_grad_(True)}),
+                    ChunkState({"k": _cache_leaf(k_own), "v": _cache_leaf(v_own)}),
                 )
             states = store.lookup(group_idx)
             _fold_leaf_grad_into(k_own, states[-1].tensors["k"])
@@ -134,9 +135,30 @@ class ChunkedCoreAttention(nn.Module):
         return out.reshape(out.shape[0], -1)
 
 
+def _cache_leaf(tensor: torch.Tensor) -> torch.Tensor:
+    leaf = tensor.detach().requires_grad_(True)
+    if os.environ.get("RELAX_CHUNKFLOW_KV_GRAD_FP32") == "1":
+        leaf._chunkflow_grad_sum = None
+
+        def accumulate(value: torch.Tensor) -> None:
+            grad = value.grad
+            dtype = torch.float32 if grad.dtype in (torch.float16, torch.bfloat16) else grad.dtype
+            if value._chunkflow_grad_sum is None:
+                value._chunkflow_grad_sum = grad.to(dtype).clone()
+            else:
+                value._chunkflow_grad_sum.add_(grad)
+            value.grad = None
+
+        leaf.register_post_accumulate_grad_hook(accumulate)
+    return leaf
+
+
 def _fold_leaf_grad_into(live: torch.Tensor, leaf: torch.Tensor) -> None:
     # Descending backward folds later chunks' leaf gradients into this chunk.
     def hook(grad: torch.Tensor) -> torch.Tensor:
+        if hasattr(leaf, "_chunkflow_grad_sum"):
+            cached = leaf._chunkflow_grad_sum
+            return grad if cached is None else (grad.to(cached.dtype) + cached).to(grad.dtype)
         return grad if leaf.grad is None else grad + leaf.grad
 
     # Fp has no graph; Fr attaches this hook to recomputed K/V.

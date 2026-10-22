@@ -12,11 +12,30 @@ from relax.backends.megatron.chunkflow import layer_diagnostics as ld
 from relax.backends.megatron.chunkflow import tail_diagnostics as td
 
 
+class CoreAttention(torch.nn.Module):
+    def forward(self, query, key, value):
+        return query + key + value
+
+
+class Attention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_qkv = torch.nn.Linear(4, 12)
+        self.q_layernorm = torch.nn.LayerNorm(4)
+        self.k_layernorm = torch.nn.LayerNorm(4)
+        self.core_attention = CoreAttention()
+        self.linear_proj = torch.nn.Linear(4, 4)
+
+    def forward(self, hidden_states):
+        q, k, v = self.linear_qkv(hidden_states).chunk(3, dim=-1)
+        return self.linear_proj(self.core_attention(self.q_layernorm(q), self.k_layernorm(k), v))
+
+
 class TransformerLayer(torch.nn.Module):
     def __init__(self, layer):
         super().__init__()
         self.layer_number = layer
-        self.self_attention = torch.nn.Linear(4, 4)
+        self.self_attention = Attention()
         self.mlp = torch.nn.Linear(4, 4)
 
     def forward(self, hidden_states):
@@ -95,6 +114,14 @@ def test_tail_probes_pair_repacked_head_rows_and_preserve_backward(tmp_path, mon
         "final_norm_input_grad",
         "attention_input_grad",
         "moe_input_grad",
+        "linear_qkv_output_tp0_grad",
+        "linear_qkv_input_grad",
+        "linear_proj_input_tp0_grad",
+        "linear_proj_output_grad",
+        "core_query_tp0_grad",
+        "core_key_tp0_grad",
+        "core_value_tp0_grad",
+        "core_output_tp0_grad",
     }
     compare(tmp_path, prefix="tail")
     rows = list(csv.DictReader((tmp_path / "tail.csv").open()))

@@ -119,7 +119,7 @@ def tap_head(
     _tap(log_probs, 40, "log_probs", layout, rows)
 
 
-def _boundary(value: torch.Tensor, layer: int, kind: str) -> None:
+def _boundary(value: torch.Tensor, layer: int, kind: str, *, separate_tp: bool = False) -> None:
     if _TRACE.get() is None or not torch.is_grad_enabled():
         return
     layout, _, _ = ld._selection(value)
@@ -129,7 +129,7 @@ def _boundary(value: torch.Tensor, layer: int, kind: str) -> None:
 
         start = ps.get_tensor_model_parallel_rank() * value.shape[0]
         rows = rows[start : start + value.shape[0]]
-    _tap(value, layer, kind, layout, rows)
+    _tap(value, layer, kind, layout, rows, separate_tp=separate_tp)
 
 
 @contextmanager
@@ -141,14 +141,14 @@ def trace_tail(models: Any, folder: Path, rollout: int, rank: int) -> Iterator[N
         restore.callback(ld._TRACE.reset, coords)
         restore.callback(ld._BATCH.reset, batch)
 
-        def attach(module: Any, layer: int, kind: str) -> None:
+        def attach(module: Any, layer: int, kind: str, *, input_tp: bool = False, output_tp: bool = False) -> None:
             def pre(module: Any, args: tuple, kwargs: dict) -> None:
                 value = args[0] if args else kwargs["hidden_states"]
-                _boundary(value, layer, kind + "_input")
+                _boundary(value, layer, kind + "_input", separate_tp=input_tp)
 
             def post(module: Any, args: tuple, output: Any) -> None:
                 value = output[0] if isinstance(output, tuple) else output
-                _boundary(value, layer, kind + "_output")
+                _boundary(value, layer, kind + "_output", separate_tp=output_tp)
 
             restore.callback(module.register_forward_pre_hook(pre, with_kwargs=True).remove)
             restore.callback(module.register_forward_hook(post).remove)
@@ -164,6 +164,35 @@ def trace_tail(models: Any, folder: Path, rollout: int, rank: int) -> Iterator[N
                     if layer == 40:
                         attach(module.self_attention, layer, "attention")
                         attach(module.mlp, layer, "moe")
+                        attention = module.self_attention
+                        for child_name in ("linear_proj", "linear_qkv", "q_layernorm", "k_layernorm"):
+                            child = getattr(attention, child_name, None)
+                            if child is not None:
+                                attach(
+                                    child,
+                                    layer,
+                                    child_name,
+                                    input_tp=child_name != "linear_qkv",
+                                    output_tp=child_name != "linear_proj",
+                                )
+                        core = getattr(attention, "core_attention", None)
+                        if core is not None:
+
+                            def core_pre(module: Any, args: tuple, kwargs: dict) -> None:
+                                for index, name in enumerate(("query", "key", "value")):
+                                    value = args[index] if len(args) > index else kwargs[name]
+                                    _boundary(value, 40, "core_" + name, separate_tp=True)
+
+                            def core_post(module: Any, args: tuple, output: Any) -> None:
+                                _boundary(
+                                    output[0] if isinstance(output, tuple) else output,
+                                    40,
+                                    "core_output",
+                                    separate_tp=True,
+                                )
+
+                            restore.callback(core.register_forward_pre_hook(core_pre, with_kwargs=True).remove)
+                            restore.callback(core.register_forward_hook(core_post).remove)
         try:
             yield
             folder.mkdir(parents=True, exist_ok=True)

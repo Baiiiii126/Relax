@@ -36,9 +36,21 @@ arms=(baseline chunkflow)
 if [ "${RELAX_CHUNKFLOW_UPDATE_TRACE:-0}" = 1 ] || [ "${RELAX_CHUNKFLOW_CONV_TRACE:-0}" = 1 ] || [ "${RELAX_CHUNKFLOW_TAIL_TRACE:-0}" = 1 ]; then
    arms=(baseline baseline_repeat chunkflow)
 fi
+if [ "${QWEN36_KV_GRAD_AB:-0}" = 1 ]; then
+   if [ "${RELAX_CHUNKFLOW_TAIL_TRACE:-0}" != 1 ] || [ "${QWEN36_DIAGNOSTICS:-0}" != 1 ]; then
+      echo "ERROR: KV gradient comparison requires tail diagnostics" >&2; exit 2
+   fi
+   arms=(baseline chunkflow_control chunkflow)
+fi
 for arm in "${arms[@]}"; do
    mode="${arm}"
    if [ "${mode}" = baseline_repeat ]; then mode=baseline; fi
+   if [ "${mode}" = chunkflow_control ]; then mode=chunkflow; fi
+   if [ "${QWEN36_KV_GRAD_AB:-0}" = 1 ]; then
+      export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
+      if [ "${arm}" = chunkflow ]; then export RELAX_CHUNKFLOW_KV_GRAD_FP32=1; fi
+   fi
+   echo "${arm}: KV gradient FP32=${RELAX_CHUNKFLOW_KV_GRAD_FP32:-0}" >> "${RESULT_DIR}/comparison.md"
    if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
       export RELAX_CHUNKFLOW_DIAGNOSTIC_DIR="${RESULT_DIR}/${arm}/diagnostics"
    else
@@ -62,7 +74,12 @@ if [ "${QWEN36_DIAGNOSTICS:-0}" = 1 ]; then
    fi
    if [ "${RELAX_CHUNKFLOW_TAIL_TRACE:-0}" = 1 ]; then
       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}" --prefix tail
-      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}" --prefix tail --candidate baseline_repeat
+      if [ -d "${RESULT_DIR}/baseline_repeat" ]; then
+         OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}" --prefix tail --candidate baseline_repeat
+      fi
+      if [ -d "${RESULT_DIR}/chunkflow_control" ]; then
+         OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}" --prefix tail --candidate chunkflow_control
+      fi
    fi
    if [ "${RELAX_CHUNKFLOW_LAYER_TRACE:-0}" = 1 ]; then
       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/compare_qwen36_layers.py "${RESULT_DIR}"
