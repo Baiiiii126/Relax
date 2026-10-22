@@ -18,7 +18,8 @@ case "${CHUNKFLOW_PROFILE}" in
    1) RUN_KIND=profile ;;
    *) echo "ERROR: CHUNKFLOW_PROFILE must be 0 or 1" >&2; exit 2 ;;
 esac
-export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-2}"
+export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-4}"
+export MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
 export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
 export QWEN36_ROUTER_DTYPE="${QWEN36_ROUTER_DTYPE:-fp64}"
 unset QWEN36_DIAGNOSTICS QWEN36_KV_GRAD_AB RELAX_TRAIN_PROFILE_DIR
@@ -35,6 +36,7 @@ cat > "${RESULT_DIR}/comparison.md" <<EOF
 Commit: $(git rev-parse HEAD)
 TP2 / PP4 / EP${EP_SIZE} / ETP1; chunk=${CHUNK_SIZE}; GBS=${GBS:-8}; seed=${TRAIN_SEED}; steps=${NUM_ROLLOUT}.
 LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
+MoE shared expert overlap: ${MOE_SHARED_EXPERT_OVERLAP} (both arms).
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
 ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (maximum parents per pipeline drain; 1=previous schedule).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.

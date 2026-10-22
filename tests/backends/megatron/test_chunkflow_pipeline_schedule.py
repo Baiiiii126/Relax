@@ -164,6 +164,43 @@ def test_pipeline_plan_is_complete_dependency_valid_and_deadlock_free(lengths, p
     _simulate(calls)
 
 
+@pytest.mark.parametrize("padding", [0, 180])
+def test_plan_preserves_real_samples_and_excludes_alignment_padding(padding):
+    import torch
+
+    from relax.backends.megatron.chunkflow.schedules import _plan
+    from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
+
+    cu = [0, 1100, 1612]
+    if padding:
+        cu.append(cu[-1] + padding)
+    tokens = torch.arange(cu[-1]).view(1, -1)
+    mask = torch.zeros_like(tokens)
+    mask[0, 1090:1099] = 1
+    parent = dict(
+        tokens=tokens,
+        full_loss_masks=mask,
+        total_lengths=[1100, 512],
+        packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=cu),
+    )
+    chunks, units = _plan(parent, 512, "staggered")
+    assert len(units) == 4
+    assert sum(c.num_tokens for c in chunks) == 1612
+    assert sorted((s.seq_id, s.prefix, s.length) for c in chunks for s in c.segments) == [
+        (0, 0, 512),
+        (0, 512, 512),
+        (0, 1024, 76),
+        (1, 0, 512),
+    ]
+    batches = [slice_parent_batch(parent, unit, pad_token_id=0) for unit in units]
+    targets = torch.cat([b["unconcat_tokens"][0][b["loss_masks"][0].bool()] for b in batches])
+    torch.testing.assert_close(targets, torch.arange(1091, 1100))
+    for source_lengths in (None, [1099, 513]):
+        parent["total_lengths"] = source_lengths
+        unverified, _ = _plan(parent, 512, "staggered")
+        assert sum(c.num_tokens for c in unverified) == cu[-1]
+
+
 @pytest.mark.parametrize("parent_window", [1, 2, 4])
 @pytest.mark.parametrize("stage", range(4))
 @pytest.mark.parametrize("keep_last_k", [0, 1])
@@ -201,10 +238,15 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         cu = [0]
         for length in lengths:
             cu.append(cu[-1] + length)
+        real_rows = cu[-1]
+        if pad := (-real_rows) % 256:
+            cu.append(real_rows + pad)
         tokens = (torch.arange(cu[-1]) + len(parents) * 10000).view(1, -1)
+        mask = torch.ones_like(tokens)
+        mask[0, real_rows:] = 0
         parent = PrepackedBatch(
             tokens=tokens,
-            full_loss_masks=torch.ones_like(tokens),
+            full_loss_masks=mask,
             total_lengths=lengths,
             packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=cu),
         )
@@ -316,7 +358,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     assert not groups
     assert sorted(released) == [0, 0, 1, 4]
     assert {mb: sum(values) for mb, values in seen_tokens.items()} == {
-        i: p["tokens"].numel() for i, p in enumerate(parents)
+        i: sum(p["total_lengths"]) for i, p in enumerate(parents)
     }
     metrics = model.chunkflow_runtime.consume_step_metrics(4)
     assert metrics["num_microbatches"] == 5 and metrics["parent_window"] == parent_window

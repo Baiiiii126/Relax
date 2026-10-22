@@ -25,6 +25,7 @@ EP_SIZE="${EP_SIZE:-1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 GDN_RECOMPUTE="${GDN_RECOMPUTE:-1}"
 CPU_OPTIMIZER_OVERLAP="${CPU_OPTIMIZER_OVERLAP:-1}"
+MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
 DIAGNOSTIC_ARGS=()
 case "${GDN_RECOMPUTE}" in
    1) DIAGNOSTIC_ARGS+=(--recompute-granularity selective --recompute-modules gdn) ;;
@@ -35,6 +36,11 @@ case "${CPU_OPTIMIZER_OVERLAP}" in
    1) DIAGNOSTIC_ARGS+=(--overlap-cpu-optimizer-d2h-h2d) ;;
    0) ;;
    *) echo "ERROR: CPU_OPTIMIZER_OVERLAP must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${MOE_SHARED_EXPERT_OVERLAP}" in
+   1) DIAGNOSTIC_ARGS+=(--moe-shared-expert-overlap) ;;
+   0) ;;
+   *) echo "ERROR: MOE_SHARED_EXPERT_OVERLAP must be 0 or 1" >&2; exit 2 ;;
 esac
 if [ "${EP_SIZE}" != 1 ] && [ "${EP_SIZE}" != 2 ]; then
    echo "ERROR: EP_SIZE must be 1 or 2 for TP2 / PP4 / ETP1 on 8 GPUs" >&2
@@ -203,6 +209,7 @@ fi
 mkdir -p "$(dirname -- "${LOG_FILE}")"
 echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=${EP_SIZE} GBS=${GBS} STEPS=${NUM_ROLLOUT} SEED=${TRAIN_SEED} ARM=${ARM}"
 echo "LR=${LEARNING_RATE} GDN_RECOMPUTE=${GDN_RECOMPUTE} CPU_OPTIMIZER_OVERLAP=${CPU_OPTIMIZER_OVERLAP}"
+echo "MOE_SHARED_EXPERT_OVERLAP=${MOE_SHARED_EXPERT_OVERLAP}"
 echo "LOG_FILE=${LOG_FILE}"
 if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
    echo "PROFILE_ROLLOUTS=${PROFILE_START}..${PROFILE_END} (0-based; includes profiler overhead)"

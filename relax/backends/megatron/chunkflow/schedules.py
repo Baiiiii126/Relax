@@ -36,6 +36,9 @@ _BATCH_KEYS = (
 def _plan(parent: dict, chunk_size: int, policy: str):
     cu = parent["packed_seq_params"].cu_seqlens_q_cpu
     lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
+    source_lengths = parent.get("total_lengths")
+    if source_lengths is not None and len(lengths) > 1 and lengths[:-1] == list(source_lengths):
+        lengths.pop()  # get_batch appends alignment padding as a separate sequence.
     chunks = build_chunks(lengths, chunk_size=chunk_size, repack_tail=False)
     return chunks, build_micro_batches(chunks, policy)
 
