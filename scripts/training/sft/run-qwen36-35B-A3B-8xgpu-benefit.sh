@@ -12,7 +12,12 @@ export EP_SIZE="${EP_SIZE:-2}"
 export CHUNK_SIZE="${CHUNK_SIZE:-8192}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
 export TRAIN_SEED="${TRAIN_SEED:-1235}"
-export CHUNKFLOW_PROFILE=0
+export CHUNKFLOW_PROFILE="${CHUNKFLOW_PROFILE:-0}"
+case "${CHUNKFLOW_PROFILE}" in
+   0) RUN_KIND=benefit ;;
+   1) RUN_KIND=profile ;;
+   *) echo "ERROR: CHUNKFLOW_PROFILE must be 0 or 1" >&2; exit 2 ;;
+esac
 export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-2}"
 export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
 export QWEN36_ROUTER_DTYPE="${QWEN36_ROUTER_DTYPE:-fp64}"
@@ -21,7 +26,7 @@ unset RELAX_CHUNKFLOW_DIAGNOSTIC_DIR RELAX_CHUNKFLOW_GRAD_ROLLOUTS RELAX_CHUNKFL
 unset RELAX_CHUNKFLOW_UPDATE_TRACE RELAX_CHUNKFLOW_CONV_TRACE RELAX_CHUNKFLOW_CONV_CHUNK_SIZE RELAX_CHUNKFLOW_TAIL_TRACE
 export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS=0
 export RELAX_CHUNKFLOW_FLASH_BACKEND="${RELAX_CHUNKFLOW_FLASH_BACKEND:-fa3}"
-RUN_ID="qwen36-benefit-$(date +%Y%m%d-%H%M%S)-$$"
+RUN_ID="qwen36-${RUN_KIND}-$(date +%Y%m%d-%H%M%S)-$$"
 RESULT_DIR="$(pwd)/analysis/${RUN_ID}"
 mkdir -p "${RESULT_DIR}"
 cat > "${RESULT_DIR}/comparison.md" <<EOF
@@ -33,16 +38,34 @@ LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer over
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
 ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (maximum parents per pipeline drain; 1=previous schedule).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
-Diagnostics and FP32 KV experiment disabled.
+Numerical probes and FP32 KV experiment disabled.
 Both arms use the same data, seed and optimizer settings; only ChunkFlow is toggled.
-Profiler and schedule prediction are disabled. For performance runs only, compare paired steps after the first 30 warmup steps using total-time ratios.
+Profiler: ${CHUNKFLOW_PROFILE}; schedule prediction is disabled. For unprofiled performance runs only, compare paired steps after the first 30 warmup steps using total-time ratios.
 Both arms must be rerun for this topology; previous EP1 measurements are not this baseline.
 EOF
+if [ "${CHUNKFLOW_PROFILE}" = 1 ]; then
+   cat > "${RESULT_DIR}/profile.md" <<EOF
+# Qwen3.6 baseline / ChunkFlow profiler comparison
+
+Configuration and completion: comparison.md. Profile steps: ${PROFILE_START:-34}..${PROFILE_END:-36} (0-based).
+Profiler timing is diagnostic only; do not use it to claim speedup.
+Each arm writes GPU traces (*.pt.trace.json.gz) and per-rank segments_*.jsonl below.
+Host intervals include nested calls and waits; do not sum them as GPU compute time.
+Use the GPU trace to distinguish GDN recomputation inside backward from the initial forward.
+CUDA allocator peaks are per profiled step and include profiler effects; they exclude allocations outside PyTorch.
+EOF
+fi
 for arm in baseline chunkflow; do
+   if [ "${CHUNKFLOW_PROFILE}" = 1 ]; then
+      export RELAX_TRAIN_PROFILE_DIR="${RESULT_DIR}/${arm}/train_trace"
+      echo "- ${arm}: ${RELAX_TRAIN_PROFILE_DIR}" >> "${RESULT_DIR}/profile.md"
+   fi
    RUN_NAME="${RUN_ID}-${arm}" LOG_FILE="${RESULT_DIR}/${arm}.log" \
       bash scripts/entrypoint/ray-job.sh \
       scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${arm}"
    echo "${arm}: complete" >> "${RESULT_DIR}/comparison.md"
 done
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}"
+if [ "${CHUNKFLOW_PROFILE}" = 0 ]; then
+   OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}"
+fi
 echo "Comparison complete: ${RESULT_DIR}"

@@ -142,6 +142,9 @@ def profile_train_step(
     from relax.utils.profile_utils import _get_rank_tag, _get_train_trace_dir
 
     profile = _StepProfile()
+    cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    if cuda_device is not None:
+        torch.cuda.reset_peak_memory_stats(cuda_device)
     token = _ACTIVE.set(profile)
     try:
         with profile.restore:
@@ -160,6 +163,13 @@ def profile_train_step(
         "rank": rank,
         "host_inclusive": profile.host,
     }
+    if cuda_device is not None:
+        row["cuda_memory_bytes"] = {
+            "peak_allocated": torch.cuda.max_memory_allocated(cuda_device),
+            "peak_reserved": torch.cuda.max_memory_reserved(cuda_device),
+            "end_allocated": torch.cuda.memory_allocated(cuda_device),
+            "end_reserved": torch.cuda.memory_reserved(cuda_device),
+        }
     # CPU intervals include waits and nested calls; GPU execution is recorded in the trace.
     with (folder / f"segments_{rank}.jsonl").open("a") as stream:
         stream.write(json.dumps(row) + "\n")
