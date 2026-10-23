@@ -161,7 +161,7 @@ def slice_pooled_batch(sources: Sequence[tuple[dict, Unit]], *, pad_token_id: in
     for parent, _ in sources:
         if (
             parent.get("multimodal_train_inputs")
-            or any(parent.get(key) is not None for key in ("__loss_scale__", "replay_micro_batch_index"))
+            or parent.get("__loss_scale__") is not None
             or parent.get("__is_dummy__", False)
         ):
             raise NotImplementedError("tail pooling supports ordinary text SFT batches only")

@@ -134,13 +134,16 @@ def test_pooled_tails_preserve_targets_masks_positions_and_padding():
     from relax.backends.megatron.chunkflow.unit_batch import slice_pooled_batch
 
     sources = []
-    for length in (301, 651):
+    for index, length in enumerate((301, 651)):
         parent = _parent([length])
+        parent["replay_micro_batch_index"] = index
         units, _ = _units([length], 256)
         sources.append((parent, units[-1]))
     args = SimpleNamespace(uses_unsplit_forward=True)
     parts = [slice_parent_batch(p, u, pad_token_id=PAD, args=args) for p, u in sources]
     pooled = slice_pooled_batch(sources, pad_token_id=PAD, args=args)
+    assert [p["replay_micro_batch_index"] for p in parts] == [0, 1]
+    assert "replay_micro_batch_index" not in pooled
     lengths = [45, 139]
     total = sum(lengths)
     assert pooled["packed_seq_params"].cu_seqlens_q_cpu == [0, 45, total]

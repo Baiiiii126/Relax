@@ -259,6 +259,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
             full_loss_masks=mask,
             total_lengths=lengths,
             packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=cu),
+            replay_micro_batch_index=len(parents),
         )
         parents.append(parent)
         chunks, units = _plan(parent, 256, "staggered")
