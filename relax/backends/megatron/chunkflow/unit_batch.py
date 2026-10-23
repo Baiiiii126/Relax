@@ -65,11 +65,11 @@ def slice_parent_batch(
         target_parts.append(target)
     mask_parts = [flat_mask[s:e] for s, e in rows]
 
-    unit_tokens = torch.cat(token_parts)
-    unit_targets = torch.cat(target_parts)
-    unit_mask = torch.cat(mask_parts)
+    unit_tokens = token_parts[0] if len(token_parts) == 1 else torch.cat(token_parts)
+    unit_targets = target_parts[0] if len(target_parts) == 1 else torch.cat(target_parts)
+    unit_mask = mask_parts[0] if len(mask_parts) == 1 else torch.cat(mask_parts)
 
-    full_mask = unit_mask.clone()
+    full_mask = unit_mask
     pad = (-unit_tokens.size(0)) % 128
     if pad:
         unit_tokens = torch.cat(
@@ -104,15 +104,16 @@ def slice_parent_batch(
         # Bridge consumes physical packing boundaries and explicit [3, B, T] positions separately.
         physical_cu = list(packed.cu_seqlens_q_cpu)
         physical_cu[-1] = unit_tokens.size(0)
-        packed.cu_seqlens_q_padded = torch.tensor(physical_cu, dtype=torch.int32, device=unit_tokens.device)
+        packed.cu_seqlens_q_padded = (
+            torch.tensor(physical_cu, dtype=torch.int32, device=unit_tokens.device) if pad else packed.cu_seqlens_q
+        )
         packed.cu_seqlens_kv_padded = packed.cu_seqlens_q_padded
         packed.max_seqlen_q = packed.max_seqlen_kv = max([*lengths[:-1], lengths[-1] + pad])
-        positions = torch.cat(
-            [
-                torch.arange(offset, offset + length, device=unit_tokens.device)
-                for offset, length in zip(offsets, lengths)
-            ]
-        )
+        position_parts = [
+            torch.arange(offset, offset + length, device=unit_tokens.device)
+            for offset, length in zip(offsets, lengths)
+        ]
+        positions = position_parts[0] if len(position_parts) == 1 else torch.cat(position_parts)
         if pad:
             positions = torch.cat([positions, positions.new_ones(pad)])
         batch["position_ids"] = positions.view(1, 1, -1).expand(3, 1, -1)
@@ -139,9 +140,10 @@ def _build_packed_seq_params(unit_tokens: torch.Tensor, lengths: list[int], offs
         cu.append(cu[-1] + length)
     device = unit_tokens.device
 
+    cu_tensor = torch.tensor(cu, dtype=torch.int32, device=device)
     packed = PackedSeqParams(
-        cu_seqlens_q=torch.tensor(cu, dtype=torch.int32, device=device),
-        cu_seqlens_kv=torch.tensor(cu, dtype=torch.int32, device=device),
+        cu_seqlens_q=cu_tensor,
+        cu_seqlens_kv=cu_tensor,
         max_seqlen_q=max(lengths),
         max_seqlen_kv=max(lengths),
         qkv_format="thd",
@@ -151,6 +153,49 @@ def _build_packed_seq_params(unit_tokens: torch.Tensor, lengths: list[int], offs
     if any(offset for offset in offsets):
         cf_rope.apply_rope_offset(packed, offsets=offsets, lengths=lengths)
     return packed
+
+
+def slice_pooled_batch(sources: Sequence[tuple[dict, Unit]], *, pad_token_id: int, args) -> dict:
+    if not getattr(args, "uses_unsplit_forward", False):
+        raise NotImplementedError("tail pooling requires explicit MRoPE positions")
+    for parent, _ in sources:
+        if (
+            parent.get("multimodal_train_inputs")
+            or any(parent.get(key) is not None for key in ("__loss_scale__", "replay_micro_batch_index"))
+            or parent.get("__is_dummy__", False)
+        ):
+            raise NotImplementedError("tail pooling supports ordinary text SFT batches only")
+    parts = [slice_parent_batch(parent, unit, pad_token_id=pad_token_id, args=args) for parent, unit in sources]
+    lengths = [unit.num_tokens for _, unit in sources]
+    tokens = torch.cat([p["tokens"][0, :n] for p, n in zip(parts, lengths)])
+    mask = torch.cat([p["loss_masks"][0] for p in parts])
+    positions = torch.cat([p["position_ids"][..., :n] for p, n in zip(parts, lengths)], dim=-1)
+    pad = (-tokens.numel()) % 128
+    full_mask = mask
+    if pad:
+        tokens = torch.cat([tokens, tokens.new_full((pad,), pad_token_id)])
+        full_mask = torch.cat([mask, mask.new_zeros(pad)])
+        positions = torch.cat([positions, positions.new_ones(3, 1, pad)], dim=-1)
+    packed = _build_packed_seq_params(tokens, lengths, [0] * len(lengths))
+    physical_cu = [*packed.cu_seqlens_q_cpu[:-1], tokens.numel()]
+    packed.cu_seqlens_q_padded = (
+        torch.tensor(physical_cu, dtype=torch.int32, device=tokens.device) if pad else packed.cu_seqlens_q
+    )
+    packed.cu_seqlens_kv_padded = packed.cu_seqlens_q_padded
+    packed.max_seqlen_q = packed.max_seqlen_kv = max([*lengths[:-1], lengths[-1] + pad])
+    batch = type(parts[0])(
+        tokens=tokens.unsqueeze(0),
+        unconcat_tokens=[torch.cat([p["unconcat_tokens"][0] for p in parts])],
+        full_loss_masks=full_mask.unsqueeze(0),
+        loss_masks=[mask],
+        total_lengths=[sum(lengths) + 1],
+        response_lengths=[sum(lengths)],
+        max_seq_lens=[max(lengths)],
+        packed_seq_params=packed,
+        position_ids=positions,
+    )
+    batch["__num_tokens_override__"] = mask.sum()
+    return batch
 
 
 def _slice_response_aligned_keys(parent: dict, batch: dict, rows: list[tuple[int, int]]) -> None:

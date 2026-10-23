@@ -78,6 +78,21 @@ def _varlen_reference(q, k, v, cu_q, cu_kv):
     return torch.cat(parts)
 
 
+def test_single_piece_attention_preserves_strided_kv_gradients():
+    torch.manual_seed(9)
+    q = torch.randn(7, 4, 8, dtype=torch.float64, requires_grad=True)
+    k, v = (torch.randn(17, 2, 16, dtype=torch.float64)[..., ::2].requires_grad_() for _ in range(2))
+    qr, kr, vr = (tensor.detach().clone().requires_grad_() for tensor in (q, k, v))
+    cu_q, cu_kv = torch.tensor([0, 7]), torch.tensor([0, 17])
+    actual = _unit_attention(q, k, v, cu_q, cu_kv, max_seqlens=(7, 17))
+    expected = _varlen_reference(qr, kr, vr, cu_q, cu_kv)
+    dout = torch.randn_like(actual)
+    actual.backward(dout)
+    expected.backward(dout)
+    for got, want in ((actual, expected), (q.grad, qr.grad), (k.grad, kr.grad), (v.grad, vr.grad)):
+        torch.testing.assert_close(got, want, atol=1e-9, rtol=1e-9)
+
+
 @pytest.mark.parametrize("with_metadata", [False, True])
 def test_unit_flash_reuses_cpu_maxima_in_forward_and_backward(monkeypatch, with_metadata):
     from unittest.mock import Mock
@@ -193,7 +208,11 @@ def test_fa3_adapter_preserves_gqa_gradients_and_forward_backend(monkeypatch, ch
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 numeric validation requires a CUDA GPU")
 @pytest.mark.parametrize(
     "bounds_q,bounds_k,heads,kv_heads,dim",
-    [([0, 17, 26], [0, 40, 53], 16, 4, 128), ([0, 6144, 8192], [0, 6144, 8192], 8, 1, 256)],
+    [
+        ([0, 17, 26], [0, 40, 53], 16, 4, 128),
+        ([0, 6144, 8192], [0, 6144, 8192], 8, 1, 256),
+        ([0, 8192], [0, 8192], 8, 1, 256),
+    ],
 )
 def test_unit_fa3_matches_cuda_reference(monkeypatch, fa3_backend, bounds_q, bounds_k, heads, kv_heads, dim):
     if torch.cuda.get_device_capability()[0] != 9:

@@ -59,6 +59,11 @@ for key in KEEP_LAST_K TRAIN_SEED; do
    fi
 done
 PROFILE_ARGS=()
+export RELAX_TRAIN_PROFILE_RECORD_SHAPES="${RELAX_TRAIN_PROFILE_RECORD_SHAPES:-0}"
+case "${RELAX_TRAIN_PROFILE_RECORD_SHAPES}" in
+   0|1) ;;
+   *) echo "ERROR: RELAX_TRAIN_PROFILE_RECORD_SHAPES must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${CHUNKFLOW_PROFILE:-0}" in
    0) ;;
    1)
@@ -114,11 +119,20 @@ export RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1
 export RELAX_CHUNKFLOW_FLASH_BACKEND="${RELAX_CHUNKFLOW_FLASH_BACKEND:-fa3}"
 export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS="${RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS:-0}"
 export RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY=1
-export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-1}"
-case "${RELAX_CHUNKFLOW_PARENT_WINDOW}" in
-   1|2|4) ;;
-   *) echo "ERROR: RELAX_CHUNKFLOW_PARENT_WINDOW must be 1, 2 or 4" >&2; exit 2 ;;
+export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-0}"
+export RELAX_CHUNKFLOW_TAIL_POOL="${RELAX_CHUNKFLOW_TAIL_POOL:-0}"
+case "${RELAX_CHUNKFLOW_TAIL_POOL}" in
+   0|1) ;;
+   *) echo "ERROR: RELAX_CHUNKFLOW_TAIL_POOL must be 0 or 1" >&2; exit 2 ;;
 esac
+if [ "${RELAX_CHUNKFLOW_TAIL_POOL}" = 1 ] && [ "${KEEP_LAST_K}" != 0 ]; then
+   echo "ERROR: tail pooling requires KEEP_LAST_K=0" >&2
+   exit 2
+fi
+if ! [[ "${RELAX_CHUNKFLOW_PARENT_WINDOW}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+   echo "ERROR: RELAX_CHUNKFLOW_PARENT_WINDOW must be nonnegative (0 uses all step parents)" >&2
+   exit 2
+fi
 case "${RELAX_CHUNKFLOW_FLASH_BACKEND}" in
    fa2|fa3) ;;
    *) echo "ERROR: RELAX_CHUNKFLOW_FLASH_BACKEND must be fa2 or fa3" >&2; exit 2 ;;
@@ -132,7 +146,7 @@ import json, os
 env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND",
             "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS", "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY",
-            "RELAX_CHUNKFLOW_PARENT_WINDOW"):
+            "RELAX_CHUNKFLOW_PARENT_WINDOW", "RELAX_CHUNKFLOW_TAIL_POOL", "RELAX_TRAIN_PROFILE_RECORD_SHAPES"):
     env.setdefault("env_vars", {})[key] = os.environ[key]
 if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
@@ -210,9 +224,11 @@ mkdir -p "$(dirname -- "${LOG_FILE}")"
 echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=${EP_SIZE} GBS=${GBS} STEPS=${NUM_ROLLOUT} SEED=${TRAIN_SEED} ARM=${ARM}"
 echo "LR=${LEARNING_RATE} GDN_RECOMPUTE=${GDN_RECOMPUTE} CPU_OPTIMIZER_OVERLAP=${CPU_OPTIMIZER_OVERLAP}"
 echo "MOE_SHARED_EXPERT_OVERLAP=${MOE_SHARED_EXPERT_OVERLAP}"
+echo "CHUNKFLOW_TAIL_POOL=${RELAX_CHUNKFLOW_TAIL_POOL} PARENT_WINDOW=${RELAX_CHUNKFLOW_PARENT_WINDOW}"
 echo "LOG_FILE=${LOG_FILE}"
 if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
    echo "PROFILE_ROLLOUTS=${PROFILE_START}..${PROFILE_END} (0-based; includes profiler overhead)"
+   echo "PROFILE_RECORD_SHAPES=${RELAX_TRAIN_PROFILE_RECORD_SHAPES}"
    echo "Worker output: ${RELAX_TRAIN_PROFILE_DIR:-traces/${RUN_NAME}/train_trace}/{*.pt.trace.json.gz,segments_*.jsonl}"
 fi
 ray job submit "${SUBMIT_ARGS[@]}" --runtime-env-json="${RUNTIME_ENV_JSON}" \

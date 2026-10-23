@@ -176,6 +176,52 @@ def _unit_attn(chunk_size, layer=1):
     )
 
 
+@pytest.mark.parametrize("fp32", [False, True])
+def test_pooled_tail_attention_preserves_prefix_outputs_and_gradients(fp32, monkeypatch):
+    from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
+    from relax.backends.megatron.chunkflow.schedule_model import make_model_plan
+    from relax.backends.megatron.chunkflow.tail_pool import pool_terminal_units
+    from relax.backends.megatron.chunkflow.units import completed_groups
+
+    monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", str(int(fp32)))
+    lengths, chunk_size = [5, 8, 10], 4
+    reference = [t.requires_grad_(True) for t in _qkv(sum(lengths), 4, 8, kv_heads=2)]
+    actual = [t.detach().clone().requires_grad_(True) for t in reference]
+    starts = [0, 5, 13]
+    expected = torch.cat([_sdpa_reference(*(t[s : s + n] for t in reference)) for s, n in zip(starts, lengths)])
+    grad = torch.zeros_like(expected)
+    for s, n in zip(starts, lengths):
+        grad[s + n - 1] = 1
+    expected.backward(grad)
+    chunks = build_chunks(lengths, chunk_size, repack_tail=False)
+    units = build_micro_batches(chunks)
+    plan = make_model_plan(units, chunks, 1 << 30, 1)
+    units, members, plan = pool_terminal_units(
+        {u.unit_id: u for u in units}, {u.unit_id: 0 for u in units}, plan, chunk_size
+    )
+    assert any(len(ids) > 1 for ids in members.values())
+    attn = _unit_attn(chunk_size)
+    outputs, indices = {}, {}
+    for uid in plan.forward:
+        unit = units[uid]
+        ix, cu = [], [0]
+        for c in unit.chunks:
+            for s in c.segments:
+                ix.extend(range(starts[s.seq_id] + s.prefix, starts[s.seq_id] + s.prefix + s.length))
+                cu.append(cu[-1] + s.length)
+        packed = SimpleNamespace(cu_seqlens_q_cpu=cu, **{UNIT_ATTR: unit})
+        outputs[uid] = attn(*(t[ix] for t in actual), packed_seq_params=packed)
+        indices[uid] = ix
+        torch.testing.assert_close(outputs[uid], expected[ix], atol=1e-9, rtol=1e-9)
+    for uid in plan.backward:
+        outputs[uid].backward(grad[indices[uid]])
+        for group in completed_groups(units[uid]):
+            attn.runtime.release_group(group)
+    attn.runtime.assert_empty("pooled tails")
+    for got, want in zip(actual, reference):
+        torch.testing.assert_close(got.grad, want.grad, atol=1e-7 if fp32 else 1e-9, rtol=1e-6 if fp32 else 1e-9)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
 def test_te_empty_expert_preserves_accumulated_gradient():
     te = pytest.importorskip("transformer_engine.pytorch")

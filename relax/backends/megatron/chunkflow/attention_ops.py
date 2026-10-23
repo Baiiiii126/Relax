@@ -209,8 +209,8 @@ class UnitCacheAttention(torch.autograd.Function):
             if len(max_seqlens) != 2 or any(type(length) is not int or length <= 0 for length in max_seqlens):
                 raise ValueError("max_seqlens must contain two positive Python integers")
         n = len(kv) // 2
-        k_all = torch.cat(kv[:n], dim=0)
-        v_all = torch.cat(kv[n:], dim=0)
+        k_all = kv[0].contiguous() if n == 1 else torch.cat(kv[:n], dim=0)
+        v_all = kv[1].contiguous() if n == 1 else torch.cat(kv[n:], dim=0)
         flash = _use_flash(q)
         ctx.flash_ops = _flash_varlen_ops() if flash else None
         if flash:
@@ -246,8 +246,8 @@ class UnitCacheAttention(torch.autograd.Function):
         rest = saved[4:]
         out = rest.pop(0) if ctx.flash else None
         n = ctx.n
-        k_all = torch.cat(rest[:n], dim=0)
-        v_all = torch.cat(rest[n:], dim=0)
+        k_all = rest[0].contiguous() if n == 1 else torch.cat(rest[:n], dim=0)
+        v_all = rest[1].contiguous() if n == 1 else torch.cat(rest[n:], dim=0)
         if ctx.flash:
             dq, dk_all, dv_all = _flash_varlen_backward(
                 dout.contiguous(),

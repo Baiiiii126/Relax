@@ -14,6 +14,20 @@ from pathlib import Path
 
 
 METRICS = ("train/loss", "train/grad_norm", "perf/actor_train_time", "perf/step_time", "perf/actor_train_tokens")
+POOL_METRICS = tuple(
+    f"train/chunkflow/{key}"
+    for key in (
+        "num_microbatches",
+        "num_units",
+        "unit_padded_rows",
+        "tail_pool_enabled",
+        "unpooled_units",
+        "tail_pool_saved_units",
+        "tail_pool_pooled_units",
+        "max_warmup_units",
+        "peak_live_activation_rows",
+    )
+)
 
 
 def read_rows(path: Path) -> dict[int, dict]:
@@ -36,12 +50,22 @@ def number(value: object) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(value)
 
 
-def summarize(folder: Path, expected_steps: int | None = None) -> bool:
-    base, chunk = (read_rows(folder / f"{arm}.log") for arm in ("baseline", "chunkflow"))
+def summarize(
+    folder: Path,
+    expected_steps: int | None = None,
+    *,
+    baseline_arm: str = "baseline",
+    chunkflow_arm: str = "chunkflow",
+    output_prefix: str = "",
+) -> bool:
+    base, chunk = (read_rows(folder / f"{arm}.log") for arm in (baseline_arm, chunkflow_arm))
     steps = sorted(base.keys() & chunk.keys())
     all_steps = sorted(base.keys() | chunk.keys() | (set(range(expected_steps)) if expected_steps else set()))
-    fields = ["step", *[f"{arm}:{metric}" for metric in METRICS for arm in ("baseline", "chunkflow")]]
-    with (folder / "paired.csv").open("w", newline="") as stream:
+    fields = [
+        "step",
+        *[f"{arm}:{metric}" for metric in (*METRICS, *POOL_METRICS) for arm in ("baseline", "chunkflow")],
+    ]
+    with (folder / f"{output_prefix}paired.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fields)
         writer.writeheader()
         for step in all_steps:
@@ -49,7 +73,7 @@ def summarize(folder: Path, expected_steps: int | None = None) -> bool:
             row.update(
                 {
                     f"{arm}:{key}": data.get(step, {}).get(key)
-                    for key in METRICS
+                    for key in (*METRICS, *POOL_METRICS)
                     for arm, data in (("baseline", base), ("chunkflow", chunk))
                 }
             )
@@ -71,6 +95,7 @@ def summarize(folder: Path, expected_steps: int | None = None) -> bool:
     lines = [
         "# Loss and performance diagnosis",
         "",
+        f"Reference (baseline columns): {baseline_arm}; candidate (ChunkFlow columns): {chunkflow_arm}.",
         f"Matched step IDs: {len(steps)}.",
         f"Expected steps per arm: {expected_steps if expected_steps is not None else 'not specified'}.",
         "Matching step IDs and token counts does not prove identical sample contents.",
@@ -84,7 +109,7 @@ def summarize(folder: Path, expected_steps: int | None = None) -> bool:
         "## ClearML",
         "",
     ]
-    for arm in ("baseline", "chunkflow"):
+    for arm in (baseline_arm, chunkflow_arm):
         urls = sorted(
             set(re.findall(r"url:\s*(https?://[^\s\x1b]+)", (folder / f"{arm}.log").read_text(errors="replace")))
         )
@@ -150,6 +175,10 @@ def summarize(folder: Path, expected_steps: int | None = None) -> bool:
             lines.append(
                 f"| {start} | {metric} | {len(valid)} | {bt / len(valid):.4f} | {ct / len(valid):.4f} | {bt / ct:.4f}x | {bt / ct - 1:+.2%} | {1 - ct / bt:+.2%} |"
             )
+    if chunkflow_arm == "chunkflow_pool":
+        invalid = [s for s in required if chunk.get(s, {}).get("train/chunkflow/tail_pool_enabled") != 1]
+        if invalid:
+            issues.append(f"Missing tail-pool execution evidence at steps {invalid}")
     lines += [
         "",
         "Profiler runs are diagnostic only. LR=0 timing is not evidence of normal-training speedup.",
@@ -159,7 +188,29 @@ def summarize(folder: Path, expected_steps: int | None = None) -> bool:
         "## Data issues",
         *([f"- {issue}" for issue in issues] if issues else ["None."]),
     ]
-    (folder / "diagnosis.md").write_text("\n".join(lines) + "\n")
+    if chunkflow_arm == "chunkflow_pool":
+        lines += [
+            "",
+            "## Tail pool execution",
+            "",
+            "Activation rows are a scheduling estimate, not measured GPU memory.",
+            "",
+            "| Step | M | Unpooled units | Executed units | Saved units | Pooled units | Max warmup | Peak live rows |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for s in all_steps:
+            keys = (
+                "num_microbatches",
+                "unpooled_units",
+                "num_units",
+                "tail_pool_saved_units",
+                "tail_pool_pooled_units",
+                "max_warmup_units",
+                "peak_live_activation_rows",
+            )
+            values = [str(chunk.get(s, {}).get(f"train/chunkflow/{k}", "missing")) for k in keys]
+            lines.append("| " + " | ".join([str(s), *values]) + " |")
+    (folder / f"{output_prefix}diagnosis.md").write_text("\n".join(lines) + "\n")
     return not issues
 
 
@@ -167,8 +218,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
     parser.add_argument("--expected-steps", type=int)
+    parser.add_argument("--baseline-arm", choices=("baseline", "chunkflow"), default="baseline")
+    parser.add_argument("--chunkflow-arm", choices=("chunkflow", "chunkflow_pool"), default="chunkflow")
+    parser.add_argument("--output-prefix", choices=("", "tail_pool-", "tail_pool-vs-unpooled-"), default="")
     args = parser.parse_args()
     if args.expected_steps is not None and args.expected_steps <= 0:
         parser.error("--expected-steps must be positive")
-    if not summarize(args.folder, args.expected_steps):
+    if not summarize(
+        args.folder,
+        args.expected_steps,
+        baseline_arm=args.baseline_arm,
+        chunkflow_arm=args.chunkflow_arm,
+        output_prefix=args.output_prefix,
+    ):
         raise SystemExit("Incomplete metrics; inspect diagnosis.md and paired.csv")

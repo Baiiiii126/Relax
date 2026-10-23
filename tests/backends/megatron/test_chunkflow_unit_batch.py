@@ -64,9 +64,11 @@ def _units(lengths, chunk_size, policy="staggered"):
 
 
 @pytest.mark.parametrize("policy", ["staggered", "lockstep"])
-def test_units_preserve_tokens_targets_masks_and_loss(policy):
-    parent = _parent([40, 12, 16])
-    units, _ = _units([40, 12, 16], 16, policy)
+@pytest.mark.parametrize("lengths,chunk_size", [([40, 12, 16], 16), ([301, 12, 16], 128)])
+def test_units_preserve_tokens_targets_masks_and_loss(policy, lengths, chunk_size):
+    parent = _parent(lengths)
+    original_tokens, original_mask = parent["tokens"].clone(), parent["full_loss_masks"].clone()
+    units, _ = _units(lengths, chunk_size, policy)
     tokens, mask = parent["tokens"][0], parent["full_loss_masks"][0]
     cu = parent["packed_seq_params"].cu_seqlens_q_cpu
     seen, counts, total_loss = [], [], torch.zeros(())
@@ -97,6 +99,8 @@ def test_units_preserve_tokens_targets_masks_and_loss(policy):
     assert sorted(seen) == tokens.tolist()
     assert len(seen) == len(set(seen))
     torch.testing.assert_close(total_loss, (mask.float() * tokens.float()).sum())
+    torch.testing.assert_close(parent["tokens"], original_tokens)
+    torch.testing.assert_close(parent["full_loss_masks"], original_mask)
 
 
 def test_attention_lengths_and_rope_offsets_are_sequence_local():
@@ -124,6 +128,38 @@ def test_lockstep_dependent_units_fail_closed_until_per_segment_rope_exists():
 
     with pytest.raises(NotImplementedError, match="per-segment RoPE offsets"):
         _rope_offsets(merged)
+
+
+def test_pooled_tails_preserve_targets_masks_positions_and_padding():
+    from relax.backends.megatron.chunkflow.unit_batch import slice_pooled_batch
+
+    sources = []
+    for length in (301, 651):
+        parent = _parent([length])
+        units, _ = _units([length], 256)
+        sources.append((parent, units[-1]))
+    args = SimpleNamespace(uses_unsplit_forward=True)
+    parts = [slice_parent_batch(p, u, pad_token_id=PAD, args=args) for p, u in sources]
+    pooled = slice_pooled_batch(sources, pad_token_id=PAD, args=args)
+    lengths = [45, 139]
+    total = sum(lengths)
+    assert pooled["packed_seq_params"].cu_seqlens_q_cpu == [0, 45, total]
+    assert pooled["packed_seq_params"].cu_seqlens_q_padded.tolist() == [0, 45, 256]
+    for key in ("unconcat_tokens", "loss_masks"):
+        torch.testing.assert_close(pooled[key][0], torch.cat([p[key][0] for p in parts]))
+    torch.testing.assert_close(
+        pooled["position_ids"][..., :total],
+        torch.cat([p["position_ids"][..., :n] for p, n in zip(parts, lengths)], dim=-1),
+    )
+    torch.testing.assert_close(
+        pooled["tokens"][0, :total], torch.cat([p["tokens"][0, :n] for p, n in zip(parts, lengths)])
+    )
+    assert not pooled["full_loss_masks"][0, total:].any()
+    assert pooled["__num_tokens_override__"] == sum(p["__num_tokens_override__"] for p in parts)
+    assert pooled["unconcat_tokens"][0][44] == PAD
+    sources[0][0]["__loss_scale__"] = 0.5
+    with pytest.raises(NotImplementedError, match="ordinary text SFT"):
+        slice_pooled_batch(sources, pad_token_id=PAD, args=args)
 
 
 def test_bridge_chunk_positions_and_padding_match_full_sequence():

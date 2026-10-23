@@ -117,7 +117,7 @@ def _create_torch_profiler(args, name):
             worker_name=worker_name,
             use_gzip=True,
         ),
-        record_shapes=True,
+        record_shapes=os.environ.get("RELAX_TRAIN_PROFILE_RECORD_SHAPES", "1") != "0",
         with_stack=args.profile_with_stack,
         profile_memory=args.profile_with_memory,
         with_flops=args.profile_with_flops,

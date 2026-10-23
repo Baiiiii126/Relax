@@ -100,6 +100,26 @@ def test_profile_directory_can_use_shared_storage(tmp_path, monkeypatch):
     assert profile_utils._get_train_trace_dir(args) == str(tmp_path)
 
 
+@pytest.mark.parametrize("record_shapes", [None, "0", "1"])
+def test_profile_shape_recording_can_be_disabled(monkeypatch, record_shapes):
+    monkeypatch.delenv("RELAX_TRAIN_PROFILE_RECORD_SHAPES", raising=False)
+    if record_shapes is not None:
+        monkeypatch.setenv("RELAX_TRAIN_PROFILE_RECORD_SHAPES", record_shapes)
+    monkeypatch.setattr(profile_utils, "_get_rank_tag", lambda: "rank0")
+    monkeypatch.setattr(torch.profiler, "profile", lambda **options: options)
+    args = SimpleNamespace(
+        tb_experiment_name="test-run",
+        profile_step_start=34,
+        profile_step_end=36,
+        profile_with_stack=False,
+        profile_with_memory=False,
+        profile_with_flops=False,
+    )
+    options = profile_utils._create_torch_profiler(args, "train_overall")
+    assert options["record_shapes"] == (record_shapes != "0")
+    assert not any(options[key] for key in ("with_stack", "profile_memory", "with_flops"))
+
+
 @pytest.mark.parametrize("chunkflow", [False, True])
 def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, chunkflow):
     args = SimpleNamespace(
@@ -151,6 +171,8 @@ def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, 
         assert hook_map[0] is original_hook
     rows = [json.loads(line) for line in next(tmp_path.glob("segments_*.jsonl")).read_text().splitlines()]
     assert [row["rollout_id"] for row in rows] == [34, 35, 36]
+    assert all(row["cpu_threads"]["intraop"] == torch.get_num_threads() for row in rows)
+    assert all(row["host_inclusive"]["step"]["thread_cpu_s"] > 0 for row in rows)
     for name in (
         "forward_backward",
         "forward",

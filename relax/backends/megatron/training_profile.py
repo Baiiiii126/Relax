@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, thread_time
 from typing import Any, Iterator
 
 import torch
@@ -22,7 +23,9 @@ _ACTIVE: ContextVar[Any] = ContextVar("training_profile", default=None)
 
 class _StepProfile:
     def __init__(self) -> None:
-        self.host: dict[str, dict[str, float | int]] = defaultdict(lambda: {"calls": 0, "inclusive_s": 0.0})
+        self.host: dict[str, dict[str, float | int]] = defaultdict(
+            lambda: {"calls": 0, "inclusive_s": 0.0, "thread_cpu_s": 0.0}
+        )
         self.restore = ExitStack()
         self.patched: set[tuple[int, str]] = set()
 
@@ -30,15 +33,17 @@ class _StepProfile:
     def phase(self, name: str) -> Iterator[None]:
         with torch.profiler.record_function(f"train.segment.{name}"):
             start = perf_counter()
+            cpu_start = thread_time()
             try:
                 yield
             finally:
                 row = self.host[name]
                 row["calls"] += 1
                 row["inclusive_s"] += perf_counter() - start
+                row["thread_cpu_s"] += thread_time() - cpu_start
 
     def wrap_call(self, function: Any, name: str) -> Any:
-        self.host.setdefault(name, {"calls": 0, "inclusive_s": 0.0})
+        self.host.setdefault(name, {"calls": 0, "inclusive_s": 0.0, "thread_cpu_s": 0.0})
 
         @wraps(function)
         def measured(*args: Any, **kwargs: Any) -> Any:
@@ -177,6 +182,11 @@ def profile_train_step(
         "arm": "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline",
         "rank": rank,
         "host_inclusive": profile.host,
+        "cpu_threads": {
+            "intraop": torch.get_num_threads(),
+            "interop": torch.get_num_interop_threads(),
+            "affinity": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(),
+        },
     }
     if cuda_device is not None:
         row["cuda_memory_bytes"] = {

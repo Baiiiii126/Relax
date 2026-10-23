@@ -13,12 +13,26 @@ export CHUNK_SIZE="${CHUNK_SIZE:-8192}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
 export TRAIN_SEED="${TRAIN_SEED:-1235}"
 export CHUNKFLOW_PROFILE="${CHUNKFLOW_PROFILE:-0}"
+export RELAX_TRAIN_PROFILE_RECORD_SHAPES="${RELAX_TRAIN_PROFILE_RECORD_SHAPES:-0}"
 case "${CHUNKFLOW_PROFILE}" in
    0) RUN_KIND=benefit ;;
    1) RUN_KIND=profile ;;
    *) echo "ERROR: CHUNKFLOW_PROFILE must be 0 or 1" >&2; exit 2 ;;
 esac
-export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-4}"
+export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-0}"
+ARMS=(baseline chunkflow)
+case "${QWEN36_TAIL_POOL_AB:-0}" in
+   0) ;;
+   1) ARMS+=(chunkflow_pool) ;;
+   *) echo "ERROR: QWEN36_TAIL_POOL_AB must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "${QWEN36_REVERSE_ORDER:-0}" = 1 ]; then
+   if [ "${QWEN36_TAIL_POOL_AB:-0}" = 1 ]; then
+      ARMS=(chunkflow_pool chunkflow baseline)
+   else
+      ARMS=(chunkflow baseline)
+   fi
+fi
 export MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
 export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
 export QWEN36_ROUTER_DTYPE="${QWEN36_ROUTER_DTYPE:-fp64}"
@@ -38,10 +52,11 @@ TP2 / PP4 / EP${EP_SIZE} / ETP1; chunk=${CHUNK_SIZE}; GBS=${GBS:-8}; seed=${TRAI
 LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
 MoE shared expert overlap: ${MOE_SHARED_EXPERT_OVERLAP} (both arms).
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
-ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (maximum parents per pipeline drain; 1=previous schedule).
+ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (0=all parents in each step; positive values cap parents per drain).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
 Numerical probes and FP32 KV experiment disabled.
-Both arms use the same data, seed and optimizer settings; only ChunkFlow is toggled.
+Arms in execution order: ${ARMS[*]}. Each starts from the same checkpoint, seed and optimizer settings.
+chunkflow_pool enables bounded terminal-tail pooling; chunkflow disables it. Both use the same parent window and CPU preparation code.
 Profiler: ${CHUNKFLOW_PROFILE}; schedule prediction is disabled. For unprofiled performance runs only, compare paired steps after the first 30 warmup steps using total-time ratios.
 Both arms must be rerun for this topology; previous EP1 measurements are not this baseline.
 EOF
@@ -51,8 +66,12 @@ if [ "${CHUNKFLOW_PROFILE}" = 1 ]; then
 
 Configuration and completion: comparison.md. Profile steps: ${PROFILE_START:-34}..${PROFILE_END:-36} (0-based).
 Profiler timing is diagnostic only; do not use it to claim speedup.
+Record tensor shapes: ${RELAX_TRAIN_PROFILE_RECORD_SHAPES} (0=lean trace; 1=shape diagnostics).
 Each arm writes GPU traces (*.pt.trace.json.gz) and per-rank segments_*.jsonl below.
 Host intervals include nested calls and waits; do not sum them as GPU compute time.
+thread_cpu_s counts CPU time on the calling thread; wall time minus thread CPU time includes waits and descheduling, not just GPU idle.
+cpu_threads records intraop/interop thread counts and affinity size; it does not establish CPU quota or available capacity.
+chunkflow.unit_prepare separates input slicing and metadata preparation from MoE kernel launches.
 ChunkFlow window scopes identify parent ranges and prepare/warmup/steady/drain phases, with unit counts.
 Warmup/drain include useful work; measure GPU idle and communication waits inside them to assess bubbles.
 Both arms split MoE routing, dispatch, expert computation and combine; dispatcher DtoH synchronization is marked when available.
@@ -62,17 +81,30 @@ Use the GPU trace to distinguish GDN recomputation inside backward from the init
 CUDA allocator peaks are per profiled step and include profiler effects; they exclude allocations outside PyTorch.
 EOF
 fi
-for arm in baseline chunkflow; do
+for arm in "${ARMS[@]}"; do
+   mode="${arm}"
+   export RELAX_CHUNKFLOW_TAIL_POOL=0
+   if [ "${arm}" = chunkflow_pool ]; then
+      mode=chunkflow
+      export RELAX_CHUNKFLOW_TAIL_POOL=1
+   fi
    if [ "${CHUNKFLOW_PROFILE}" = 1 ]; then
       export RELAX_TRAIN_PROFILE_DIR="${RESULT_DIR}/${arm}/train_trace"
       echo "- ${arm}: ${RELAX_TRAIN_PROFILE_DIR}" >> "${RESULT_DIR}/profile.md"
    fi
    RUN_NAME="${RUN_ID}-${arm}" LOG_FILE="${RESULT_DIR}/${arm}.log" \
       bash scripts/entrypoint/ray-job.sh \
-      scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${arm}"
+      scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${mode}"
    echo "${arm}: complete" >> "${RESULT_DIR}/comparison.md"
 done
 if [ "${CHUNKFLOW_PROFILE}" = 0 ]; then
    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}"
+   if [ "${QWEN36_TAIL_POOL_AB:-0}" = 1 ]; then
+      python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
+         --expected-steps "${NUM_ROLLOUT}" --chunkflow-arm chunkflow_pool --output-prefix tail_pool-
+      python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
+         --expected-steps "${NUM_ROLLOUT}" --baseline-arm chunkflow --chunkflow-arm chunkflow_pool \
+         --output-prefix tail_pool-vs-unpooled-
+   fi
 fi
 echo "Comparison complete: ${RESULT_DIR}"
