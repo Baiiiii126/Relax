@@ -102,3 +102,46 @@ def test_chunk_sweep_reuses_baseline_and_reports_regressions(tmp_path: Path):
     rows = list(csv.DictReader((tmp_path / "sweep.csv").open()))
     assert rows[0]["train_speedup"] == "" and rows[0]["status"].startswith("invalid")
     assert rows[2]["status"] == "complete"
+
+
+def test_gate_report_checks_decisions_and_keeps_all_100_steps(tmp_path: Path):
+    summarize = runpy.run_path(
+        str(Path(__file__).resolve().parents[2] / "scripts/training/sft/tools/summarize_qwen36_comparison.py")
+    )["summarize"]
+    for arm in ("baseline", "chunkflow_gate"):
+        lines = []
+        for step in range(100):
+            row = {
+                "train/loss": 1.0,
+                "perf/actor_train_time": 10,
+                "perf/step_time": 12,
+                "perf/actor_train_tokens": 100,
+            }
+            if arm == "chunkflow_gate":
+                row.update(
+                    {
+                        "train/chunkflow/" + key: value
+                        for key, value in {
+                            "gate_selected": step % 2,
+                            "gate_predicted_speedup": 1.3 if step % 2 else 1.2,
+                            "gate_threshold_gain_pct": 20,
+                            "gate_prediction_time_s": 0.002,
+                            "gate_consensus_time_s": 0.003,
+                        }.items()
+                    }
+                )
+            lines.append(f"step {step}: {row}")
+        (tmp_path / f"{arm}.log").write_text("\n".join(lines))
+    assert summarize(tmp_path, 100, chunkflow_arm="chunkflow_gate", output_prefix="gate-")
+    report = (tmp_path / "gate-diagnosis.md").read_text()
+    assert "| 0 | 100 | 50 | 50 | 50.0% | 5.000 |" in report
+    assert "| 50 | perf/actor_train_time | 50 |" in report
+    rows = list(csv.DictReader((tmp_path / "gate-paired.csv").open()))
+    assert len(rows) == 100 and rows[-1]["step"] == "99"
+    assert rows[0]["chunkflow:train/chunkflow/gate_selected"] == "0"
+    path = tmp_path / "chunkflow_gate.log"
+    path.write_text(
+        path.read_text().replace("'train/chunkflow/gate_selected': 0", "'train/chunkflow/gate_selected': 1", 1)
+    )
+    assert not summarize(tmp_path, 100, chunkflow_arm="chunkflow_gate", output_prefix="gate-")
+    assert "Missing/inconsistent gate decisions at steps [0]" in (tmp_path / "gate-diagnosis.md").read_text()

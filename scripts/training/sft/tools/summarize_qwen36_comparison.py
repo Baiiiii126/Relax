@@ -17,6 +17,11 @@ METRICS = ("train/loss", "train/grad_norm", "perf/actor_train_time", "perf/step_
 POOL_METRICS = tuple(
     f"train/chunkflow/{key}"
     for key in (
+        "gate_selected",
+        "gate_predicted_speedup",
+        "gate_threshold_gain_pct",
+        "gate_prediction_time_s",
+        "gate_consensus_time_s",
         "num_microbatches",
         "num_units",
         "unit_padded_rows",
@@ -175,6 +180,48 @@ def summarize(
             lines.append(
                 f"| {start} | {metric} | {len(valid)} | {bt / len(valid):.4f} | {ct / len(valid):.4f} | {bt / ct:.4f}x | {bt / ct - 1:+.2%} | {1 - ct / bt:+.2%} |"
             )
+    if chunkflow_arm == "chunkflow_gate":
+        prefix = "train/chunkflow/"
+        invalid = []
+        for step in required:
+            row = chunk.get(step, {})
+            selected = row.get(prefix + "gate_selected")
+            prediction = row.get(prefix + "gate_predicted_speedup")
+            threshold = row.get(prefix + "gate_threshold_gain_pct")
+            if (
+                selected not in (0, 1)
+                or not number(prediction)
+                or not number(threshold)
+                or selected != int(prediction > 1 + threshold / 100)
+            ):
+                invalid.append(step)
+        if invalid:
+            issues.append(f"Missing/inconsistent gate decisions at steps {sorted(invalid)}")
+        lines += [
+            "",
+            "## Gate decisions",
+            "",
+            "Prediction uses CPU lengths before forward; the threshold is frozen for the run.",
+            "Timings include prediction, rank agreement and path switching. Fallback uses the native schedule and operators.",
+            "",
+            "| Start step | Valid decisions | ChunkFlow on | Baseline fallback | On rate | Mean prediction + agreement (ms) |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for start in (0, 10, 30, 50):
+            valid = [s for s in sorted(required) if s >= start and s not in invalid]
+            if not valid:
+                continue
+            enabled = sum(chunk[s][prefix + "gate_selected"] for s in valid)
+            overhead = [
+                sum(
+                    chunk[s].get(prefix + k, float("nan")) for k in ("gate_prediction_time_s", "gate_consensus_time_s")
+                )
+                for s in valid
+            ]
+            lines.append(
+                f"| {start} | {len(valid)} | {enabled} | {len(valid) - enabled} | {enabled / len(valid):.1%} | {1000 * sum(overhead) / len(valid):.3f} |"
+            )
+        lines += ["", "Per-step predictions, decisions, loss and timing are retained in the paired CSV."]
     if chunkflow_arm == "chunkflow_pool":
         invalid = [s for s in required if chunk.get(s, {}).get("train/chunkflow/tail_pool_enabled") != 1]
         if invalid:
@@ -301,8 +348,10 @@ if __name__ == "__main__":
     parser.add_argument("folder", type=Path)
     parser.add_argument("--expected-steps", type=int)
     parser.add_argument("--baseline-arm", choices=("baseline", "chunkflow"), default="baseline")
-    parser.add_argument("--chunkflow-arm", choices=("chunkflow", "chunkflow_pool"), default="chunkflow")
-    parser.add_argument("--output-prefix", choices=("", "tail_pool-", "tail_pool-vs-unpooled-"), default="")
+    parser.add_argument(
+        "--chunkflow-arm", choices=("chunkflow", "chunkflow_pool", "chunkflow_gate"), default="chunkflow"
+    )
+    parser.add_argument("--output-prefix", choices=("", "tail_pool-", "tail_pool-vs-unpooled-", "gate-"), default="")
     parser.add_argument("--chunks", type=int, nargs="+")
     parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()

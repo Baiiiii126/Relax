@@ -1182,7 +1182,16 @@ def train_one_step(
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
-    if getattr(args, "use_chunkflow", False):
+    use_chunkflow_this_step = getattr(args, "use_chunkflow", False)
+    fallback_context = nullcontext()
+    if use_chunkflow_this_step and os.environ.get("RELAX_CHUNKFLOW_GATE_GAIN_PCT"):
+        from relax.backends.megatron.chunkflow.gating import prepare_step_gate
+        from relax.backends.megatron.chunkflow.integration import baseline_execution
+
+        use_chunkflow_this_step = prepare_step_gate(args, model, data_iterator, num_microbatches)
+        if not use_chunkflow_this_step:
+            fallback_context = baseline_execution(model[0])
+    if use_chunkflow_this_step:
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size > 1:
             if getattr(args, "chunkflow_pipeline", 0) != pp_size:
@@ -1219,13 +1228,13 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    path = "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline"
+    path = "chunkflow" if use_chunkflow_this_step else "baseline"
     compute_context = (
         torch.profiler.record_function(f"chunkflow.path.{path}.forward_backward")
         if getattr(args, "use_pytorch_profiler", False)
         else nullcontext()
     )
-    with train_phase("forward_backward"), compute_context:
+    with train_phase("forward_backward"), compute_context, fallback_context:
         losses_reduced = forward_backward_func(
             forward_step_func=profile_forward_step(forward_step),
             data_iterator=data_iterator,

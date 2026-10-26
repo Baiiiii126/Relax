@@ -11,7 +11,11 @@ fi
 export EP_SIZE="${EP_SIZE:-2}"
 export GBS="${GBS:-8}"
 export CHUNK_SIZE="${CHUNK_SIZE:-8192}"
-export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
+if [ -n "${QWEN36_GATE_GAIN_PCT:-}" ]; then
+   export NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
+else
+   export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
+fi
 export TRAIN_SEED="${TRAIN_SEED:-1235}"
 export CHUNKFLOW_PROFILE="${CHUNKFLOW_PROFILE:-0}"
 export RELAX_TRAIN_PROFILE_RECORD_SHAPES="${RELAX_TRAIN_PROFILE_RECORD_SHAPES:-0}"
@@ -70,6 +74,16 @@ if [ -n "${CHUNK_SIZES:-}" ]; then
       ARMS=("${REVERSED[@]}")
    fi
 fi
+if [ -n "${QWEN36_GATE_GAIN_PCT:-}" ]; then
+   if [ -n "${CHUNK_SIZES:-}" ] || [ "${QWEN36_TAIL_POOL_AB:-0}" != 0 ] || [ "${CHUNKFLOW_PROFILE}" != 0 ]; then
+      echo "ERROR: gating comparison requires one chunk size, no tail pool and no profiler" >&2
+      exit 2
+   fi
+   export QWEN36_GATE_GAIN_PCT
+   python3 -c 'import math, os; x=float(os.environ["QWEN36_GATE_GAIN_PCT"]); assert math.isfinite(x) and x >= 0, "Invalid gate gain percentage"'
+   ARMS=(baseline chunkflow_gate)
+   if [ "${QWEN36_REVERSE_ORDER:-0}" = 1 ]; then ARMS=(chunkflow_gate baseline); fi
+fi
 export MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
 export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
 export QWEN36_ROUTER_DTYPE="${QWEN36_ROUTER_DTYPE:-fp64}"
@@ -95,7 +109,8 @@ Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LAB
 Numerical probes and FP32 KV experiment disabled.
 Arms in execution order: ${ARMS[*]}. Each starts from the same checkpoint, seed and optimizer settings.
 chunkflow_pool enables bounded terminal-tail pooling; chunkflow disables it. Both use the same parent window and CPU preparation code.
-Profiler: ${CHUNKFLOW_PROFILE}; schedule prediction is disabled. For unprofiled performance runs only, compare paired steps after the first 30 warmup steps using total-time ratios.
+Gate threshold: ${QWEN36_GATE_GAIN_PCT:-disabled}% predicted gain; only chunkflow_gate predicts before every step. Gate costs are included in timings.
+Profiler: ${CHUNKFLOW_PROFILE}; post-step schedule analysis is disabled. For unprofiled performance runs only, compare paired steps after the first 30 warmup steps using total-time ratios.
 Both arms must be rerun for this topology; previous EP1 measurements are not this baseline.
 EOF
 if [ "${CHUNKFLOW_PROFILE}" = 1 ]; then
@@ -128,6 +143,11 @@ EOF
 fi
 for arm in "${ARMS[@]}"; do
    mode="${arm}"
+   unset RELAX_CHUNKFLOW_GATE_GAIN_PCT
+   if [ "${arm}" = chunkflow_gate ]; then
+      mode=chunkflow
+      export RELAX_CHUNKFLOW_GATE_GAIN_PCT="${QWEN36_GATE_GAIN_PCT}"
+   fi
    export RELAX_CHUNKFLOW_TAIL_POOL=0
    if [ "${#CHUNKS[@]}" -gt 0 ] && [ "${arm}" != baseline ]; then
       mode=chunkflow
@@ -151,7 +171,10 @@ for arm in "${ARMS[@]}"; do
    fi
 done
 if [ "${CHUNKFLOW_PROFILE}" = 0 ]; then
-   if [ "${#CHUNKS[@]}" -eq 0 ]; then
+   if [ -n "${QWEN36_GATE_GAIN_PCT:-}" ]; then
+      python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
+         --expected-steps "${NUM_ROLLOUT}" --chunkflow-arm chunkflow_gate --output-prefix gate-
+   elif [ "${#CHUNKS[@]}" -eq 0 ]; then
       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}"
    else
       python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \

@@ -141,6 +141,12 @@ case "${RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS}" in
    0|1) ;;
    *) echo "ERROR: RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS must be 0 or 1" >&2; exit 2 ;;
 esac
+if [ "${MODE}" = baseline ]; then
+   unset RELAX_CHUNKFLOW_GATE_GAIN_PCT
+elif [ -n "${RELAX_CHUNKFLOW_GATE_GAIN_PCT:-}" ]; then
+   export RELAX_CHUNKFLOW_GATE_GAIN_PCT
+   python3 -c 'import math, os; x=float(os.environ["RELAX_CHUNKFLOW_GATE_GAIN_PCT"]); assert math.isfinite(x) and x >= 0, "Invalid gate gain percentage"'
+fi
 RUNTIME_ENV_JSON=$(python3 -c '
 import json, os
 env = json.loads(os.environ["RUNTIME_ENV_JSON"])
@@ -152,7 +158,7 @@ if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
 else:
     env.setdefault("env_vars", {}).pop("RELAX_TRAIN_PROFILE_DIR", None)
-for key in ("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR", "RELAX_CHUNKFLOW_GRAD_ROLLOUTS", "RELAX_CHUNKFLOW_LAYER_TRACE",
+for key in ("RELAX_CHUNKFLOW_GATE_GAIN_PCT", "RELAX_CHUNKFLOW_DIAGNOSTIC_DIR", "RELAX_CHUNKFLOW_GRAD_ROLLOUTS", "RELAX_CHUNKFLOW_LAYER_TRACE",
             "RELAX_CHUNKFLOW_UPDATE_TRACE", "RELAX_CHUNKFLOW_KV_GRAD_FP32", "RELAX_CHUNKFLOW_TAIL_TRACE", "RELAX_CHUNKFLOW_CONV_TRACE", "RELAX_CHUNKFLOW_CONV_CHUNK_SIZE"):
     if os.environ.get(key):
         env.setdefault("env_vars", {})[key] = os.environ[key]
@@ -224,6 +230,7 @@ mkdir -p "$(dirname -- "${LOG_FILE}")"
 echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=${EP_SIZE} GBS=${GBS} STEPS=${NUM_ROLLOUT} SEED=${TRAIN_SEED} ARM=${ARM}"
 echo "LR=${LEARNING_RATE} GDN_RECOMPUTE=${GDN_RECOMPUTE} CPU_OPTIMIZER_OVERLAP=${CPU_OPTIMIZER_OVERLAP}"
 echo "MOE_SHARED_EXPERT_OVERLAP=${MOE_SHARED_EXPERT_OVERLAP}"
+echo "CHUNKFLOW_GATE_GAIN_PCT=${RELAX_CHUNKFLOW_GATE_GAIN_PCT:-disabled}"
 echo "CHUNKFLOW_TAIL_POOL=${RELAX_CHUNKFLOW_TAIL_POOL} PARENT_WINDOW=${RELAX_CHUNKFLOW_PARENT_WINDOW}"
 echo "LOG_FILE=${LOG_FILE}"
 if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import itertools
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -226,6 +228,7 @@ def install(model, chunk_size: int) -> int:
             cfg = getattr(module, "config", None)
             if cfg is not None and hasattr(cfg, "apply_rope_fusion") and id(cfg) not in seen_configs:
                 seen_configs.add(id(cfg))
+                runtime.baseline_rope_configs.setdefault(id(cfg), (cfg, cfg.apply_rope_fusion))
                 cfg.apply_rope_fusion = False
         logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
     logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
@@ -249,3 +252,34 @@ def uninstall(model) -> int:
         delattr(attn, _ORIG_ATTR)
         n += 1
     return n
+
+
+@contextmanager
+def baseline_execution(model: nn.Module) -> Iterator[None]:
+    from relax.backends.megatron.chunkflow import gdn
+    from relax.backends.megatron.chunkflow.runtime import require_runtime
+
+    runtime = require_runtime(model)
+    runtime.assert_empty("before baseline fallback")
+    overrides = []
+    for module in list(model.modules()):
+        original = getattr(module, _ORIG_ATTR, None)
+        if original is not None:
+            overrides.append((module, "core_attention", original))
+        if hasattr(module, _TRANSPOSE_CACHE_ATTR):
+            overrides.append((module, "disable_parameter_transpose_cache", getattr(module, _TRANSPOSE_CACHE_ATTR)))
+        original_gdn = getattr(module, gdn._ORIGINAL, None)
+        if original_gdn is not None:
+            names = ("forward", "_forward_compute", "_resolve_cu_seqlens", "gated_delta_rule")
+            overrides.extend((module, name, value) for name, value in zip(names, original_gdn))
+    overrides.extend((cfg, "apply_rope_fusion", value) for cfg, value in runtime.baseline_rope_configs.values())
+    saved = []
+    try:
+        for obj, name, value in overrides:
+            saved.append((obj, name, getattr(obj, name)))
+            setattr(obj, name, value)
+        yield
+        runtime.assert_empty("after baseline fallback")
+    finally:
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)

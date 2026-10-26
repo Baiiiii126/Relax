@@ -390,3 +390,102 @@ def test_kv_cache_fp32_accumulates_across_backward_without_changing_values(monke
     torch.testing.assert_close(
         old_live.grad, torch.full_like(old_live, 256 if dtype == torch.bfloat16 else 258), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_baseline_fallback_restores_native_modules_for_entire_backward(monkeypatch, fail):
+    from relax.backends.megatron.chunkflow import gdn
+    from relax.backends.megatron.chunkflow.integration import baseline_execution
+
+    model = torch.nn.Sequential(_FakeAttn())
+    attn = model[0]
+    attn.config.apply_rope_fusion = True
+    attn.disable_parameter_transpose_cache = False
+    attn.is_first_microbatch = True
+    native_core = attn.core_attention
+    install(model, chunk_size=4)
+    cf_core = attn.core_attention
+    names = ("forward", "_forward_compute", "_resolve_cu_seqlens", "gated_delta_rule")
+    originals = tuple(lambda: None for _ in names)
+    wrappers = tuple(lambda: None for _ in names)
+    setattr(attn, gdn._ORIGINAL, originals)
+    for name, method in zip(names, wrappers):
+        setattr(attn, name, method)
+    runtime = model.chunkflow_runtime
+    runtime.gate_metrics = {"gate_selected": 0}
+    runtime.begin_step()
+    assert runtime.consume_step_metrics(4) == {"gate_selected": 0}
+    assert runtime.consume_step_metrics(4) == {}
+    for _ in range(2):
+        try:
+            with baseline_execution(model):
+                assert attn.core_attention is native_core
+                assert attn.config.apply_rope_fusion is True
+                assert attn.disable_parameter_transpose_cache is False
+                assert tuple(getattr(attn, name) for name in names) == originals
+                # Check the same native state when autograd invokes a backward hook.
+                x = torch.ones(1, requires_grad=True)
+                observed = []
+                x.register_hook(lambda grad: observed.append(attn.core_attention is native_core))
+                native_core(x).sum().backward()
+                assert observed == [True]
+                if fail:
+                    raise RuntimeError("injected forward/backward failure")
+        except RuntimeError as exc:
+            assert fail and "injected" in str(exc)
+        assert attn.core_attention is cf_core
+        assert attn.config.apply_rope_fusion is False
+        assert attn.disable_parameter_transpose_cache is True
+        assert tuple(getattr(attn, name) for name in names) == wrappers
+
+
+@pytest.mark.parametrize(
+    "threshold,peer_error,expected",
+    [("20", None, False), ("19", None, True), ("nan", None, None), ("20", "mismatch", None), ("20", "error", None)],
+)
+def test_gate_agrees_before_scheduling_and_retains_decision(monkeypatch, threshold, peer_error, expected):
+    import torch.distributed as dist
+    from megatron.core import mpu
+
+    from relax.backends.megatron.chunkflow import gating
+    from relax.utils import distributed_utils
+
+    model = torch.nn.Identity()
+    model.chunkflow_runtime = ChunkflowRuntime(8192)
+    monkeypatch.setenv(gating.GATE_ENV, threshold)
+    monkeypatch.setenv("RELAX_CHUNKFLOW_TAIL_POOL", "0")
+    for name, result in (
+        ("get_data_parallel_world_size", 1),
+        ("get_context_parallel_world_size", 1),
+        ("get_virtual_pipeline_model_parallel_world_size", None),
+        ("get_pipeline_model_parallel_world_size", 4),
+        ("get_tensor_model_parallel_world_size", 2),
+    ):
+        monkeypatch.setattr(mpu, name, lambda *a, _result=result, **kw: _result)
+    monkeypatch.setattr(gating, "forecast_step", lambda *a, **kw: ({"schedule_model_speedup": 1.2}, "input"))
+    group = object()
+    monkeypatch.setattr(distributed_utils, "get_gloo_group", lambda: group)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 8)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    gathered = []
+
+    def agree(peers, local, *, group):
+        gathered.append(local)
+        peers[:] = [local] * 8
+        if peer_error:
+            changed = list(local)
+            changed[0 if peer_error == "error" else 1] = "different"
+            peers[-1] = tuple(changed)
+
+    monkeypatch.setattr(dist, "all_gather_object", agree)
+    args = SimpleNamespace(
+        qkv_format="thd", loss_type="sft", chunkflow_chunk_size=8192, data_pad_size_multiplier=128, is_vl_model=True
+    )
+    if expected is None:
+        with pytest.raises(ValueError, match="adaptive ChunkFlow"):
+            gating.prepare_step_gate(args, [model], [object()], 2)
+    else:
+        assert gating.prepare_step_gate(args, [model], [object()], 2) is expected
+        model.chunkflow_runtime.begin_step()
+        assert model.chunkflow_runtime.consume_step_metrics(4)["gate_selected"] == int(expected)
+    assert len(gathered) == 1
