@@ -214,6 +214,88 @@ def summarize(
     return not issues
 
 
+def summarize_sweep(folder: Path, chunks: list[int], expected_steps: int) -> bool:
+    records = []
+    complete = True
+    lines = [
+        "# Fixed-GBS chunk-size comparison",
+        "",
+        "Configuration and run completion: comparison.md. All candidates share one baseline; GBS is unchanged.",
+        "Primary window: step 30 onward. Step 10 onward is also shown to expose warmup sensitivity.",
+        "Speedup = baseline total time / candidate total time. Above 1 is faster; below 1 is slower.",
+        "Step time excludes job startup/model loading. Do not average per-step speedup ratios.",
+        "",
+        "| Chunk | Start step | Pairs | Training speedup | Step speedup | Step throughput change | Slower training steps | Max absolute loss difference (all steps) | Status |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for size in chunks:
+        arm = f"chunk{size}"
+        paths = (folder / "baseline.log", folder / f"{arm}.log")
+        valid = False
+        status = "pending"
+        if all(p.exists() for p in paths):
+            valid = summarize(folder, expected_steps, chunkflow_arm=arm, output_prefix=f"{arm}-")
+            base, chunk = (read_rows(p) for p in paths)
+            valid = valid and all(
+                base[s]["perf/actor_train_tokens"] > 0
+                and base[s]["perf/actor_train_tokens"] == chunk[s]["perf/actor_train_tokens"]
+                and all(d[s][m] > 0 for d in (base, chunk) for m in ("perf/actor_train_time", "perf/step_time"))
+                for s in range(expected_steps)
+            )
+            status = "complete" if valid else "invalid: inspect diagnosis and token counts"
+        complete = complete and valid
+        for start in (30, 10):
+            row = {"chunk": size, "start_step": start, "pairs": 0, "status": status}
+            if valid:
+                steps = range(start, expected_steps)
+                train_x, step_x = (
+                    sum(base[s][m] for s in steps) / sum(chunk[s][m] for s in steps)
+                    for m in ("perf/actor_train_time", "perf/step_time")
+                )
+                loss_delta = max(abs(chunk[s]["train/loss"] - base[s]["train/loss"]) for s in range(expected_steps))
+                slower = sum(chunk[s]["perf/actor_train_time"] > base[s]["perf/actor_train_time"] for s in steps)
+                row.update(
+                    pairs=len(steps),
+                    train_speedup=train_x,
+                    step_speedup=step_x,
+                    step_throughput_change=step_x - 1,
+                    train_slower_fraction=slower / len(steps),
+                    max_abs_loss_delta=loss_delta,
+                )
+                lines.append(
+                    f"| {size} | {start} | {len(steps)} | {train_x:.4f}x | {step_x:.4f}x | {step_x - 1:+.2%} | {slower}/{len(steps)} | {loss_delta:.6g} | {status} |"
+                )
+            else:
+                lines.append(f"| {size} | {start} | — | — | — | — | — | — | {status} |")
+            records.append(row)
+    lines += [
+        "",
+        "Per-size chunk*-paired.csv preserves every loss/timing point; chunk*-diagnosis.md includes ClearML links.",
+        "All sizes are shown, including regressions. Invalid or unequal-token runs are excluded from speedup calculations.",
+        "Loss differences are reported, not automatically accepted as correct; matching token counts does not prove identical data.",
+        "Slower-step counts use a strict time comparison without a noise tolerance.",
+        "This is parameter screening. Shared baselines and sequential run order do not establish statistical significance.",
+        "Confirm a promising size by rerunning baseline/ChunkFlow in reverse order with the same configuration, without profiler.",
+    ]
+    (folder / "sweep.md").write_text("\n".join(lines) + "\n")
+    fields = (
+        "chunk",
+        "start_step",
+        "pairs",
+        "train_speedup",
+        "step_speedup",
+        "step_throughput_change",
+        "train_slower_fraction",
+        "max_abs_loss_delta",
+        "status",
+    )
+    with (folder / "sweep.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(records)
+    return complete
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
@@ -221,9 +303,19 @@ if __name__ == "__main__":
     parser.add_argument("--baseline-arm", choices=("baseline", "chunkflow"), default="baseline")
     parser.add_argument("--chunkflow-arm", choices=("chunkflow", "chunkflow_pool"), default="chunkflow")
     parser.add_argument("--output-prefix", choices=("", "tail_pool-", "tail_pool-vs-unpooled-"), default="")
+    parser.add_argument("--chunks", type=int, nargs="+")
+    parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()
     if args.expected_steps is not None and args.expected_steps <= 0:
         parser.error("--expected-steps must be positive")
+    if args.chunks is not None:
+        if args.expected_steps is None or args.expected_steps <= 30:
+            parser.error("--chunks requires --expected-steps > 30")
+        if min(args.chunks) <= 0 or len(set(args.chunks)) != len(args.chunks):
+            parser.error("--chunks must contain distinct positive sizes")
+        if not summarize_sweep(args.folder, args.chunks, args.expected_steps) and args.require_complete:
+            raise SystemExit("Incomplete sweep; inspect sweep.md")
+        raise SystemExit(0)
     if not summarize(
         args.folder,
         args.expected_steps,

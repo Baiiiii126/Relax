@@ -67,3 +67,38 @@ def test_tail_pool_comparison_exports_execution_and_refuses_missing_evidence(tmp
         path.read_text().replace("'train/chunkflow/tail_pool_enabled': 1", "'train/chunkflow/tail_pool_enabled': 0")
     )
     assert not summarize(tmp_path, 1, chunkflow_arm="chunkflow_pool", output_prefix="tail_pool-")
+
+
+def test_chunk_sweep_reuses_baseline_and_reports_regressions(tmp_path: Path):
+    sweep = runpy.run_path(
+        str(Path(__file__).resolve().parents[2] / "scripts/training/sft/tools/summarize_qwen36_comparison.py")
+    )["summarize_sweep"]
+    for arm in ("baseline", "chunk4096", "chunk8192"):
+        lines = []
+        for step in range(50):
+            train_time = 10 if step % 2 else {"baseline": 2, "chunk4096": 1, "chunk8192": 4}[arm]
+            row = {
+                "train/loss": 1.0 + (0.01 if arm == "chunk8192" else 0),
+                "perf/actor_train_time": train_time,
+                "perf/step_time": train_time + 1,
+                "perf/actor_train_tokens": 100,
+            }
+            lines.append(f"step {step}: {row}")
+        (tmp_path / f"{arm}.log").write_text("\n".join(lines))
+    assert not sweep(tmp_path, [4096, 8192, 16384], 50)
+    rows = list(csv.DictReader((tmp_path / "sweep.csv").open()))
+    assert [r["chunk"] for r in rows] == ["4096", "4096", "8192", "8192", "16384", "16384"]
+    assert float(rows[0]["train_speedup"]) == 6 / 5.5
+    assert float(rows[0]["step_speedup"]) == 7 / 6.5
+    assert float(rows[2]["train_speedup"]) == 6 / 7
+    assert float(rows[2]["train_slower_fraction"]) == 0.5
+    assert rows[4]["status"] == "pending"
+    assert len(list(csv.DictReader((tmp_path / "chunk8192-paired.csv").open()))) == 50
+    assert sweep(tmp_path, [4096, 8192], 50)
+
+    path = tmp_path / "chunk4096.log"
+    path.write_text(path.read_text().replace("'perf/actor_train_tokens': 100", "'perf/actor_train_tokens': 99"))
+    assert not sweep(tmp_path, [4096, 8192], 50)
+    rows = list(csv.DictReader((tmp_path / "sweep.csv").open()))
+    assert rows[0]["train_speedup"] == "" and rows[0]["status"].startswith("invalid")
+    assert rows[2]["status"] == "complete"

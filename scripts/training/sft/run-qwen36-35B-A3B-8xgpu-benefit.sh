@@ -9,6 +9,7 @@ if [ "$#" -ne 0 ] || [ "${RAY_NO_WAIT:-0}" != 0 ]; then
    exit 2
 fi
 export EP_SIZE="${EP_SIZE:-2}"
+export GBS="${GBS:-8}"
 export CHUNK_SIZE="${CHUNK_SIZE:-8192}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
 export TRAIN_SEED="${TRAIN_SEED:-1235}"
@@ -33,6 +34,42 @@ if [ "${QWEN36_REVERSE_ORDER:-0}" = 1 ]; then
       ARMS=(chunkflow baseline)
    fi
 fi
+CHUNKS=()
+if [ -n "${CHUNK_SIZES:-}" ]; then
+   if [ "${CHUNKFLOW_PROFILE}" != 0 ] || [ "${QWEN36_TAIL_POOL_AB:-0}" != 0 ]; then
+      echo "ERROR: CHUNK_SIZES requires CHUNKFLOW_PROFILE=0 and QWEN36_TAIL_POOL_AB=0" >&2
+      exit 2
+   fi
+   if ! [[ "${NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]] || [ "${NUM_ROLLOUT}" -le 30 ]; then
+      echo "ERROR: chunk sweep requires NUM_ROLLOUT > 30" >&2
+      exit 2
+   fi
+   read -r -a CHUNKS <<< "${CHUNK_SIZES}"
+   ARMS=(baseline)
+   for chunk in "${CHUNKS[@]}"; do
+      if ! [[ "${chunk}" =~ ^[1-9][0-9]*$ ]] || [ "${chunk}" -ge "${SEQ_LENGTH:-32768}" ]; then
+         echo "ERROR: each CHUNK_SIZES value must be positive and smaller than SEQ_LENGTH" >&2
+         exit 2
+      fi
+      for arm in "${ARMS[@]}"; do
+         if [ "${arm}" = "chunk${chunk}" ]; then
+            echo "ERROR: duplicate chunk size ${chunk}" >&2
+            exit 2
+         fi
+      done
+      ARMS+=("chunk${chunk}")
+   done
+   if [ "${#CHUNKS[@]}" -eq 0 ]; then
+      echo "ERROR: CHUNK_SIZES contains no sizes" >&2
+      exit 2
+   fi
+   export CHUNK_SIZE="${CHUNKS[0]}"
+   if [ "${QWEN36_REVERSE_ORDER:-0}" = 1 ]; then
+      REVERSED=()
+      for ((i=${#ARMS[@]}-1; i>=0; i--)); do REVERSED+=("${ARMS[i]}"); done
+      ARMS=("${REVERSED[@]}")
+   fi
+fi
 export MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
 export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
 export QWEN36_ROUTER_DTYPE="${QWEN36_ROUTER_DTYPE:-fp64}"
@@ -49,6 +86,7 @@ cat > "${RESULT_DIR}/comparison.md" <<EOF
 
 Commit: $(git rev-parse HEAD)
 TP2 / PP4 / EP${EP_SIZE} / ETP1; chunk=${CHUNK_SIZE}; GBS=${GBS:-8}; seed=${TRAIN_SEED}; steps=${NUM_ROLLOUT}.
+Chunk sizes under comparison: ${CHUNK_SIZES:-${CHUNK_SIZE}}. GBS is fixed across all arms; each chunk uses the same baseline.
 LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
 MoE shared expert overlap: ${MOE_SHARED_EXPERT_OVERLAP} (both arms).
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
@@ -91,6 +129,10 @@ fi
 for arm in "${ARMS[@]}"; do
    mode="${arm}"
    export RELAX_CHUNKFLOW_TAIL_POOL=0
+   if [ "${#CHUNKS[@]}" -gt 0 ] && [ "${arm}" != baseline ]; then
+      mode=chunkflow
+      export CHUNK_SIZE="${arm#chunk}"
+   fi
    if [ "${arm}" = chunkflow_pool ]; then
       mode=chunkflow
       export RELAX_CHUNKFLOW_TAIL_POOL=1
@@ -103,9 +145,18 @@ for arm in "${ARMS[@]}"; do
       bash scripts/entrypoint/ray-job.sh \
       scripts/training/sft/run-qwen36-35B-A3B-8xgpu-chunkflow.sh "${mode}"
    echo "${arm}: complete" >> "${RESULT_DIR}/comparison.md"
+   if [ "${#CHUNKS[@]}" -gt 0 ]; then
+      python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
+         --expected-steps "${NUM_ROLLOUT}" --chunks "${CHUNKS[@]}"
+   fi
 done
 if [ "${CHUNKFLOW_PROFILE}" = 0 ]; then
-   OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}"
+   if [ "${#CHUNKS[@]}" -eq 0 ]; then
+      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}"
+   else
+      python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
+         --expected-steps "${NUM_ROLLOUT}" --chunks "${CHUNKS[@]}" --require-complete
+   fi
    if [ "${QWEN36_TAIL_POOL_AB:-0}" = 1 ]; then
       python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
          --expected-steps "${NUM_ROLLOUT}" --chunkflow-arm chunkflow_pool --output-prefix tail_pool-
