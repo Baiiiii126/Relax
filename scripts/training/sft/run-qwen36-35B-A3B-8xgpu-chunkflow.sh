@@ -182,6 +182,7 @@ TRAIN_ARGS=(
    --seq-length "${SEQ_LENGTH}"
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
    --sft-oversize-strategy skip
+   --sft-invalid-multimodal-strategy skip
    --calculate-per-token-loss
    --cross-entropy-loss-fusion
    --sft-chunked-logits

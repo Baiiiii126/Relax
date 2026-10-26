@@ -106,6 +106,7 @@ MoE shared expert overlap: ${MOE_SHARED_EXPERT_OVERLAP} (both arms).
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
 ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (0=all parents in each step; positive values cap parents per drain).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
+Data filtering: oversize=skip; invalid multimodal=skip (both arms refill full batches and log skipped samples).
 Numerical probes and FP32 KV experiment disabled.
 Arms in execution order: ${ARMS[*]}. Each starts from the same checkpoint, seed and optimizer settings.
 chunkflow_pool enables bounded terminal-tail pooling; chunkflow disables it. Both use the same parent window and CPU preparation code.
