@@ -72,6 +72,13 @@ Host intervals include nested calls and waits; do not sum them as GPU compute ti
 thread_cpu_s counts CPU time on the calling thread; wall time minus thread CPU time includes waits and descheduling, not just GPU idle.
 cpu_threads records intraop/interop thread counts and affinity size; it does not establish CPU quota or available capacity.
 chunkflow.unit_prepare separates input slicing and metadata preparation from MoE kernel launches.
+chunkflow.tail_pool.plan measures pooling decisions; chunkflow.batch.pooled includes its nested chunkflow.batch.pool_part calls.
+chunkflow.gdn.kernel.conv/recurrent count actual per-segment kernel calls; chunkflow.gdn.tail_assemble marks pooled output concatenation/padding.
+GDN kernel scopes also include calls during selective recomputation; they are host launch intervals, not GPU durations.
+These kernel scopes are ChunkFlow-only; compare model.gdn_compute and GPU kernels across all three arms.
+segments files distinguish tail_pool_enabled and record process CPU time plus visible cgroup counters before/after each selected step.
+The visible cgroup may be shared with other processes; throttling/pressure deltas indicate resource pressure, not its owner or a proven cause.
+Process CPU time covers all threads of one worker; do not sum shared cgroup deltas across ranks or treat PSI averages as step durations.
 ChunkFlow window scopes identify parent ranges and prepare/warmup/steady/drain phases, with unit counts.
 Warmup/drain include useful work; measure GPU idle and communication waits inside them to assess bubbles.
 Both arms split MoE routing, dispatch, expert computation and combine; dispatcher DtoH synchronization is marked when available.

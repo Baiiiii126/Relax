@@ -11,7 +11,7 @@ try:
     from megatron.core.pipeline_parallel import p2p_communication, schedules
 
     from relax.backends.megatron import training_profile as profiling
-    from relax.backends.megatron.chunkflow import pipeline_schedules
+    from relax.backends.megatron.chunkflow import gdn, pipeline_schedules, unit_batch
     from relax.utils import profile_utils
 except ImportError as exc:
     pytest.skip(f"Training profiler dependencies unavailable: {exc}", allow_module_level=True)
@@ -120,8 +120,9 @@ def test_profile_shape_recording_can_be_disabled(monkeypatch, record_shapes):
     assert not any(options[key] for key in ("with_stack", "profile_memory", "with_flops"))
 
 
-@pytest.mark.parametrize("chunkflow", [False, True])
-def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, chunkflow):
+@pytest.mark.parametrize("chunkflow,tail_pool", [(False, False), (True, False), (True, True)])
+def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, chunkflow, tail_pool):
+    monkeypatch.setenv("RELAX_CHUNKFLOW_TAIL_POOL", str(int(tail_pool)))
     args = SimpleNamespace(
         use_pytorch_profiler=True,
         profile_target=["train_overall"],
@@ -142,6 +143,16 @@ def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, 
     hook_map = optimizer.optimizer.cpu_optimizers[0]._optimizer_step_post_hooks
     original_hook = hook_map[0]
     config = SimpleNamespace(finalize_model_grads_func=lambda: None, grad_sync_func=None)
+    originals = [
+        (target, name, getattr(target, name))
+        for target, name in (
+            (gdn, "_invoke_kernel"),
+            (pipeline_schedules, "pool_terminal_units"),
+            (pipeline_schedules, "slice_parent_batch"),
+            (pipeline_schedules, "slice_pooled_batch"),
+            (unit_batch, "slice_parent_batch"),
+        )
+    ]
     for rollout in (33, 34, 35, 36, 37):
         x = torch.ones(3, requires_grad=True)
         with (
@@ -155,11 +166,15 @@ def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, 
                 (pipeline_schedules if chunkflow else schedules).backward_step(output)
                 config.finalize_model_grads_func()
             assert optimizer.step()
+            if chunkflow:
+                for name in ("conv", "recurrent"):
+                    torch.testing.assert_close(gdn._invoke_kernel(torch.neg, name, x), -x)
         names = {event.key for event in trace.key_averages()}
         active = 34 <= rollout <= 36
         assert ("train.segment.backward" in names) == active
         assert ("train.segment.offload.params_h2d" in names) == active
         assert ("train.segment.model.moe.experts" in names) == active
+        assert ("train.segment.chunkflow.gdn.kernel.conv" in names) == (active and chunkflow)
         torch.testing.assert_close(x.grad, torch.full_like(x, 4))
         assert schedules.backward_step is original_backward
         assert pipeline_schedules.backward_step is original_backward
@@ -169,8 +184,14 @@ def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, 
         assert vars(module[1].token_dispatcher) == dispatcher_methods
         assert "step" not in vars(optimizer)
         assert hook_map[0] is original_hook
+        assert all(getattr(target, name) is function for target, name, function in originals)
     rows = [json.loads(line) for line in next(tmp_path.glob("segments_*.jsonl")).read_text().splitlines()]
     assert [row["rollout_id"] for row in rows] == [34, 35, 36]
+    assert all(row["tail_pool_enabled"] == tail_pool for row in rows)
+    assert all(
+        row["host_resources_after"]["process_cpu_s"] >= row["host_resources_before"]["process_cpu_s"] for row in rows
+    )
+    assert all("cgroup_visible_root" in row["host_resources_before"] for row in rows)
     assert all(row["cpu_threads"]["intraop"] == torch.get_num_threads() for row in rows)
     assert all(row["host_inclusive"]["step"]["thread_cpu_s"] > 0 for row in rows)
     for name in (
@@ -206,3 +227,4 @@ def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, 
     assert "_forward_compute" not in vars(module[0]) and "step" not in vars(optimizer)
     assert "forward" not in vars(module[1].experts)
     assert vars(module[1].token_dispatcher) == dispatcher_methods
+    assert all(getattr(target, name) is function for target, name, function in originals)

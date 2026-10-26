@@ -15,6 +15,7 @@ from torch.nn import functional as F
 
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
 from relax.backends.megatron.chunkflow.state_store import ChunkState
+from relax.backends.megatron.training_profile import train_phase
 
 
 _ORIGINAL = "_chunkflow_original_gdn"
@@ -82,9 +83,10 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
                         bound.arguments[key] = None
                 output, _ = _invoke_kernel(kernel, name, *bound.args, **bound.kwargs)
                 outputs.append(output)
-            output = torch.cat(outputs, dim=1)
-            if padded_length > real_length:
-                output = F.pad(output, (0, 0) * (output.ndim - 2) + (0, padded_length - real_length))
+            with train_phase("chunkflow.gdn.tail_assemble"):
+                output = torch.cat(outputs, dim=1)
+                if padded_length > real_length:
+                    output = F.pad(output, (0, 0) * (output.ndim - 2) + (0, padded_length - real_length))
             context.seen.add(name)
             return output, None
         if context.current is None:

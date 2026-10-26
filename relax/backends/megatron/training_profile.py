@@ -71,9 +71,22 @@ class _StepProfile:
 
         backward_modules = [schedules]
         if getattr(args, "use_chunkflow", False):
-            from relax.backends.megatron.chunkflow import pipeline_schedules
+            from relax.backends.megatron.chunkflow import gdn, pipeline_schedules, unit_batch
 
             backward_modules.append(pipeline_schedules)
+            self.wrap(pipeline_schedules, "pool_terminal_units", "chunkflow.tail_pool.plan")
+            self.wrap(pipeline_schedules, "slice_pooled_batch", "chunkflow.batch.pooled")
+            self.wrap(pipeline_schedules, "slice_parent_batch", "chunkflow.batch.single")
+            self.wrap(unit_batch, "slice_parent_batch", "chunkflow.batch.pool_part")
+            original_invoke = gdn._invoke_kernel
+
+            @wraps(original_invoke)
+            def invoke(kernel: Any, name: str, *a: Any, **kw: Any) -> Any:
+                with self.phase(f"chunkflow.gdn.kernel.{name}"):
+                    return original_invoke(kernel, name, *a, **kw)
+
+            gdn._invoke_kernel = invoke
+            self.restore.callback(setattr, gdn, "_invoke_kernel", original_invoke)
         for module in backward_modules:
             self.wrap(module, "backward_step", "backward")
         for method in (
@@ -148,6 +161,24 @@ def profile_forward_step(function: Any) -> Any:
     return forward
 
 
+def _host_resources() -> dict[str, Any]:
+    result: dict[str, Any] = {"process_cpu_s": sum(os.times()[:2]), "cgroup_visible_root": {}}
+    for name in (
+        "cpu.stat",
+        "cpu.max",
+        "cpu.pressure",
+        "memory.current",
+        "memory.max",
+        "memory.events",
+        "memory.pressure",
+    ):
+        try:
+            result["cgroup_visible_root"][name] = (Path("/sys/fs/cgroup") / name).read_text().strip()
+        except OSError:
+            continue
+    return result
+
+
 @contextmanager
 def profile_train_step(
     args: Any, rollout_id: int, step_id: int, models: Any, optimizer: Any, config: Any
@@ -169,8 +200,10 @@ def profile_train_step(
     try:
         with profile.restore:
             profile.install(args, models, optimizer, config)
+            resources_before = _host_resources()
             with profile.phase("step"):
                 yield
+            resources_after = _host_resources()
     finally:
         _ACTIVE.reset(token)
     rank = _get_rank_tag()
@@ -180,8 +213,12 @@ def profile_train_step(
         "rollout_id": rollout_id,
         "step_id": step_id,
         "arm": "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline",
+        "tail_pool_enabled": bool(getattr(args, "use_chunkflow", False))
+        and os.environ.get("RELAX_CHUNKFLOW_TAIL_POOL") == "1",
         "rank": rank,
         "host_inclusive": profile.host,
+        "host_resources_before": resources_before,
+        "host_resources_after": resources_after,
         "cpu_threads": {
             "intraop": torch.get_num_threads(),
             "interop": torch.get_num_interop_threads(),
