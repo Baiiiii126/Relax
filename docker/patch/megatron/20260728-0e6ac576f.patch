@@ -1837,3 +1837,125 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/csa.py b/m
                  weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
  
                  indexer_compressed_local, _ = indexer.compressor._forward_thd(
+diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/transformer/moe/token_dispatcher.py
+--- a/megatron/core/transformer/moe/token_dispatcher.py
++++ b/megatron/core/transformer/moe/token_dispatcher.py
+@@ -393,6 +393,7 @@
+
+     # DtoH copies are performed on this stream for overlapping with the main stream.
+     cuda_dtoh_stream = None
++    _relax_moe_metadata_patch_version = 1
+
+     def __init__(
+         self,
+@@ -492,6 +493,32 @@
+         ]
+
+         self.shared_experts = None
++        self._init_relax_metadata_mode()
++
++    def _init_relax_metadata_mode(self) -> None:
++        """Select the opt-in metadata experiment without changing routing arithmetic."""
++        self.relax_metadata_mode = os.environ.get("RELAX_MOE_METADATA_MODE", "off")
++        self._relax_counts_cpu = None
++        if self.relax_metadata_mode not in ("off", "a", "b"):
++            raise ValueError("RELAX_MOE_METADATA_MODE must be off, a or b")
++        if self.relax_metadata_mode == "off":
++            return
++        if self.tp_size != 1 or self.config.cuda_graph_impl != "none":
++            raise ValueError("MoE metadata A/B requires expert TP=1 and CUDA Graph disabled")
++        if self.relax_metadata_mode == "b" and not (
++            self.ep_size == 2
++            and self.num_local_experts == 128
++            and self.num_experts == 256
++            and not self.drop_and_pad
++            and self.config.moe_expert_capacity_factor is None
++            and not self.config.moe_router_padding_for_quantization
++            and self.config.moe_permute_fusion
++        ):
++            raise ValueError(
++                "MoE metadata B requires EP2, 256 experts, dropless routing, "
++                "no quantization padding and permutation fusion"
++            )
++        logger.info("Relax MoE metadata mode=%s (ETP1)", self.relax_metadata_mode)
+
+     def set_shared_experts(self, shared_experts):
+         """Set shared expert to the dispatcher."""
+@@ -504,7 +531,7 @@
+         """Return true when permutation 2 would only copy already grouped local chunks."""
+         return self.tp_size == 1 and self.ep_size == 1
+
+-    def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
++    def preprocess(self, routing_map: torch.Tensor) -> Optional[torch.Tensor]:
+         """
+         Preprocesses the token routing map for All-to-All communication and token permutation.
+
+@@ -585,17 +612,21 @@
+                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
+             ].contiguous()
+             # [tp_size, ep_size, num_local_experts] -> [tp_size, ep_size]
+-            num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
+-            # [tp_size, ep_size] -> [ep_size]
+-            # self.output_splits represents the number of tokens received by the current rank
+-            # from other EP rank.
+-            self.output_splits = num_global_tokens_per_rank[self.tp_rank]
+-            # [tp_size, ep_size] -> [tp_size]
+-            # self.output_splits_tp represents the number of tokens received by the current
+-            # rank from other TP rank.
+-            self.output_splits_tp = num_global_tokens_per_rank.sum(axis=1)
+-            # [tp_size, ep_size, num_local_experts] -> [num_local_experts]
+-            num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1))
++            if self.relax_metadata_mode == "b":
++                # Keep the existing GPU count matrix for fused chunk sorting. Derive
++                # host metadata from its DtoH copy only after the event has completed.
++                self._relax_counts_cpu = None
++                self.output_splits = None
++                self.output_splits_tp = None
++                num_tokens_per_local_expert = None
++            else:
++                num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
++                self.output_splits = num_global_tokens_per_rank[self.tp_rank]
++                self.output_splits_tp = (
++                    num_global_tokens_per_rank.sum(axis=1)
++                    if self.relax_metadata_mode == "off" else None
++                )
++                num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1))
+
+             # A synchronization is needed before expert parallel AlltoAll communication
+             # to get the `input_splits` and `output_splits` CPU values.
+@@ -936,9 +967,16 @@
+                     self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
+                 with torch.cuda.stream(self.cuda_dtoh_stream):
+                     # TODO: use MemcpyBatchAsync instead.
+-                    tokens_per_expert = maybe_move_tensor_to_cpu(
+-                        tokens_per_expert, record_stream=on_side_stream
+-                    )
++                    if self.relax_metadata_mode == "b":
++                        self._relax_counts_cpu = maybe_move_tensor_to_cpu(
++                            self.num_global_tokens_per_local_expert,
++                            as_numpy=True,
++                            record_stream=on_side_stream,
++                        )
++                    else:
++                        tokens_per_expert = maybe_move_tensor_to_cpu(
++                            tokens_per_expert, record_stream=on_side_stream
++                        )
+                     self.input_splits = maybe_move_tensor_to_cpu(
+                         self.input_splits, as_numpy=True, record_stream=on_side_stream
+                     )
+@@ -960,8 +998,15 @@
+             if point == self.cuda_sync_point:
+                 # Synchronize with the DtoH stream at self.cuda_sync_point.
+                 self.d2h_event.synchronize()
++                if self.relax_metadata_mode == "b":
++                    counts = self._relax_counts_cpu
++                    # Independent CPU arrays must outlive this invocation: A2A
++                    # autograd contexts retain splits until their backward runs.
++                    self.output_splits = counts.sum(axis=1, dtype="int64")
++                    tokens_per_expert = torch.from_numpy(counts.sum(axis=0, dtype="int64"))
++                    self._relax_counts_cpu = None
+
+         return tokens_per_expert
+
+
+ class _DispatchManager(ABC):

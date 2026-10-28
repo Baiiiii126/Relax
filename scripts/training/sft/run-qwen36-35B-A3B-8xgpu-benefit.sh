@@ -11,6 +11,19 @@ fi
 export EP_SIZE="${EP_SIZE:-2}"
 export GBS="${GBS:-8}"
 export CHUNK_SIZE="${CHUNK_SIZE:-8192}"
+export RELAX_MOE_METADATA_MODE="${RELAX_MOE_METADATA_MODE:-off}"
+case "${RELAX_MOE_METADATA_MODE}" in
+   off|a|b) ;;
+   *) echo "ERROR: RELAX_MOE_METADATA_MODE must be off, a or b" >&2; exit 2 ;;
+esac
+case "${QWEN36_MEMORY_CHECK:-0}" in
+   0|1) ;;
+   *) echo "ERROR: QWEN36_MEMORY_CHECK must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "${QWEN36_MEMORY_CHECK:-0}" = 1 ] && [ "${CHUNKFLOW_PROFILE:-0}" != 0 ]; then
+   echo "ERROR: QWEN36_MEMORY_CHECK requires CHUNKFLOW_PROFILE=0" >&2
+   exit 2
+fi
 if [ -n "${QWEN36_GATE_GAIN_PCT:-}" ]; then
    export NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
 else
@@ -92,7 +105,7 @@ unset RELAX_CHUNKFLOW_DIAGNOSTIC_DIR RELAX_CHUNKFLOW_GRAD_ROLLOUTS RELAX_CHUNKFL
 unset RELAX_CHUNKFLOW_UPDATE_TRACE RELAX_CHUNKFLOW_CONV_TRACE RELAX_CHUNKFLOW_CONV_CHUNK_SIZE RELAX_CHUNKFLOW_TAIL_TRACE
 export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS=0
 export RELAX_CHUNKFLOW_FLASH_BACKEND="${RELAX_CHUNKFLOW_FLASH_BACKEND:-fa3}"
-RUN_ID="qwen36-${RUN_KIND}-$(date +%Y%m%d-%H%M%S)-$$"
+RUN_ID="qwen36-${RUN_KIND}-moe-${RELAX_MOE_METADATA_MODE}-$(date +%Y%m%d-%H%M%S)-$$"
 RESULT_DIR="$(pwd)/analysis/${RUN_ID}"
 mkdir -p "${RESULT_DIR}"
 cat > "${RESULT_DIR}/comparison.md" <<EOF
@@ -104,6 +117,8 @@ Chunk sizes under comparison: ${CHUNK_SIZES:-${CHUNK_SIZE}}. GBS is fixed across
 LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer overlap=${CPU_OPTIMIZER_OVERLAP:-1}.
 MoE shared expert overlap: ${MOE_SHARED_EXPERT_OVERLAP} (both arms).
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
+MoE metadata mode: ${RELAX_MOE_METADATA_MODE} (both arms; off=original, a=ETP1 cleanup, b=two DtoH copies).
+Allocator memory check: ${QWEN36_MEMORY_CHECK:-0}; excludes external CUDA allocations. Keep this setting identical across runs.
 ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (0=all parents in each step; positive values cap parents per drain).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
 Data filtering: oversize=skip; invalid multimodal=skip (both arms refill full batches and log skipped samples).
@@ -143,6 +158,9 @@ CUDA allocator peaks are per profiled step and include profiler effects; they ex
 EOF
 fi
 for arm in "${ARMS[@]}"; do
+   if [ "${QWEN36_MEMORY_CHECK:-0}" = 1 ]; then
+      export RELAX_TRAIN_MEMORY_DIR="${RESULT_DIR}/${arm}/memory"
+   fi
    mode="${arm}"
    unset RELAX_CHUNKFLOW_GATE_GAIN_PCT
    if [ "${arm}" = chunkflow_gate ]; then

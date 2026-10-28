@@ -180,6 +180,44 @@ def _host_resources() -> dict[str, Any]:
 
 
 @contextmanager
+def _record_allocator_memory(args: Any, rollout_id: int, step_id: int) -> Iterator[None]:
+    """Record allocator peaks without enabling the CUDA profiler or adding a
+    GPU sync."""
+    directory = os.environ.get("RELAX_TRAIN_MEMORY_DIR")
+    if not directory or not torch.cuda.is_available():
+        yield
+        return
+    from relax.utils.profile_utils import _get_rank_tag
+
+    device = torch.cuda.current_device()
+    before = {
+        "allocated": torch.cuda.memory_allocated(device),
+        "reserved": torch.cuda.memory_reserved(device),
+        "peak_allocated_since_previous_reset": torch.cuda.max_memory_allocated(device),
+        "peak_reserved_since_previous_reset": torch.cuda.max_memory_reserved(device),
+    }
+    torch.cuda.reset_peak_memory_stats(device)
+    yield
+    rank = _get_rank_tag()
+    row = {
+        "rollout_id": rollout_id,
+        "step_id": step_id,
+        "rank": rank,
+        "arm": "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline",
+        "moe_metadata_mode": os.environ.get("RELAX_MOE_METADATA_MODE", "off"),
+        "before": before,
+        "peak_allocated": torch.cuda.max_memory_allocated(device),
+        "peak_reserved": torch.cuda.max_memory_reserved(device),
+        "end_allocated": torch.cuda.memory_allocated(device),
+        "end_reserved": torch.cuda.memory_reserved(device),
+    }
+    folder = Path(directory)
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / f"memory_{rank}.jsonl").open("a") as stream:
+        stream.write(json.dumps(row) + "\n")
+
+
+@contextmanager
 def profile_train_step(
     args: Any, rollout_id: int, step_id: int, models: Any, optimizer: Any, config: Any
 ) -> Iterator[None]:
@@ -188,7 +226,8 @@ def profile_train_step(
         and "train_overall" in getattr(args, "profile_target", [])
         and args.profile_step_start <= rollout_id <= args.profile_step_end
     ):
-        yield
+        with _record_allocator_memory(args, rollout_id, step_id):
+            yield
         return
     from relax.utils.profile_utils import _get_rank_tag, _get_train_trace_dir
 
