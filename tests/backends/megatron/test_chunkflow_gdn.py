@@ -176,7 +176,7 @@ def _packed(lengths, unit=None):
     return packed
 
 
-def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, tail_pool=False):
+def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, tail_pool=False, padding=3):
     torch.manual_seed(21)
     lengths = [11, 7, 2, 1] if device == "cpu" else [151, 83, 2, 1]
     if tail_pool:
@@ -237,7 +237,7 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, tail_p
         packed = _packed([s.length for c in unit.chunks for s in c.segments], unit)
         packed.cu_seqlens_q = packed.cu_seqlens_q.to(device)
         setattr(packed, RECOMPUTE_ATTR, kind == "Fr")
-        padded = torch.cat((x[indices], torch.randn(3, 1, heads * dim, device=device, dtype=x.dtype)))
+        padded = torch.cat((x[indices], torch.randn(padding, 1, heads * dim, device=device, dtype=x.dtype)))
 
         def forward(t, params=packed):
             return model(t, packed_seq_params=params)
@@ -272,6 +272,42 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, tail_p
     runtime.assert_empty("GDN baseline pass-through")
     assert gdn.uninstall(model) == 1
     assert model.state_dict().keys() == reference.state_dict().keys()
+    return torch.stack([actual[i] for i in range(sum(lengths))]), x.grad, [p.grad for p in model.parameters()]
+
+
+@pytest.mark.parametrize("mode", ["keep", "fr", "selective", "selective_last", "outer"])
+@pytest.mark.parametrize("padding", [0, 3])
+def test_gdn_execution_optimization_matches_original_chunkflow(kernels, monkeypatch, mode, padding):
+    results = []
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", enabled)
+        # Global conv wrapping captures the setting at installation, as in a fresh worker.
+        kernels.causal_conv1d = _conv
+        results.append(_alignment(kernels, mode, padding=padding))
+    torch.testing.assert_close(results[1], results[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("padding", [0, 3])
+def test_gdn_execution_optimization_preserves_input_identity_without_padding(monkeypatch, padding):
+    monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", "1")
+    received = []
+
+    def kernel(x, initial_state=None, output_final_state=False, cu_seqlens=None):
+        received.append(x)
+        return x.square(), x[:, -1].square()
+
+    x = torch.randn(1, 4 + padding, 3, requires_grad=True)
+    packed = SimpleNamespace(**{UNIT_ATTR: SimpleNamespace(num_tokens=4)})
+    context = gdn._Context(SimpleNamespace(), packed, previous={}, current={})
+    token = gdn._ACTIVE.set(context)
+    try:
+        out, _ = gdn._wrap_kernel(kernel, "conv")(x)
+        out.sum().backward()
+    finally:
+        gdn._ACTIVE.reset(token)
+    assert (received[0] is x) == (padding == 0)
+    torch.testing.assert_close(x.grad[:, :4], 2 * x[:, :4], rtol=0, atol=0)
+    assert torch.count_nonzero(x.grad[:, 4:]) == 0
 
 
 @pytest.mark.parametrize(
@@ -286,7 +322,9 @@ def test_gdn_pooled_tails_outputs_and_gradients_match_full_sequence(kernels, mod
     _alignment(kernels, mode, tail_pool=True)
 
 
-def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels):
+@pytest.mark.parametrize("enabled", ["0", "1"])
+@pytest.mark.parametrize("padding", [0, 3])
+def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels, monkeypatch, enabled, padding):
     import inspect
     from functools import wraps
 
@@ -297,24 +335,27 @@ def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels):
         received.append(inspect.signature(_rule).bind(*args, **kwargs).arguments.get("cu_seqlens_cpu"))
         return _rule(*args, **kwargs)
 
+    monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", enabled)
     kernels.rule = rule
     model = GatedDeltaNet(kernels)
     gdn.install(model, ChunkflowRuntime(4))
     unit = build_micro_batches(build_chunks([2, 1], 4, repack_tail=False), "staggered")[0]
     packed = _packed([2, 1], unit)
-    x = torch.randn(6, 1, 8)
+    total = 3 + padding
+    x = torch.randn(total, 1, 8)
     first = model(x, packed_seq_params=packed)
     metadata = packed._chunkflow_gdn_lengths
     second = model(x, packed_seq_params=packed)
     assert packed._chunkflow_gdn_lengths is metadata
     assert len(received) == 2 and all(value is metadata[2] for value in received)
-    assert metadata[2].tolist() == [0, 2, 3, 6]
+    assert metadata[2].tolist() == ([0, 2, 3, total] if padding else [0, 2, 3])
+    assert (metadata[1] is packed.cu_seqlens_q) == (enabled == "1" and padding == 0)
     torch.testing.assert_close(first, second, rtol=0, atol=0)
     token = gdn._ACTIVE.set(gdn._Context(model, SimpleNamespace(_chunkflow_gdn_lengths=metadata)))
     try:
         conv = gdn._wrap_kernel(_conv, "conv")
         # Matching physical boundaries can share CPU metadata; extra conv padding must bypass it.
-        for length in (6, 9):
+        for length in (total, total + 3):
             cu = metadata[1].clone()
             cu[-1] = length
             conv(torch.randn(1, length, 24), model.weight, model.bias, cu_seqlens=cu)

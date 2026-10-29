@@ -28,6 +28,11 @@ CPU_OPTIMIZER_OVERLAP="${CPU_OPTIMIZER_OVERLAP:-1}"
 MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
 export RELAX_MOE_METADATA_MODE="${RELAX_MOE_METADATA_MODE:-off}"
 export RELAX_MOE_CHUNK_MODE="${RELAX_MOE_CHUNK_MODE:-off}"
+export RELAX_CHUNKFLOW_EXECUTION_OPT="${RELAX_CHUNKFLOW_EXECUTION_OPT:-0}"
+case "${RELAX_CHUNKFLOW_EXECUTION_OPT}" in
+   0|1) ;;
+   *) echo "ERROR: RELAX_CHUNKFLOW_EXECUTION_OPT must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${RELAX_MOE_CHUNK_MODE}" in
    off|dedup|expert|both) ;;
    *) echo "ERROR: RELAX_MOE_CHUNK_MODE must be off, dedup, expert or both" >&2; exit 2 ;;
@@ -167,7 +172,7 @@ env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND",
             "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS", "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY",
             "RELAX_CHUNKFLOW_PARENT_WINDOW", "RELAX_CHUNKFLOW_TAIL_POOL", "RELAX_TRAIN_PROFILE_RECORD_SHAPES",
-            "RELAX_MOE_METADATA_MODE", "RELAX_MOE_CHUNK_MODE"):
+            "RELAX_MOE_METADATA_MODE", "RELAX_MOE_CHUNK_MODE", "RELAX_CHUNKFLOW_EXECUTION_OPT"):
     env.setdefault("env_vars", {})[key] = os.environ[key]
 if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
@@ -248,6 +253,7 @@ echo "LR=${LEARNING_RATE} GDN_RECOMPUTE=${GDN_RECOMPUTE} CPU_OPTIMIZER_OVERLAP=$
 echo "MOE_SHARED_EXPERT_OVERLAP=${MOE_SHARED_EXPERT_OVERLAP}"
 echo "RELAX_MOE_METADATA_MODE=${RELAX_MOE_METADATA_MODE}"
 echo "RELAX_MOE_CHUNK_MODE=${RELAX_MOE_CHUNK_MODE}"
+echo "RELAX_CHUNKFLOW_EXECUTION_OPT=${RELAX_CHUNKFLOW_EXECUTION_OPT}"
 echo "CHUNKFLOW_GATE_GAIN_PCT=${RELAX_CHUNKFLOW_GATE_GAIN_PCT:-disabled}"
 echo "CHUNKFLOW_TAIL_POOL=${RELAX_CHUNKFLOW_TAIL_POOL} PARENT_WINDOW=${RELAX_CHUNKFLOW_PARENT_WINDOW}"
 echo "LOG_FILE=${LOG_FILE}"
@@ -320,6 +326,10 @@ if [ "${RAY_NO_WAIT:-0}" != 1 ]; then
             exit 1
          fi
       done
+      if [ "${RELAX_CHUNKFLOW_EXECUTION_OPT}" = 1 ] && ! grep -q 'chunkflow: execution optimization enabled=True' "${LOG_FILE}"; then
+         echo "ERROR: ChunkFlow execution optimization was not confirmed in worker logs" >&2
+         exit 1
+      fi
    elif grep -Eq 'chunkflow: (stateful GDN|chunked attention) installed' "${LOG_FILE}"; then
       echo "ERROR: baseline unexpectedly installed ChunkFlow" >&2
       exit 1

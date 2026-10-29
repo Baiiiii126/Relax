@@ -9,6 +9,7 @@ from collections.abc import Sequence
 import torch
 
 from relax.backends.megatron.chunkflow import rope as cf_rope
+from relax.backends.megatron.chunkflow.metadata import int32_metadata
 from relax.backends.megatron.chunkflow.scheduler import Segment
 from relax.backends.megatron.chunkflow.units import Unit
 
@@ -104,9 +105,7 @@ def slice_parent_batch(
         # Bridge consumes physical packing boundaries and explicit [3, B, T] positions separately.
         physical_cu = list(packed.cu_seqlens_q_cpu)
         physical_cu[-1] = unit_tokens.size(0)
-        packed.cu_seqlens_q_padded = (
-            torch.tensor(physical_cu, dtype=torch.int32, device=unit_tokens.device) if pad else packed.cu_seqlens_q
-        )
+        packed.cu_seqlens_q_padded = int32_metadata(physical_cu, unit_tokens.device) if pad else packed.cu_seqlens_q
         packed.cu_seqlens_kv_padded = packed.cu_seqlens_q_padded
         packed.max_seqlen_q = packed.max_seqlen_kv = max([*lengths[:-1], lengths[-1] + pad])
         position_parts = [
@@ -140,7 +139,7 @@ def _build_packed_seq_params(unit_tokens: torch.Tensor, lengths: list[int], offs
         cu.append(cu[-1] + length)
     device = unit_tokens.device
 
-    cu_tensor = torch.tensor(cu, dtype=torch.int32, device=device)
+    cu_tensor = int32_metadata(cu, device)
     packed = PackedSeqParams(
         cu_seqlens_q=cu_tensor,
         cu_seqlens_kv=cu_tensor,
@@ -178,9 +177,7 @@ def slice_pooled_batch(sources: Sequence[tuple[dict, Unit]], *, pad_token_id: in
         positions = torch.cat([positions, positions.new_ones(3, 1, pad)], dim=-1)
     packed = _build_packed_seq_params(tokens, lengths, [0] * len(lengths))
     physical_cu = [*packed.cu_seqlens_q_cpu[:-1], tokens.numel()]
-    packed.cu_seqlens_q_padded = (
-        torch.tensor(physical_cu, dtype=torch.int32, device=tokens.device) if pad else packed.cu_seqlens_q
-    )
+    packed.cu_seqlens_q_padded = int32_metadata(physical_cu, tokens.device) if pad else packed.cu_seqlens_q
     packed.cu_seqlens_kv_padded = packed.cu_seqlens_q_padded
     packed.max_seqlen_q = packed.max_seqlen_kv = max([*lengths[:-1], lengths[-1] + pad])
     batch = type(parts[0])(

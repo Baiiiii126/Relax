@@ -13,6 +13,7 @@ from torch import nn
 
 from relax.backends.megatron.chunkflow.attention_ops import chunk_attention_forward
 from relax.backends.megatron.chunkflow.flash_backends import flash3_varlen_ops, flash_backend_name
+from relax.backends.megatron.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from relax.backends.megatron.chunkflow.state_store import ChunkState, StateStore
 from relax.utils.logging_utils import get_logger
@@ -82,12 +83,12 @@ class ChunkedCoreAttention(nn.Module):
         if metadata is None:
             cu_q = getattr(packed_seq_params, "cu_seqlens_q", None)
             if cu_q is None:
-                cu_q = torch.tensor(cu, dtype=torch.int32, device=query.device)
+                cu_q = int32_metadata(cu, query.device)
             q_lengths = [end - start for start, end in zip(cu[:-1], cu[1:])]
             cu_kv = (
                 cu_q
                 if kv_lengths == q_lengths
-                else torch.tensor([0, *itertools.accumulate(kv_lengths)], dtype=torch.int32, device=query.device)
+                else int32_metadata([0, *itertools.accumulate(kv_lengths)], query.device)
             )
             metadata = (cu_q, cu_kv, (max(q_lengths), max(kv_lengths)))
             packed_seq_params._chunkflow_attention_metadata = metadata
@@ -232,6 +233,7 @@ def install(model, chunk_size: int) -> int:
                 cfg.apply_rope_fusion = False
         logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
     logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
+    logger.info("chunkflow: execution optimization enabled=%s", execution_optimizations_enabled())
     return n
 
 

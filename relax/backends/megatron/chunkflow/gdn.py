@@ -13,6 +13,7 @@ from typing import Any, Callable
 import torch
 from torch.nn import functional as F
 
+from relax.backends.megatron.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
 from relax.backends.megatron.chunkflow.state_store import ChunkState
 from relax.backends.megatron.training_profile import train_phase
@@ -57,6 +58,7 @@ def _invoke_kernel(kernel: Callable, name: str, *args: Any, **kwargs: Any) -> An
 def _wrap_kernel(kernel: Callable, name: str) -> Callable:
     signature = inspect.signature(kernel)
     fields = ("x",) if name == "conv" else ("q", "k", "v", "g", "beta")
+    optimize_execution = execution_optimizations_enabled()
 
     @wraps(kernel)
     def call(*args, **kwargs):
@@ -106,8 +108,9 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
         padded_length = bound.arguments[fields[0]].shape[1]
         if padded_length < length:
             raise ValueError("GDN kernel input is shorter than its ChunkFlow unit")
-        for key in fields:
-            bound.arguments[key] = bound.arguments[key][:, :length]
+        if padded_length > length or not optimize_execution:
+            for key in fields:
+                bound.arguments[key] = bound.arguments[key][:, :length]
         bound.arguments.update(initial_state=context.previous.get(name), output_final_state=True, cu_seqlens=None)
         for key in ("cu_seqlens_cpu", "chunk_indices"):
             if key in signature.parameters:
@@ -155,7 +158,9 @@ def _wrap_forward(module: Any, original: Callable, runtime: ChunkflowRuntime, *,
                     cu.append(total)
                 lengths = (
                     total,
-                    torch.tensor(cu, dtype=torch.int32, device=packed.cu_seqlens_q.device),
+                    packed.cu_seqlens_q
+                    if execution_optimizations_enabled() and unit.num_tokens == total
+                    else int32_metadata(cu, packed.cu_seqlens_q.device),
                     torch.tensor(cu, dtype=torch.int64),
                 )
                 packed._chunkflow_gdn_lengths = lengths

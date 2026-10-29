@@ -349,9 +349,22 @@ if __name__ == "__main__":
     parser.add_argument("--expected-steps", type=int)
     parser.add_argument("--baseline-arm", choices=("baseline", "chunkflow"), default="baseline")
     parser.add_argument(
-        "--chunkflow-arm", choices=("chunkflow", "chunkflow_pool", "chunkflow_gate"), default="chunkflow"
+        "--chunkflow-arm",
+        choices=("chunkflow", "chunkflow_pool", "chunkflow_gate", "chunkflow_exec"),
+        default="chunkflow",
     )
-    parser.add_argument("--output-prefix", choices=("", "tail_pool-", "tail_pool-vs-unpooled-", "gate-"), default="")
+    parser.add_argument(
+        "--output-prefix",
+        choices=(
+            "",
+            "tail_pool-",
+            "tail_pool-vs-unpooled-",
+            "gate-",
+            "execution-vs-baseline-",
+            "execution-vs-chunkflow-",
+        ),
+        default="",
+    )
     parser.add_argument("--chunks", type=int, nargs="+")
     parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()

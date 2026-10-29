@@ -98,6 +98,18 @@ if [ -n "${QWEN36_GATE_GAIN_PCT:-}" ]; then
    if [ "${QWEN36_REVERSE_ORDER:-0}" = 1 ]; then ARMS=(chunkflow_gate baseline); fi
 fi
 export MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
+case "${QWEN36_EXECUTION_AB:-0}" in
+   0) ;;
+   1)
+      if [ -n "${CHUNK_SIZES:-}" ] || [ "${QWEN36_TAIL_POOL_AB:-0}" != 0 ] || [ -n "${QWEN36_GATE_GAIN_PCT:-}" ]; then
+         echo "ERROR: execution comparison requires one chunk size, no tail pooling and no gate" >&2
+         exit 2
+      fi
+      ARMS=(baseline chunkflow chunkflow_exec)
+      if [ "${QWEN36_REVERSE_ORDER:-0}" = 1 ]; then ARMS=(chunkflow_exec chunkflow baseline); fi
+      ;;
+   *) echo "ERROR: QWEN36_EXECUTION_AB must be 0 or 1" >&2; exit 2 ;;
+esac
 export RELAX_CHUNKFLOW_KV_GRAD_FP32=0
 export QWEN36_ROUTER_DTYPE="${QWEN36_ROUTER_DTYPE:-fp64}"
 unset QWEN36_DIAGNOSTICS QWEN36_KV_GRAD_AB RELAX_TRAIN_PROFILE_DIR
@@ -123,6 +135,7 @@ MoE shared expert overlap: ${MOE_SHARED_EXPERT_OVERLAP} (both arms).
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
 MoE metadata mode: ${RELAX_MOE_METADATA_MODE} (both arms; off=original, a=ETP1 cleanup, b=two DtoH copies).
 MoE chunk optimization: ${RELAX_MOE_CHUNK_MODE:-off} (off / dedup / expert / both).
+ChunkFlow execution comparison: ${QWEN36_EXECUTION_AB:-0}; when enabled, chunkflow_exec alone uses nonblocking host metadata copies, GDN metadata reuse and removal of identity slices. Host staging can still block; verify actual overlap with profiling.
 Allocator memory check: ${QWEN36_MEMORY_CHECK:-0}; excludes external CUDA allocations. Keep this setting identical across runs.
 ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (0=all parents in each step; positive values cap parents per drain).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
@@ -167,6 +180,13 @@ for arm in "${ARMS[@]}"; do
       export RELAX_TRAIN_MEMORY_DIR="${RESULT_DIR}/${arm}/memory"
    fi
    mode="${arm}"
+   if [ "${QWEN36_EXECUTION_AB:-0}" = 1 ]; then
+      export RELAX_CHUNKFLOW_EXECUTION_OPT=0
+      if [ "${arm}" = chunkflow_exec ]; then
+         mode=chunkflow
+         export RELAX_CHUNKFLOW_EXECUTION_OPT=1
+      fi
+   fi
    unset RELAX_CHUNKFLOW_GATE_GAIN_PCT
    if [ "${arm}" = chunkflow_gate ]; then
       mode=chunkflow
@@ -215,6 +235,13 @@ if [ "${CHUNKFLOW_PROFILE}" = 0 ]; then
       python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
          --expected-steps "${NUM_ROLLOUT}" --baseline-arm chunkflow --chunkflow-arm chunkflow_pool \
          --output-prefix tail_pool-vs-unpooled-
+   fi
+   if [ "${QWEN36_EXECUTION_AB:-0}" = 1 ]; then
+      python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
+         --expected-steps "${NUM_ROLLOUT}" --chunkflow-arm chunkflow_exec --output-prefix execution-vs-baseline-
+      python3 scripts/training/sft/tools/summarize_qwen36_comparison.py "${RESULT_DIR}" \
+         --expected-steps "${NUM_ROLLOUT}" --baseline-arm chunkflow --chunkflow-arm chunkflow_exec \
+         --output-prefix execution-vs-chunkflow-
    fi
 fi
 echo "Comparison complete: ${RESULT_DIR}"
