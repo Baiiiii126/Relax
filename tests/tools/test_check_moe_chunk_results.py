@@ -3,7 +3,9 @@
 import importlib.util
 import io
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -170,6 +172,77 @@ class MoEChunkReportTests(unittest.TestCase):
         path.write_text(path.read_text().replace("'perf/step_time': 1.8", "'perf/step_time': 2.1"))
         issues, _ = self.module.report(self.root, "formal", 31, 1)
         self.assertTrue(any("both: positive end-to-end gain not reproduced" in i for i in issues))
+
+    def test_observation_run_records_drift_and_regressions_without_rejection(self):
+        folder = self.make_formal_runs()
+        path = folder / "both/chunkflow.log"
+        path.write_text(
+            path.read_text()
+            .replace("'perf/step_time': 1.8", "'perf/step_time': 2.1")
+            .replace("'train/loss': 1.0", "'train/loss': 1.02")
+        )
+        issues, text = self.module.report(self.root, "formal", 31, 1, observe_only=True)
+        self.assertEqual(issues, [])
+        self.assertIn("train/loss max_abs_diff", text)
+        self.assertIn("positive end-to-end gain not reproduced", text)
+        self.assertIn("acceptance left to user review", text)
+
+    def test_observation_run_still_rejects_missing_training_steps(self):
+        path = self.root / "pilot/repeat0/both/chunkflow.log"
+        path.write_text(path.read_text().splitlines()[0] + "\n")
+        issues, text = self.module.report(self.root, "pilot", 2, 1, observe_only=True)
+        self.assertTrue(any("missing or extra steps" in i for i in issues))
+        self.assertIn("INCOMPLETE / INVALID EVIDENCE", text)
+
+    def test_cli_restores_observation_mode(self):
+        (self.root / "config.json").write_text(json.dumps({"observe_only": True}))
+        path = self.root / "pilot/repeat0/both/chunkflow.log"
+        path.write_text(path.read_text().replace("'train/loss': 1.0", "'train/loss': 1.02", 1))
+        argv = ["check_moe_chunk_results.py", str(self.root), "--phase", "pilot", "--steps", "2", "--repeats", "1"]
+        with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exc:
+            self.module.main()
+        self.assertEqual(exc.exception.code, 0)
+
+    def test_run_launches_formal_matrix_without_operator_or_pilot_gate(self):
+        repo = self.root / "launch"
+        relative = Path("scripts/training/sft/run-qwen36-35B-A3B-8xgpu-moe-chunk-experiment.sh")
+        script = repo / relative
+        script.parent.mkdir(parents=True)
+        shutil.copyfile(Path(__file__).resolve().parents[2] / relative, script)
+        fakebin = repo / "bin"
+        fakebin.mkdir()
+        commands = {
+            "python3": '#!/bin/bash\ncase "$*" in *--fingerprint*) echo fingerprint;; *) cat >/dev/null;; esac\n',
+            "bash": '#!/bin/bash\nprintf "%s %s\\n" "$NUM_ROLLOUT" "$RELAX_MOE_CHUNK_MODE" >> "$FLOW_LOG"\n',
+            "torchrun": '#!/bin/bash\necho "Unexpected operator gate" >&2\nexit 99\n',
+        }
+        for name, source in commands.items():
+            path = fakebin / name
+            path.write_text(source)
+            path.chmod(0o755)
+        (repo / "config.json").write_text("{}")
+        (repo / "data.jsonl").touch()
+        flow = repo / "flow.log"
+        env = dict(
+            os.environ,
+            PATH=f"{fakebin}:/usr/bin:/bin",
+            HF_CHECKPOINT=str(repo),
+            PROMPT_DATA=str(repo / "data.jsonl"),
+            FLOW_LOG=str(flow),
+            MOE_EXPERIMENT_DIR=str(repo / "results"),
+            NUM_ROLLOUT="100",
+            EXPERIMENT_REPEATS="3",
+            PILOT_STEPS="5",
+        )
+        result = subprocess.run(
+            ["/bin/bash", str(script), "run"], env=env, input="", text=True, capture_output=True, timeout=20
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        jobs = flow.read_text().splitlines()
+        self.assertEqual(len(jobs), 12)  # benefit.sh expands each invocation into baseline/chunkflow.
+        for mode in self.module.MODES:
+            self.assertEqual(jobs.count(f"100 {mode}"), 3)
+        self.assertNotIn("phase=pilot", result.stdout)
 
 
 if __name__ == "__main__":

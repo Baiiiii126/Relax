@@ -1,7 +1,8 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # One command, eight GPUs throughout. No two-GPU prerequisite.
-# run: operator gate -> short numerical pilot -> repeated production matrix.
+# run: repeated production matrix; inspect curves without acceptance gates.
+# check/pilot are optional, explicitly requested diagnostic runs.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -36,8 +37,12 @@ export QWEN36_ROUTER_DTYPE=fp64 RELAX_MOE_METADATA_MODE=off RELAX_MOE_CHUNK_MODE
 export RELAX_CHUNKFLOW_FLASH_BACKEND=fa3 RELAX_CHUNKFLOW_PARENT_WINDOW=0
 export QWEN36_TAIL_POOL_AB=0 QWEN36_REVERSE_ORDER=0 CHUNKFLOW_PROFILE=0
 export QWEN36_MEMORY_CHECK=1 QWEN36_DEVICE_MEMORY_CHECK=1 RAY_NO_WAIT=0
-# Current experiment defers memory acceptance while retaining measurements.
-export RELAX_MOE_MEMORY_POLICY="${RELAX_MOE_MEMORY_POLICY:-report}"
+# Training records memory without acceptance gates; standalone check can be strict.
+if [ "${PHASE}" = check ]; then
+   export RELAX_MOE_MEMORY_POLICY="${RELAX_MOE_MEMORY_POLICY:-report}"
+else
+   export RELAX_MOE_MEMORY_POLICY=report
+fi
 case "${RELAX_MOE_MEMORY_POLICY}" in
    strict|report) ;;
    *) echo "ERROR: RELAX_MOE_MEMORY_POLICY must be strict or report" >&2; exit 2 ;;
@@ -72,6 +77,7 @@ keys = ("HF_CHECKPOINT", "PROMPT_DATA", "GBS", "TP_SIZE", "PP_SIZE", "EP_SIZE", 
         "RELAX_MOE_MEMORY_POLICY")
 record = {k: os.environ.get(k) for k in keys}
 record.update(commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              observe_only=True,
               torch=torch.__version__, te=md.version("transformer-engine"), triton=md.version("triton"),
               gpus=[torch.cuda.get_device_name(i) for i in range(8)])
 if os.environ["MOE_EXPERIMENT_PHASE"] != "check":
@@ -88,7 +94,8 @@ if os.environ["MOE_EXPERIMENT_PHASE"] != "check":
 (Path(os.environ["SUITE_DIR"]) / "config.json").write_text(json.dumps(record, indent=2) + "\n")
 PY
 echo "Experiment directory: ${SUITE_DIR}"
-echo "Memory policy: ${RELAX_MOE_MEMORY_POLICY} (report records increases without blocking; numerical checks remain strict)"
+echo "Training comparisons are observational: loss, memory and performance differences do not block."
+if [ "${PHASE}" = check ]; then
 export RELAX_MOE_GATE_DIR="${SUITE_DIR}/operator-gate"
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
    timeout --signal=TERM --kill-after=30s 1800s \
@@ -106,7 +113,9 @@ for rank in range(8):
     if record.get("memory_policy") != os.environ["RELAX_MOE_MEMORY_POLICY"]:
         raise SystemExit(f"Operator gate memory policy mismatch on rank {rank}")
 PY
-if [ "${PHASE}" = check ]; then echo "Eight-GPU operator gate passed: ${SUITE_DIR}"; exit 0; fi
+echo "Eight-GPU operator check passed: ${SUITE_DIR}"
+exit 0
+fi
 
 run_mode() {
    local phase="$1" repeat="$2" name="$3" steps="$4" mode="$3"
@@ -124,13 +133,13 @@ run_mode() {
    fi
 }
 
-# The existing baseline has shown run-to-run/ChunkFlow numerical differences.
-# Do not silently waive them or spend a full matrix on an invalid reference.
-for mode in off off_repeat dedup expert both; do
-   run_mode pilot 0 "${mode}" "${PILOT_STEPS}"
-done
-python3 "${REPORT}" "${SUITE_DIR}" --phase pilot --steps "${PILOT_STEPS}" --repeats 1 --memory-policy "${RELAX_MOE_MEMORY_POLICY}"
-if [ "${PHASE}" = pilot ]; then exit 0; fi
+if [ "${PHASE}" = pilot ]; then
+   for mode in off off_repeat dedup expert both; do
+      run_mode pilot 0 "${mode}" "${PILOT_STEPS}"
+   done
+   python3 "${REPORT}" "${SUITE_DIR}" --phase pilot --steps "${PILOT_STEPS}" --repeats 1 --observe-only
+   exit 0
+fi
 
 for ((repeat=0; repeat<REPEATS; repeat++)); do
    case "$((repeat % 3))" in
@@ -142,4 +151,4 @@ for ((repeat=0; repeat<REPEATS; repeat++)); do
       run_mode formal "${repeat}" "${mode}" "${STEPS}"
    done
 done
-python3 "${REPORT}" "${SUITE_DIR}" --phase formal --steps "${STEPS}" --repeats "${REPEATS}" --memory-policy "${RELAX_MOE_MEMORY_POLICY}"
+python3 "${REPORT}" "${SUITE_DIR}" --phase formal --steps "${STEPS}" --repeats "${REPEATS}" --observe-only

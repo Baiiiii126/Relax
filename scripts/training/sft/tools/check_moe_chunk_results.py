@@ -160,17 +160,23 @@ def compare(
 
 
 def report(
-    root: Path, phase: str, steps: int, repeats: int, *, memory_policy: str = "strict"
+    root: Path, phase: str, steps: int, repeats: int, *, memory_policy: str = "strict", observe_only: bool = False
 ) -> tuple[list[str], str]:
     if memory_policy not in ("strict", "report"):
         raise ValueError("Memory policy must be strict or report")
+    if observe_only:
+        memory_policy = "report"
     memory_observations = [] if memory_policy == "report" else None
     issues, lines = (
         [],
         [
             f"# MoE chunk experiment: {phase}",
             "",
-            "Exact logged loss/grad_norm/token checks; no tolerance relaxation.",
+            (
+                "Observational run: numerical differences and performance regressions are reported without acceptance gates."
+                if observe_only
+                else "Exact logged loss/grad_norm/token checks; no tolerance relaxation."
+            ),
             f"Memory policy: {memory_policy}."
             + (
                 " Memory increases do not block; memory acceptance is deferred."
@@ -184,6 +190,7 @@ def report(
             "|---|---|---|---:|---:|---:|---:|---:|---:|",
         ],
     )
+    observations = [] if observe_only else issues
     speedups = {m: [] for m in MODES if m != "off"}
     for repeat in range(repeats):
         folder = root / phase / f"repeat{repeat}"
@@ -214,7 +221,7 @@ def report(
                     f"{avg('perf/step_time'):.6f} | {peak('allocated'):.4f} | {peak('reserved'):.4f} | "
                     f"{run['rows'][steps - 1]['train/loss']:.9f} |"
                 )
-            issues.extend(
+            observations.extend(
                 compare(
                     runs[mode]["baseline"],
                     runs[mode]["chunkflow"],
@@ -228,7 +235,7 @@ def report(
             if mode == "off":
                 continue
             for arm in ARMS:
-                issues.extend(
+                observations.extend(
                     compare(
                         runs["off"][arm],
                         run[arm],
@@ -250,15 +257,21 @@ def report(
     if phase == "formal":
         for mode, gains in speedups.items():
             if len(gains) != repeats or any(min(g) <= 0 for g in gains):
-                issues.append(f"{mode}: positive end-to-end gain not reproduced in every repeat/comparison")
+                observations.append(f"{mode}: positive end-to-end gain not reproduced in every repeat/comparison")
+    status = "Status: recorded checks passed; production acceptance still requires workload replication."
+    if observe_only:
+        status = "Status: measurements complete; accuracy, memory and performance acceptance left to user review."
+    if issues:
+        status = "Status: INCOMPLETE / INVALID EVIDENCE" if observe_only else "Status: FAILED / NOT ACCEPTED"
     lines += [
         "",
-        "Status: FAILED / NOT ACCEPTED"
-        if issues
-        else "Status: recorded checks passed; production acceptance still requires workload replication.",
+        status,
         "",
     ]
     lines.extend(f"- {issue}" for issue in issues)
+    if observe_only and observations:
+        lines += ["", "Numerical and performance observations (non-blocking):", ""]
+        lines.extend(f"- {observation}" for observation in observations)
     if memory_observations:
         lines += ["", "Memory observations (non-blocking; not accepted as memory compliant):", ""]
         lines.extend(f"- {observation}" for observation in memory_observations)
@@ -273,6 +286,12 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
+        "--observe-only",
+        action="store_true",
+        default=None,
+        help="Report differences without acceptance gates; also restored from config.json",
+    )
+    parser.add_argument(
         "--memory-policy",
         choices=("strict", "report"),
         help="Defaults to the recorded experiment policy, or strict for older runs",
@@ -283,13 +302,13 @@ def main() -> None:
         return
     if args.steps <= 0 or args.repeats <= 0 or (args.phase == "formal" and args.steps <= 30):
         parser.error("Require positive counts and >30 steps for formal performance measurements")
-    policy = args.memory_policy
-    if policy is None:
-        config = args.root / "config.json"
-        policy = (
-            json.loads(config.read_text()).get("RELAX_MOE_MEMORY_POLICY", "strict") if config.exists() else "strict"
-        )
-    issues, markdown = report(args.root, args.phase, args.steps, args.repeats, memory_policy=policy)
+    config = args.root / "config.json"
+    record = json.loads(config.read_text()) if config.exists() else {}
+    policy = args.memory_policy or record.get("RELAX_MOE_MEMORY_POLICY", "strict")
+    observe_only = args.observe_only if args.observe_only is not None else record.get("observe_only", False)
+    issues, markdown = report(
+        args.root, args.phase, args.steps, args.repeats, memory_policy=policy, observe_only=observe_only
+    )
     output = args.root / f"{args.phase}-report.md"
     output.write_text(markdown)
     print(markdown)
