@@ -213,6 +213,11 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    from .moe_chunk_optimizations import install as install_moe_chunk_optimizations
+
+    install_moe_chunk_optimizations(
+        os.environ.get("RELAX_MOE_CHUNK_MODE", "off"), os.environ.get("RELAX_MOE_METADATA_MODE", "off")
+    )
     metadata_mode = os.environ.get("RELAX_MOE_METADATA_MODE", "off")
     if metadata_mode != "off":
         from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher

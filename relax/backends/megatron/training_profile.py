@@ -205,6 +205,7 @@ def _record_allocator_memory(args: Any, rollout_id: int, step_id: int) -> Iterat
         "rank": rank,
         "arm": "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline",
         "moe_metadata_mode": os.environ.get("RELAX_MOE_METADATA_MODE", "off"),
+        "moe_chunk_mode": os.environ.get("RELAX_MOE_CHUNK_MODE", "off"),
         "before": before,
         "peak_allocated": torch.cuda.max_memory_allocated(device),
         "peak_reserved": torch.cuda.max_memory_reserved(device),

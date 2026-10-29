@@ -105,8 +105,12 @@ unset RELAX_CHUNKFLOW_DIAGNOSTIC_DIR RELAX_CHUNKFLOW_GRAD_ROLLOUTS RELAX_CHUNKFL
 unset RELAX_CHUNKFLOW_UPDATE_TRACE RELAX_CHUNKFLOW_CONV_TRACE RELAX_CHUNKFLOW_CONV_CHUNK_SIZE RELAX_CHUNKFLOW_TAIL_TRACE
 export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS=0
 export RELAX_CHUNKFLOW_FLASH_BACKEND="${RELAX_CHUNKFLOW_FLASH_BACKEND:-fa3}"
-RUN_ID="qwen36-${RUN_KIND}-moe-${RELAX_MOE_METADATA_MODE}-$(date +%Y%m%d-%H%M%S)-$$"
-RESULT_DIR="$(pwd)/analysis/${RUN_ID}"
+RUN_ID="qwen36-${RUN_KIND}-moe-${RELAX_MOE_METADATA_MODE}-chunkopt-${RELAX_MOE_CHUNK_MODE:-off}-$(date +%Y%m%d-%H%M%S)-$$"
+RESULT_DIR="${QWEN36_RESULT_DIR:-$(pwd)/analysis/${RUN_ID}}"
+if [ -e "${RESULT_DIR}" ]; then
+   echo "ERROR: refusing to reuse result directory: ${RESULT_DIR}" >&2
+   exit 2
+fi
 mkdir -p "${RESULT_DIR}"
 cat > "${RESULT_DIR}/comparison.md" <<EOF
 # Qwen3.6 baseline / ChunkFlow comparison
@@ -118,6 +122,7 @@ LR=${LEARNING_RATE:-1e-5}; GDN recompute=${GDN_RECOMPUTE:-1}; CPU optimizer over
 MoE shared expert overlap: ${MOE_SHARED_EXPERT_OVERLAP} (both arms).
 Router dtype: ${QWEN36_ROUTER_DTYPE:-fp32}.
 MoE metadata mode: ${RELAX_MOE_METADATA_MODE} (both arms; off=original, a=ETP1 cleanup, b=two DtoH copies).
+MoE chunk optimization: ${RELAX_MOE_CHUNK_MODE:-off} (off / dedup / expert / both).
 Allocator memory check: ${QWEN36_MEMORY_CHECK:-0}; excludes external CUDA allocations. Keep this setting identical across runs.
 ChunkFlow parent window: ${RELAX_CHUNKFLOW_PARENT_WINDOW} (0=all parents in each step; positive values cap parents per drain).
 Data: ${PROMPT_DATA:-unset}; input key: ${INPUT_KEY:-question}; label key: ${LABEL_KEY-answer}.
@@ -179,6 +184,11 @@ for arm in "${ARMS[@]}"; do
    if [ "${CHUNKFLOW_PROFILE}" = 1 ]; then
       export RELAX_TRAIN_PROFILE_DIR="${RESULT_DIR}/${arm}/train_trace"
       echo "- ${arm}: ${RELAX_TRAIN_PROFILE_DIR}" >> "${RESULT_DIR}/profile.md"
+   fi
+   if [ "${QWEN36_DEVICE_MEMORY_CHECK:-0}" = 1 ]; then
+      export RELAX_DEVICE_MEMORY_DIR="${RESULT_DIR}/${arm}"
+   else
+      unset RELAX_DEVICE_MEMORY_DIR
    fi
    RUN_NAME="${RUN_ID}-${arm}" LOG_FILE="${RESULT_DIR}/${arm}.log" \
       bash scripts/entrypoint/ray-job.sh \

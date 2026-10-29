@@ -27,6 +27,15 @@ GDN_RECOMPUTE="${GDN_RECOMPUTE:-1}"
 CPU_OPTIMIZER_OVERLAP="${CPU_OPTIMIZER_OVERLAP:-1}"
 MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
 export RELAX_MOE_METADATA_MODE="${RELAX_MOE_METADATA_MODE:-off}"
+export RELAX_MOE_CHUNK_MODE="${RELAX_MOE_CHUNK_MODE:-off}"
+case "${RELAX_MOE_CHUNK_MODE}" in
+   off|dedup|expert|both) ;;
+   *) echo "ERROR: RELAX_MOE_CHUNK_MODE must be off, dedup, expert or both" >&2; exit 2 ;;
+esac
+if [ "${RELAX_MOE_CHUNK_MODE}" != off ] && [ "${RELAX_MOE_METADATA_MODE}" != off ]; then
+   echo "ERROR: MoE chunk experiments require RELAX_MOE_METADATA_MODE=off" >&2
+   exit 2
+fi
 case "${RELAX_MOE_METADATA_MODE}" in
    off|a|b) ;;
    *) echo "ERROR: RELAX_MOE_METADATA_MODE must be off, a or b" >&2; exit 2 ;;
@@ -158,7 +167,7 @@ env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND",
             "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS", "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY",
             "RELAX_CHUNKFLOW_PARENT_WINDOW", "RELAX_CHUNKFLOW_TAIL_POOL", "RELAX_TRAIN_PROFILE_RECORD_SHAPES",
-            "RELAX_MOE_METADATA_MODE"):
+            "RELAX_MOE_METADATA_MODE", "RELAX_MOE_CHUNK_MODE"):
     env.setdefault("env_vars", {})[key] = os.environ[key]
 if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
@@ -238,6 +247,7 @@ echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=${EP_SIZE} GBS=${GBS} STEPS=${NUM_ROLLOUT} 
 echo "LR=${LEARNING_RATE} GDN_RECOMPUTE=${GDN_RECOMPUTE} CPU_OPTIMIZER_OVERLAP=${CPU_OPTIMIZER_OVERLAP}"
 echo "MOE_SHARED_EXPERT_OVERLAP=${MOE_SHARED_EXPERT_OVERLAP}"
 echo "RELAX_MOE_METADATA_MODE=${RELAX_MOE_METADATA_MODE}"
+echo "RELAX_MOE_CHUNK_MODE=${RELAX_MOE_CHUNK_MODE}"
 echo "CHUNKFLOW_GATE_GAIN_PCT=${RELAX_CHUNKFLOW_GATE_GAIN_PCT:-disabled}"
 echo "CHUNKFLOW_TAIL_POOL=${RELAX_CHUNKFLOW_TAIL_POOL} PARENT_WINDOW=${RELAX_CHUNKFLOW_PARENT_WINDOW}"
 echo "LOG_FILE=${LOG_FILE}"
@@ -246,15 +256,63 @@ if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
    echo "PROFILE_RECORD_SHAPES=${RELAX_TRAIN_PROFILE_RECORD_SHAPES}"
    echo "Worker output: ${RELAX_TRAIN_PROFILE_DIR:-traces/${RUN_NAME}/train_trace}/{*.pt.trace.json.gz,segments_*.jsonl}"
 fi
+memory_sampler_pid=""
+stop_memory_sampler() {
+   if [ -n "${memory_sampler_pid}" ]; then
+      kill "${memory_sampler_pid}" 2>/dev/null || true
+      wait "${memory_sampler_pid}" 2>/dev/null || true
+      memory_sampler_pid=""
+   fi
+}
+if [ -n "${RELAX_DEVICE_MEMORY_DIR:-}" ]; then
+   if [ "${RAY_NO_WAIT:-0}" = 1 ]; then
+      echo "ERROR: device memory sampling requires a blocking training run" >&2; exit 2
+   fi
+   # ray-job.sh has completed cleanup. Refuse to include surviving GPU contexts
+   # from a previous arm in this arm's peak measurement.
+   for ((attempt=0; attempt<30; attempt++)); do
+      active_gpu_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
+      if [ -z "${active_gpu_pids}" ]; then break; fi
+      sleep 1
+   done
+   if [ -n "${active_gpu_pids}" ]; then
+      echo "ERROR: GPU contexts still active before measurement: ${active_gpu_pids}" >&2; exit 1
+   fi
+   mkdir -p "${RELAX_DEVICE_MEMORY_DIR}"
+   nvidia-smi --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits -lms 250 \
+      > "${RELAX_DEVICE_MEMORY_DIR}/device-memory.csv" 2> "${RELAX_DEVICE_MEMORY_DIR}/device-memory.stderr" &
+   memory_sampler_pid=$!
+   trap stop_memory_sampler EXIT
+   sleep 1
+   kill -0 "${memory_sampler_pid}"
+   python3 -c 'import time; print(time.time())' > "${RELAX_DEVICE_MEMORY_DIR}/device-memory.start"
+fi
 ray job submit "${SUBMIT_ARGS[@]}" --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train --resource '{"sft": [1, 0], "actor": [1, 8]}' \
    "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" "${DIAGNOSTIC_ARGS[@]}" "${PROFILE_ARGS[@]}" "${CHUNKFLOW_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+
+if [ -n "${memory_sampler_pid}" ]; then
+   python3 -c 'import time; print(time.time())' > "${RELAX_DEVICE_MEMORY_DIR}/device-memory.end"
+   sleep 1
+   if ! kill -0 "${memory_sampler_pid}"; then
+      echo "ERROR: device memory sampler stopped before training completed" >&2; exit 1
+   fi
+   stop_memory_sampler
+fi
 
 if [ "${RAY_NO_WAIT:-0}" != 1 ]; then
    if ! grep -q "Actor training completed step $((NUM_ROLLOUT - 1))/${NUM_ROLLOUT}" "${LOG_FILE}"; then
       echo "ERROR: expected training steps not completed; inspect ${LOG_FILE}" >&2
       exit 1
    fi
+   for feature in dedup expert; do
+      if [ "${RELAX_MOE_CHUNK_MODE}" = "${feature}" ] || [ "${RELAX_MOE_CHUNK_MODE}" = both ]; then
+         if ! grep -q "MoE chunk optimization installed: ${feature}" "${LOG_FILE}"; then
+            echo "ERROR: requested MoE optimization not installed: ${feature}" >&2
+            exit 1
+         fi
+      fi
+   done
    if [ "${MODE}" = chunkflow ]; then
       for pattern in 'stateful GDN installed on [1-9][0-9]* layer' 'chunked attention installed on [1-9][0-9]* layer'; do
          if ! grep -Eq "chunkflow: ${pattern}" "${LOG_FILE}"; then
