@@ -1,11 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import importlib.util
+import io
 import json
 import shutil
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -103,6 +105,33 @@ class MoEChunkReportTests(unittest.TestCase):
         path.write_text(path.read_text().replace(", 3, 500", ", 3, 501"))
         issues, _ = self.run_report()
         self.assertTrue(any("GPU 3 sampled memory" in i for i in issues))
+
+    def test_report_policy_records_memory_growth_without_blocking(self):
+        path = self.root / "pilot/repeat0/dedup/chunkflow/memory/memory_rank3.jsonl"
+        path.write_text(path.read_text().replace('"peak_allocated": 100', '"peak_allocated": 101', 1))
+        path = self.root / "pilot/repeat0/dedup/chunkflow/device-memory.csv"
+        path.write_text(path.read_text().replace(", 3, 500", ", 3, 501"))
+        issues, text = self.module.report(self.root, "pilot", 2, 1, memory_policy="report")
+        self.assertEqual(issues, [])
+        self.assertIn("allocator increases", text)
+        self.assertIn("GPU 3 sampled memory", text)
+        self.assertIn("memory acceptance is deferred", text)
+
+    def test_report_policy_keeps_numerical_checks_strict(self):
+        path = self.root / "pilot/repeat0/both/chunkflow.log"
+        path.write_text(path.read_text().replace("'train/loss': 1.0", "'train/loss': 1.02", 1))
+        issues, _ = self.module.report(self.root, "pilot", 2, 1, memory_policy="report")
+        self.assertTrue(any("both vs off/chunkflow: train/loss" in i for i in issues))
+
+    def test_cli_uses_recorded_memory_policy(self):
+        (self.root / "config.json").write_text(json.dumps({"RELAX_MOE_MEMORY_POLICY": "report"}))
+        path = self.root / "pilot/repeat0/dedup/chunkflow/device-memory.csv"
+        path.write_text(path.read_text().replace(", 3, 500", ", 3, 501"))
+        argv = ["check_moe_chunk_results.py", str(self.root), "--phase", "pilot", "--steps", "2", "--repeats", "1"]
+        with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exc:
+            self.module.main()
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("GPU 3 sampled memory", (self.root / "pilot-report.md").read_text())
 
     def test_missing_repeat_control_fails(self):
         (self.root / "pilot/repeat0/off_repeat/comparison.md").unlink()

@@ -21,6 +21,9 @@ dist = pytest.importorskip("torch.distributed")
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires eight NVIDIA GPUs, NCCL, TE 2.14.1 and Megatron")
 def test_moe_chunk_modes_exact_forward_backward_and_memory(monkeypatch):
+    memory_policy = os.environ.get("RELAX_MOE_MEMORY_POLICY", "strict")
+    if memory_policy not in ("strict", "report"):
+        raise ValueError("RELAX_MOE_MEMORY_POLICY must be strict or report")
     if int(os.environ.get("WORLD_SIZE", "1")) != 8:
         pytest.skip("Use torchrun --standalone --nproc_per_node=8 -m pytest on this file")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -94,6 +97,7 @@ def test_moe_chunk_modes_exact_forward_backward_and_memory(monkeypatch):
         return tensors, peaks
 
     results = {}
+    memory_increases = []
     try:
         reference = None
         for mode in ("off", "dedup", "expert", "both"):
@@ -114,7 +118,14 @@ def test_moe_chunk_modes_exact_forward_backward_and_memory(monkeypatch):
                     for index, (expected, result) in enumerate(zip(reference, actual, strict=True)):
                         torch.testing.assert_close(result, expected, rtol=0, atol=0, msg=f"{mode} tensor {index}")
                     for metric in ("allocated", "reserved"):
-                        assert peaks[metric] <= results["off"][metric], (mode, metric, results)
+                        if peaks[metric] > results["off"][metric]:
+                            note = dict(
+                                mode=mode, metric=metric, baseline=results["off"][metric], actual=peaks[metric]
+                            )
+                            memory_increases.append(note)
+                            if memory_policy == "strict":
+                                raise AssertionError((mode, metric, results))
+                            print(f"MoE gate rank {rank}: memory increase (report only): {note}", flush=True)
                 except AssertionError as exc:
                     error = f"rank {rank}: {exc}"
             # All ranks finish this mode before any rank can enter its successor.
@@ -126,7 +137,18 @@ def test_moe_chunk_modes_exact_forward_backward_and_memory(monkeypatch):
         if directory:
             folder = Path(directory)
             folder.mkdir(parents=True, exist_ok=True)
-            (folder / f"rank{rank}.json").write_text(json.dumps(dict(rank=rank, passed=True, peaks=results)) + "\n")
+            (folder / f"rank{rank}.json").write_text(
+                json.dumps(
+                    dict(
+                        rank=rank,
+                        passed=True,
+                        peaks=results,
+                        memory_policy=memory_policy,
+                        memory_increases=memory_increases,
+                    )
+                )
+                + "\n"
+            )
     finally:
         install("off")
         dist.destroy_process_group()

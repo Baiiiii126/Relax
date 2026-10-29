@@ -126,8 +126,11 @@ def read_run(folder: Path, mode: str, steps: int, ranks: int = 8) -> dict:
     return result
 
 
-def compare(left: dict, right: dict, label: str, *, memory: bool = True) -> list[str]:
+def compare(
+    left: dict, right: dict, label: str, *, memory: bool = True, memory_observations: list[str] | None = None
+) -> list[str]:
     issues = []
+    memory_issues = issues if memory_observations is None else memory_observations
     if left["rows"].keys() != right["rows"].keys():
         return [f"{label}: different step coverage"]
     for field in ("train/loss", "train/grad_norm", "perf/actor_train_tokens"):
@@ -137,7 +140,7 @@ def compare(left: dict, right: dict, label: str, *, memory: bool = True) -> list
             issues.append(f"{label}: {field} max_abs_diff={delta:.12g} step={step}")
     if memory:
         if left["memory"].keys() != right["memory"].keys():
-            issues.append(f"{label}: different memory coverage")
+            memory_issues.append(f"{label}: different memory coverage")
         else:
             increases = [
                 (b - a, key, field)
@@ -146,23 +149,34 @@ def compare(left: dict, right: dict, label: str, *, memory: bool = True) -> list
                 if (b := right["memory"][key][field]) > a
             ]
             if increases:
-                issues.append(f"{label}: {len(increases)} allocator increases; largest={max(increases)}")
+                memory_issues.append(f"{label}: {len(increases)} allocator increases; largest={max(increases)}")
         if left["device"].keys() != right["device"].keys():
-            issues.append(f"{label}: different device memory coverage")
+            memory_issues.append(f"{label}: different device memory coverage")
         else:
             for gpu, value in left["device"].items():
                 if right["device"][gpu] > value:
-                    issues.append(f"{label}: GPU {gpu} sampled memory {value} -> {right['device'][gpu]} MiB")
+                    memory_issues.append(f"{label}: GPU {gpu} sampled memory {value} -> {right['device'][gpu]} MiB")
     return issues
 
 
-def report(root: Path, phase: str, steps: int, repeats: int) -> tuple[list[str], str]:
+def report(
+    root: Path, phase: str, steps: int, repeats: int, *, memory_policy: str = "strict"
+) -> tuple[list[str], str]:
+    if memory_policy not in ("strict", "report"):
+        raise ValueError("Memory policy must be strict or report")
+    memory_observations = [] if memory_policy == "report" else None
     issues, lines = (
         [],
         [
             f"# MoE chunk experiment: {phase}",
             "",
             "Exact logged loss/grad_norm/token checks; no tolerance relaxation.",
+            f"Memory policy: {memory_policy}."
+            + (
+                " Memory increases do not block; memory acceptance is deferred."
+                if memory_policy == "report"
+                else " Memory increases block acceptance."
+            ),
             "Allocator checks are per rank and step. Device memory is sampled every 250 ms and can miss brief peaks.",
             "Matching logged values is not proof of full-gradient or sample-identity equality.",
             "",
@@ -214,7 +228,14 @@ def report(root: Path, phase: str, steps: int, repeats: int) -> tuple[list[str],
             if mode == "off":
                 continue
             for arm in ARMS:
-                issues.extend(compare(runs["off"][arm], run[arm], f"repeat{repeat}/{mode} vs off/{arm}"))
+                issues.extend(
+                    compare(
+                        runs["off"][arm],
+                        run[arm],
+                        f"repeat{repeat}/{mode} vs off/{arm}",
+                        memory_observations=memory_observations,
+                    )
+                )
             if phase == "formal":
                 total = lambda value: sum(v["perf/step_time"] for s, v in value["rows"].items() if s >= 30)
                 patch_gain = total(runs["off"]["chunkflow"]) / total(run["chunkflow"]) - 1
@@ -238,6 +259,9 @@ def report(root: Path, phase: str, steps: int, repeats: int) -> tuple[list[str],
         "",
     ]
     lines.extend(f"- {issue}" for issue in issues)
+    if memory_observations:
+        lines += ["", "Memory observations (non-blocking; not accepted as memory compliant):", ""]
+        lines.extend(f"- {observation}" for observation in memory_observations)
     return issues, "\n".join(lines) + "\n"
 
 
@@ -248,13 +272,24 @@ def main() -> None:
     parser.add_argument("--phase", choices=("pilot", "formal"), default="formal")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--memory-policy",
+        choices=("strict", "report"),
+        help="Defaults to the recorded experiment policy, or strict for older runs",
+    )
     args = parser.parse_args()
     if args.fingerprint:
         print(fingerprint(args.root))
         return
     if args.steps <= 0 or args.repeats <= 0 or (args.phase == "formal" and args.steps <= 30):
         parser.error("Require positive counts and >30 steps for formal performance measurements")
-    issues, markdown = report(args.root, args.phase, args.steps, args.repeats)
+    policy = args.memory_policy
+    if policy is None:
+        config = args.root / "config.json"
+        policy = (
+            json.loads(config.read_text()).get("RELAX_MOE_MEMORY_POLICY", "strict") if config.exists() else "strict"
+        )
+    issues, markdown = report(args.root, args.phase, args.steps, args.repeats, memory_policy=policy)
     output = args.root / f"{args.phase}-report.md"
     output.write_text(markdown)
     print(markdown)

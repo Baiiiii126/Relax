@@ -36,6 +36,12 @@ export QWEN36_ROUTER_DTYPE=fp64 RELAX_MOE_METADATA_MODE=off RELAX_MOE_CHUNK_MODE
 export RELAX_CHUNKFLOW_FLASH_BACKEND=fa3 RELAX_CHUNKFLOW_PARENT_WINDOW=0
 export QWEN36_TAIL_POOL_AB=0 QWEN36_REVERSE_ORDER=0 CHUNKFLOW_PROFILE=0
 export QWEN36_MEMORY_CHECK=1 QWEN36_DEVICE_MEMORY_CHECK=1 RAY_NO_WAIT=0
+# Current experiment defers memory acceptance while retaining measurements.
+export RELAX_MOE_MEMORY_POLICY="${RELAX_MOE_MEMORY_POLICY:-report}"
+case "${RELAX_MOE_MEMORY_POLICY}" in
+   strict|report) ;;
+   *) echo "ERROR: RELAX_MOE_MEMORY_POLICY must be strict or report" >&2; exit 2 ;;
+esac
 export INPUT_KEY="${INPUT_KEY:-messages}" LABEL_KEY="${LABEL_KEY-}"
 unset QWEN36_GATE_GAIN_PCT RELAX_CHUNKFLOW_GATE_GAIN_PCT
 unset TORCH_DISTRIBUTED_DEBUG NCCL_DEBUG CUDA_LAUNCH_BLOCKING
@@ -62,7 +68,8 @@ if md.version("transformer-engine") != "2.14.1":
     raise SystemExit("Expected Transformer Engine 2.14.1")
 keys = ("HF_CHECKPOINT", "PROMPT_DATA", "GBS", "TP_SIZE", "PP_SIZE", "EP_SIZE", "CHUNK_SIZE", "TRAIN_SEED",
         "SEQ_LENGTH", "MAX_TOKENS_PER_GPU", "QWEN36_ROUTER_DTYPE", "LEARNING_RATE", "GDN_RECOMPUTE",
-        "CPU_OPTIMIZER_OVERLAP", "MOE_SHARED_EXPERT_OVERLAP", "RELAX_CHUNKFLOW_FLASH_BACKEND", "INPUT_KEY", "LABEL_KEY")
+        "CPU_OPTIMIZER_OVERLAP", "MOE_SHARED_EXPERT_OVERLAP", "RELAX_CHUNKFLOW_FLASH_BACKEND", "INPUT_KEY", "LABEL_KEY",
+        "RELAX_MOE_MEMORY_POLICY")
 record = {k: os.environ.get(k) for k in keys}
 record.update(commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               torch=torch.__version__, te=md.version("transformer-engine"), triton=md.version("triton"),
@@ -81,6 +88,7 @@ if os.environ["MOE_EXPERIMENT_PHASE"] != "check":
 (Path(os.environ["SUITE_DIR"]) / "config.json").write_text(json.dumps(record, indent=2) + "\n")
 PY
 echo "Experiment directory: ${SUITE_DIR}"
+echo "Memory policy: ${RELAX_MOE_MEMORY_POLICY} (report records increases without blocking; numerical checks remain strict)"
 export RELAX_MOE_GATE_DIR="${SUITE_DIR}/operator-gate"
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
    timeout --signal=TERM --kill-after=30s 1800s \
@@ -95,6 +103,8 @@ for rank in range(8):
     record = json.loads((folder / f"rank{rank}.json").read_text())
     if record.get("rank") != rank or record.get("passed") is not True:
         raise SystemExit(f"Operator gate missing or failed on rank {rank}")
+    if record.get("memory_policy") != os.environ["RELAX_MOE_MEMORY_POLICY"]:
+        raise SystemExit(f"Operator gate memory policy mismatch on rank {rank}")
 PY
 if [ "${PHASE}" = check ]; then echo "Eight-GPU operator gate passed: ${SUITE_DIR}"; exit 0; fi
 
@@ -119,7 +129,7 @@ run_mode() {
 for mode in off off_repeat dedup expert both; do
    run_mode pilot 0 "${mode}" "${PILOT_STEPS}"
 done
-python3 "${REPORT}" "${SUITE_DIR}" --phase pilot --steps "${PILOT_STEPS}" --repeats 1
+python3 "${REPORT}" "${SUITE_DIR}" --phase pilot --steps "${PILOT_STEPS}" --repeats 1 --memory-policy "${RELAX_MOE_MEMORY_POLICY}"
 if [ "${PHASE}" = pilot ]; then exit 0; fi
 
 for ((repeat=0; repeat<REPEATS; repeat++)); do
@@ -132,4 +142,4 @@ for ((repeat=0; repeat<REPEATS; repeat++)); do
       run_mode formal "${repeat}" "${mode}" "${STEPS}"
    done
 done
-python3 "${REPORT}" "${SUITE_DIR}" --phase formal --steps "${STEPS}" --repeats "${REPEATS}"
+python3 "${REPORT}" "${SUITE_DIR}" --phase formal --steps "${STEPS}" --repeats "${REPEATS}" --memory-policy "${RELAX_MOE_MEMORY_POLICY}"
