@@ -207,9 +207,7 @@ def simulate(plans: Sequence[ModelPlan], pp_size: int) -> dict[str, Any]:
     }
 
 
-def predict_step(
-    plans: Sequence[PlanTelemetry], pp_size: int, *, executed_windows: Sequence[ModelPlan] | None = None
-) -> dict[str, Any]:
+def predict_step(plans: Sequence[PlanTelemetry], pp_size: int) -> dict[str, Any]:
     if not plans or any(plan.model_plan is None for plan in plans):
         raise ValueError("schedule prediction needs nonempty plans captured with include_schedule=True")
     baseline_rows = {i: plan.input_rows for i, plan in enumerate(plans)}
@@ -228,9 +226,7 @@ def predict_step(
     )
     window = plans[0].parent_window
     chunkflow = simulate(
-        executed_windows
-        if executed_windows is not None
-        else [
+        [
             merge_model_plans([p.model_plan for p in plans[i : i + window]], pp_size)
             for i in range(0, len(plans), window)
         ],

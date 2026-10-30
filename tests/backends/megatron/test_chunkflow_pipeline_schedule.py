@@ -205,7 +205,7 @@ def test_plan_preserves_real_samples_and_excludes_alignment_padding(padding):
 @pytest.mark.parametrize("parent_window", [None, 0, 1, 2, 4, 7])
 @pytest.mark.parametrize("stage", range(4))
 @pytest.mark.parametrize("keep_last_k", [0, 1])
-def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k, parent_window, pool=False):
+def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k, parent_window):
     import torch
     from megatron.training import global_vars
 
@@ -237,13 +237,12 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         data_pad_size_multiplier=128,
         qkv_format="thd",
         allgather_cp=False,
-        uses_unsplit_forward=pool,
+        uses_unsplit_forward=False,
         loss_type="sft",
         calculate_per_token_loss=True,
     )
-    monkeypatch.setenv("RELAX_CHUNKFLOW_TAIL_POOL", str(int(pool)))
     parents, forward_shapes, backward_shapes = [], [], []
-    first_lengths = [301, 512, 651, 200, 129, 1] if pool else [600, 350, 200, 129, 1]
+    first_lengths = [600, 350, 200, 129, 1]
     for lengths in (first_lengths, [513, 128, 33], [128], [129], [700]):
         cu = [0]
         for length in lengths:
@@ -268,28 +267,6 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         forward_shapes.extend(shapes[uid] for uid in fwd)
         backward_shapes.extend(shapes[uid] for uid in bwd)
     assert len(set(forward_shapes)) > 1
-    if pool:
-        from dataclasses import replace
-
-        from relax.backends.megatron.chunkflow.schedule_model import make_model_plan, merge_model_plans
-        from relax.backends.megatron.chunkflow.tail_pool import pool_terminal_units
-        from relax.backends.megatron.chunkflow.units import Unit
-
-        by_id, owners, plans = {}, {}, []
-        for mb, parent in enumerate(parents):
-            chunks, units = _plan(parent, 256, "staggered")
-            plans.append(make_model_plan(units, chunks, 1 << 30, 4))
-            for u in units:
-                uid = len(by_id)
-                by_id[uid] = Unit(
-                    uid, [replace(c, group=mb * 100 + c.group if c.group is not None else None) for c in u.chunks]
-                )
-                owners[uid] = mb
-        pooled, members, plan = pool_terminal_units(by_id, owners, merge_model_plans(plans, 4), 256)
-        assert len(pooled) < len(by_id)
-        shapes = {uid: ((u.num_tokens + 127) // 128 * 64, 1, 4) for uid, u in pooled.items()}
-        forward_shapes = [shapes[uid] for uid in plan.forward]
-        backward_shapes = [shapes[uid] for uid in plan.backward]
 
     class Communicator:
         total_stages, current_stage = 4, stage
@@ -344,8 +321,7 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         unit = getattr(batch["packed_seq_params"], UNIT_ATTR)
         mb = _kwargs["current_microbatch"]
         first_flags.append(_kwargs["is_first_microbatch"])
-        if not pool:
-            assert (batch["tokens"][0, : unit.num_tokens] // 10000 == mb).all()
+        assert (batch["tokens"][0, : unit.num_tokens] // 10000 == mb).all()
         offset = 0
         for chunk in unit.chunks:
             owner_mb = int(batch["tokens"][0, offset] // 10000)
@@ -395,16 +371,13 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     )
     assert first_flags.count(True) == 1
     assert not groups
-    assert sorted(released) == ([0, 0, 0, 1, 4] if pool else [0, 0, 1, 4])
+    assert sorted(released) == [0, 0, 1, 4]
     assert {mb: sum(values) for mb, values in seen_tokens.items()} == {
         i: sum(p["total_lengths"]) for i, p in enumerate(parents)
     }
     metrics = model.chunkflow_runtime.consume_step_metrics(4)
     effective_window = parent_window or len(parents)
     assert metrics["num_microbatches"] == 5 and metrics["parent_window"] == effective_window
-    if pool:
-        assert metrics["tail_pool_saved_units"] > 0
-        assert metrics["num_units"] == len(forward_shapes)
     assert config.variable_seq_lengths is True and comm.config is config
     assert config.batch_p2p_comm is True
     windows = [name for name in profile.host if name.startswith("chunkflow.window") and name.count(".") == 2]
@@ -416,8 +389,3 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
             assert len(keys) == 1 and profile.host[keys[0]]["calls"] == 1
     for key, expected in (("sf", stage != 3), ("rf", stage != 0), ("sb", stage != 0), ("rb", stage != 3)):
         assert comm.positions[key] == (len(forward_shapes) if expected else 0)
-
-
-@pytest.mark.parametrize("stage", range(4))
-def test_executor_pooled_tails_match_p2p_shapes_and_release_groups(monkeypatch, stage):
-    test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, 0, 0, pool=True)

@@ -26,38 +26,24 @@ LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 GDN_RECOMPUTE="${GDN_RECOMPUTE:-1}"
 CPU_OPTIMIZER_OVERLAP="${CPU_OPTIMIZER_OVERLAP:-1}"
 MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
-export RELAX_MOE_METADATA_MODE="${RELAX_MOE_METADATA_MODE:-off}"
-export RELAX_MOE_CHUNK_MODE="${RELAX_MOE_CHUNK_MODE:-off}"
 export RELAX_CHUNKFLOW_EXECUTION_OPT="${RELAX_CHUNKFLOW_EXECUTION_OPT:-0}"
 case "${RELAX_CHUNKFLOW_EXECUTION_OPT}" in
    0|1) ;;
    *) echo "ERROR: RELAX_CHUNKFLOW_EXECUTION_OPT must be 0 or 1" >&2; exit 2 ;;
 esac
-case "${RELAX_MOE_CHUNK_MODE}" in
-   off|dedup|expert|both) ;;
-   *) echo "ERROR: RELAX_MOE_CHUNK_MODE must be off, dedup, expert or both" >&2; exit 2 ;;
-esac
-if [ "${RELAX_MOE_CHUNK_MODE}" != off ] && [ "${RELAX_MOE_METADATA_MODE}" != off ]; then
-   echo "ERROR: MoE chunk experiments require RELAX_MOE_METADATA_MODE=off" >&2
-   exit 2
-fi
-case "${RELAX_MOE_METADATA_MODE}" in
-   off|a|b) ;;
-   *) echo "ERROR: RELAX_MOE_METADATA_MODE must be off, a or b" >&2; exit 2 ;;
-esac
-DIAGNOSTIC_ARGS=()
+OPTIMIZATION_ARGS=()
 case "${GDN_RECOMPUTE}" in
-   1) DIAGNOSTIC_ARGS+=(--recompute-granularity selective --recompute-modules gdn) ;;
+   1) OPTIMIZATION_ARGS+=(--recompute-granularity selective --recompute-modules gdn) ;;
    0) ;;
    *) echo "ERROR: GDN_RECOMPUTE must be 0 or 1" >&2; exit 2 ;;
 esac
 case "${CPU_OPTIMIZER_OVERLAP}" in
-   1) DIAGNOSTIC_ARGS+=(--overlap-cpu-optimizer-d2h-h2d) ;;
+   1) OPTIMIZATION_ARGS+=(--overlap-cpu-optimizer-d2h-h2d) ;;
    0) ;;
    *) echo "ERROR: CPU_OPTIMIZER_OVERLAP must be 0 or 1" >&2; exit 2 ;;
 esac
 case "${MOE_SHARED_EXPERT_OVERLAP}" in
-   1) DIAGNOSTIC_ARGS+=(--moe-shared-expert-overlap) ;;
+   1) OPTIMIZATION_ARGS+=(--moe-shared-expert-overlap) ;;
    0) ;;
    *) echo "ERROR: MOE_SHARED_EXPERT_OVERLAP must be 0 or 1" >&2; exit 2 ;;
 esac
@@ -139,15 +125,6 @@ export RELAX_CHUNKFLOW_FLASH_BACKEND="${RELAX_CHUNKFLOW_FLASH_BACKEND:-fa3}"
 export RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS="${RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS:-0}"
 export RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY=1
 export RELAX_CHUNKFLOW_PARENT_WINDOW="${RELAX_CHUNKFLOW_PARENT_WINDOW:-0}"
-export RELAX_CHUNKFLOW_TAIL_POOL="${RELAX_CHUNKFLOW_TAIL_POOL:-0}"
-case "${RELAX_CHUNKFLOW_TAIL_POOL}" in
-   0|1) ;;
-   *) echo "ERROR: RELAX_CHUNKFLOW_TAIL_POOL must be 0 or 1" >&2; exit 2 ;;
-esac
-if [ "${RELAX_CHUNKFLOW_TAIL_POOL}" = 1 ] && [ "${KEEP_LAST_K}" != 0 ]; then
-   echo "ERROR: tail pooling requires KEEP_LAST_K=0" >&2
-   exit 2
-fi
 if ! [[ "${RELAX_CHUNKFLOW_PARENT_WINDOW}" =~ ^(0|[1-9][0-9]*)$ ]]; then
    echo "ERROR: RELAX_CHUNKFLOW_PARENT_WINDOW must be nonnegative (0 uses all step parents)" >&2
    exit 2
@@ -160,26 +137,23 @@ case "${RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS}" in
    0|1) ;;
    *) echo "ERROR: RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS must be 0 or 1" >&2; exit 2 ;;
 esac
-if [ "${MODE}" = baseline ]; then
-   unset RELAX_CHUNKFLOW_GATE_GAIN_PCT
-elif [ -n "${RELAX_CHUNKFLOW_GATE_GAIN_PCT:-}" ]; then
-   export RELAX_CHUNKFLOW_GATE_GAIN_PCT
-   python3 -c 'import math, os; x=float(os.environ["RELAX_CHUNKFLOW_GATE_GAIN_PCT"]); assert math.isfinite(x) and x >= 0, "Invalid gate gain percentage"'
-fi
 RUNTIME_ENV_JSON=$(python3 -c '
 import json, os
 env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+# Older Megatron installations may still contain the retired metadata patch.
+env.setdefault("env_vars", {})["RELAX_MOE_METADATA_MODE"] = "off"
+for key in ("RELAX_MOE_CHUNK_MODE", "RELAX_CHUNKFLOW_TAIL_POOL"):
+    env["env_vars"].pop(key, None)
 for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND",
             "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS", "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY",
-            "RELAX_CHUNKFLOW_PARENT_WINDOW", "RELAX_CHUNKFLOW_TAIL_POOL", "RELAX_TRAIN_PROFILE_RECORD_SHAPES",
-            "RELAX_MOE_METADATA_MODE", "RELAX_MOE_CHUNK_MODE", "RELAX_CHUNKFLOW_EXECUTION_OPT"):
+            "RELAX_CHUNKFLOW_PARENT_WINDOW", "RELAX_TRAIN_PROFILE_RECORD_SHAPES",
+            "RELAX_CHUNKFLOW_EXECUTION_OPT"):
     env.setdefault("env_vars", {})[key] = os.environ[key]
 if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
 else:
     env.setdefault("env_vars", {}).pop("RELAX_TRAIN_PROFILE_DIR", None)
-for key in ("RELAX_TRAIN_MEMORY_DIR", "RELAX_CHUNKFLOW_GATE_GAIN_PCT", "RELAX_CHUNKFLOW_DIAGNOSTIC_DIR", "RELAX_CHUNKFLOW_GRAD_ROLLOUTS", "RELAX_CHUNKFLOW_LAYER_TRACE",
-            "RELAX_CHUNKFLOW_UPDATE_TRACE", "RELAX_CHUNKFLOW_KV_GRAD_FP32", "RELAX_CHUNKFLOW_TAIL_TRACE", "RELAX_CHUNKFLOW_CONV_TRACE", "RELAX_CHUNKFLOW_CONV_CHUNK_SIZE"):
+for key in ("RELAX_TRAIN_MEMORY_DIR", "RELAX_CHUNKFLOW_KV_GRAD_FP32"):
     if os.environ.get(key):
         env.setdefault("env_vars", {})[key] = os.environ[key]
     else:
@@ -251,11 +225,8 @@ mkdir -p "$(dirname -- "${LOG_FILE}")"
 echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=${EP_SIZE} GBS=${GBS} STEPS=${NUM_ROLLOUT} SEED=${TRAIN_SEED} ARM=${ARM}"
 echo "LR=${LEARNING_RATE} GDN_RECOMPUTE=${GDN_RECOMPUTE} CPU_OPTIMIZER_OVERLAP=${CPU_OPTIMIZER_OVERLAP}"
 echo "MOE_SHARED_EXPERT_OVERLAP=${MOE_SHARED_EXPERT_OVERLAP}"
-echo "RELAX_MOE_METADATA_MODE=${RELAX_MOE_METADATA_MODE}"
-echo "RELAX_MOE_CHUNK_MODE=${RELAX_MOE_CHUNK_MODE}"
 echo "RELAX_CHUNKFLOW_EXECUTION_OPT=${RELAX_CHUNKFLOW_EXECUTION_OPT}"
-echo "CHUNKFLOW_GATE_GAIN_PCT=${RELAX_CHUNKFLOW_GATE_GAIN_PCT:-disabled}"
-echo "CHUNKFLOW_TAIL_POOL=${RELAX_CHUNKFLOW_TAIL_POOL} PARENT_WINDOW=${RELAX_CHUNKFLOW_PARENT_WINDOW}"
+echo "PARENT_WINDOW=${RELAX_CHUNKFLOW_PARENT_WINDOW}"
 echo "LOG_FILE=${LOG_FILE}"
 if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
    echo "PROFILE_ROLLOUTS=${PROFILE_START}..${PROFILE_END} (0-based; includes profiler overhead)"
@@ -295,7 +266,7 @@ if [ -n "${RELAX_DEVICE_MEMORY_DIR:-}" ]; then
 fi
 ray job submit "${SUBMIT_ARGS[@]}" --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train --resource '{"sft": [1, 0], "actor": [1, 8]}' \
-   "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" "${DIAGNOSTIC_ARGS[@]}" "${PROFILE_ARGS[@]}" "${CHUNKFLOW_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+   "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" "${OPTIMIZATION_ARGS[@]}" "${PROFILE_ARGS[@]}" "${CHUNKFLOW_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
 
 if [ -n "${memory_sampler_pid}" ]; then
    python3 -c 'import time; print(time.time())' > "${RELAX_DEVICE_MEMORY_DIR}/device-memory.end"
@@ -311,14 +282,6 @@ if [ "${RAY_NO_WAIT:-0}" != 1 ]; then
       echo "ERROR: expected training steps not completed; inspect ${LOG_FILE}" >&2
       exit 1
    fi
-   for feature in dedup expert; do
-      if [ "${RELAX_MOE_CHUNK_MODE}" = "${feature}" ] || [ "${RELAX_MOE_CHUNK_MODE}" = both ]; then
-         if ! grep -q "MoE chunk optimization installed: ${feature}" "${LOG_FILE}"; then
-            echo "ERROR: requested MoE optimization not installed: ${feature}" >&2
-            exit 1
-         fi
-      fi
-   done
    if [ "${MODE}" = chunkflow ]; then
       for pattern in 'stateful GDN installed on [1-9][0-9]* layer' 'chunked attention installed on [1-9][0-9]* layer'; do
          if ! grep -Eq "chunkflow: ${pattern}" "${LOG_FILE}"; then

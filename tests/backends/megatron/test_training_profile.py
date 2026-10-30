@@ -120,9 +120,8 @@ def test_profile_shape_recording_can_be_disabled(monkeypatch, record_shapes):
     assert not any(options[key] for key in ("with_stack", "profile_memory", "with_flops"))
 
 
-@pytest.mark.parametrize("chunkflow,tail_pool", [(False, False), (True, False), (True, True)])
-def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, chunkflow, tail_pool):
-    monkeypatch.setenv("RELAX_CHUNKFLOW_TAIL_POOL", str(int(tail_pool)))
+@pytest.mark.parametrize("chunkflow", [False, True])
+def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, chunkflow):
     args = SimpleNamespace(
         use_pytorch_profiler=True,
         profile_target=["train_overall"],
@@ -147,9 +146,7 @@ def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, 
         (target, name, getattr(target, name))
         for target, name in (
             (gdn, "_invoke_kernel"),
-            (pipeline_schedules, "pool_terminal_units"),
             (pipeline_schedules, "slice_parent_batch"),
-            (pipeline_schedules, "slice_pooled_batch"),
             (unit_batch, "slice_parent_batch"),
         )
     ]
@@ -187,7 +184,6 @@ def test_profile_records_both_arms_and_restores_wrappers(tmp_path, monkeypatch, 
         assert all(getattr(target, name) is function for target, name, function in originals)
     rows = [json.loads(line) for line in next(tmp_path.glob("segments_*.jsonl")).read_text().splitlines()]
     assert [row["rollout_id"] for row in rows] == [34, 35, 36]
-    assert all(row["tail_pool_enabled"] == tail_pool for row in rows)
     assert all(
         row["host_resources_after"]["process_cpu_s"] >= row["host_resources_before"]["process_cpu_s"] for row in rows
     )

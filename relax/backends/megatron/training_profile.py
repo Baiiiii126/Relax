@@ -74,8 +74,6 @@ class _StepProfile:
             from relax.backends.megatron.chunkflow import gdn, pipeline_schedules, unit_batch
 
             backward_modules.append(pipeline_schedules)
-            self.wrap(pipeline_schedules, "pool_terminal_units", "chunkflow.tail_pool.plan")
-            self.wrap(pipeline_schedules, "slice_pooled_batch", "chunkflow.batch.pooled")
             self.wrap(pipeline_schedules, "slice_parent_batch", "chunkflow.batch.single")
             self.wrap(unit_batch, "slice_parent_batch", "chunkflow.batch.pool_part")
             original_invoke = gdn._invoke_kernel
@@ -204,8 +202,6 @@ def _record_allocator_memory(args: Any, rollout_id: int, step_id: int) -> Iterat
         "step_id": step_id,
         "rank": rank,
         "arm": "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline",
-        "moe_metadata_mode": os.environ.get("RELAX_MOE_METADATA_MODE", "off"),
-        "moe_chunk_mode": os.environ.get("RELAX_MOE_CHUNK_MODE", "off"),
         "before": before,
         "peak_allocated": torch.cuda.max_memory_allocated(device),
         "peak_reserved": torch.cuda.max_memory_reserved(device),
@@ -253,8 +249,6 @@ def profile_train_step(
         "rollout_id": rollout_id,
         "step_id": step_id,
         "arm": "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline",
-        "tail_pool_enabled": bool(getattr(args, "use_chunkflow", False))
-        and os.environ.get("RELAX_CHUNKFLOW_TAIL_POOL") == "1",
         "rank": rank,
         "host_inclusive": profile.host,
         "host_resources_before": resources_before,

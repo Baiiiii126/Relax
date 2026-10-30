@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import inspect
-import os
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
@@ -16,7 +15,6 @@ from torch.nn import functional as F
 from relax.backends.megatron.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
 from relax.backends.megatron.chunkflow.state_store import ChunkState
-from relax.backends.megatron.training_profile import train_phase
 
 
 _ORIGINAL = "_chunkflow_original_gdn"
@@ -28,7 +26,6 @@ class _Context:
     packed: Any
     previous: dict[str, torch.Tensor] | None = None
     current: dict[str, torch.Tensor] | None = None
-    tails: list[dict[str, torch.Tensor]] | None = None
     seen: set[str] = field(default_factory=set)
 
 
@@ -48,10 +45,6 @@ class _StateGradient(torch.autograd.Function):
 
 
 def _invoke_kernel(kernel: Callable, name: str, *args: Any, **kwargs: Any) -> Any:
-    if name == "conv" and os.environ.get("RELAX_CHUNKFLOW_CONV_TRACE") == "1":
-        from relax.backends.megatron.chunkflow.conv_diagnostics import call_convolution
-
-        return call_convolution(kernel, *args, **kwargs)
     return kernel(*args, **kwargs)
 
 
@@ -65,32 +58,6 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
         context = _ACTIVE.get()
         if context is None:
             return _invoke_kernel(kernel, name, *args, **kwargs)
-        if context.tails is not None:
-            bound = signature.bind(*args, **kwargs)
-            if bound.arguments.get("cp_context") is not None:
-                raise NotImplementedError("ChunkFlow GDN state transfer requires CP=1")
-            inputs = {key: bound.arguments[key] for key in fields}
-            cu = context.packed.cu_seqlens_q_cpu
-            padded_length = inputs[fields[0]].shape[1]
-            real_length = getattr(context.packed, UNIT_ATTR).num_tokens
-            if padded_length < real_length:
-                raise ValueError("GDN kernel input is shorter than its pooled unit")
-            outputs = []
-            for i, previous in enumerate(context.tails):
-                for key in fields:
-                    bound.arguments[key] = inputs[key][:, cu[i] : cu[i + 1]]
-                bound.arguments.update(initial_state=previous[name], output_final_state=False, cu_seqlens=None)
-                for key in ("cu_seqlens_cpu", "chunk_indices"):
-                    if key in signature.parameters:
-                        bound.arguments[key] = None
-                output, _ = _invoke_kernel(kernel, name, *bound.args, **bound.kwargs)
-                outputs.append(output)
-            with train_phase("chunkflow.gdn.tail_assemble"):
-                output = torch.cat(outputs, dim=1)
-                if padded_length > real_length:
-                    output = F.pad(output, (0, 0) * (output.ndim - 2) + (0, padded_length - real_length))
-            context.seen.add(name)
-            return output, None
         if context.current is None:
             if "cu_seqlens_cpu" in signature.parameters:
                 bound = signature.bind(*args, **kwargs)
@@ -115,10 +82,6 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
         for key in ("cu_seqlens_cpu", "chunk_indices"):
             if key in signature.parameters:
                 bound.arguments[key] = None
-        if os.environ.get("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR"):
-            from relax.backends.megatron.chunkflow.diagnostics import record_kernel
-
-            record_kernel(kernel, dict(bound.arguments), f"{context.module.layer_number}:{name}:state_kernel")
         output, final_state = _invoke_kernel(kernel, name, *bound.args, **bound.kwargs)
         if not isinstance(final_state, torch.Tensor):
             raise RuntimeError(f"GDN {name} kernel did not return its final state")
@@ -174,30 +137,21 @@ def _wrap_forward(module: Any, original: Callable, runtime: ChunkflowRuntime, *,
             bound.arguments["packed_seq_params"] = packed
         context = _Context(module, packed)
         if not prepare and unit.is_dependent:
-            if len(unit.chunks) > 1:
-                if any(
-                    not c.is_dependent or len(c.segments) != 1 or not 0 < c.group_idx == c.group_size - 1
-                    for c in unit.chunks
-                ):
-                    raise NotImplementedError("ChunkFlow GDN pooling requires terminal dependent segments")
-                context.tails = [
-                    runtime.store(module.layer_number, c.group).lookup(c.group_idx - 1)[-1].tensors
-                    for c in unit.chunks
-                ]
-            else:
-                chunk = unit.chunks[0]
-                if len(chunk.segments) != 1:
-                    raise NotImplementedError("ChunkFlow GDN requires one dependent segment per chunk")
-                store = runtime.store(module.layer_number, chunk.group)
-                if chunk.group_idx == len(store) and not getattr(packed, RECOMPUTE_ATTR, False):
-                    store.put(chunk.group_idx, ChunkState({}))
-                states = store.lookup(chunk.group_idx)
-                context.previous = states[-2].tensors if chunk.group_idx else {}
-                context.current = states[-1].tensors
+            if len(unit.chunks) != 1:
+                raise NotImplementedError("ChunkFlow GDN requires one dependent chunk per unit")
+            chunk = unit.chunks[0]
+            if len(chunk.segments) != 1:
+                raise NotImplementedError("ChunkFlow GDN requires one dependent segment per chunk")
+            store = runtime.store(module.layer_number, chunk.group)
+            if chunk.group_idx == len(store) and not getattr(packed, RECOMPUTE_ATTR, False):
+                store.put(chunk.group_idx, ChunkState({}))
+            states = store.lookup(chunk.group_idx)
+            context.previous = states[-2].tensors if chunk.group_idx else {}
+            context.current = states[-1].tensors
         token = _ACTIVE.set(context)
         try:
             result = original(*bound.args, **bound.kwargs)
-            if (context.current is not None or context.tails is not None) and context.seen != {"conv", "recurrent"}:
+            if context.current is not None and context.seen != {"conv", "recurrent"}:
                 raise RuntimeError("GDN execution bypassed the state-aware convolution or recurrence")
             return result
         finally:

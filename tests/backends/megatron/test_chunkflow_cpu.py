@@ -24,7 +24,7 @@ def _load_chunkflow() -> SimpleNamespace:
             module = ModuleType(name)
             module.__path__ = []
             sys.modules[name] = module
-        for leaf in ("scheduler", "units", "schedule_model", "telemetry", "gating"):
+        for leaf in ("scheduler", "units", "schedule_model", "telemetry"):
             name = f"{package}.{leaf}"
             spec = importlib.util.spec_from_file_location(name, folder / f"{leaf}.py")
             module = importlib.util.module_from_spec(spec)
@@ -38,49 +38,6 @@ class ChunkflowPlanTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cf = _load_chunkflow()
-
-    def test_gate_forecast_peeks_current_parents_and_excludes_padding_from_units(self):
-        from dataclasses import replace
-
-        lengths = [999, 2050, 300, 4097]
-        iterator = SimpleNamespace(
-            offset=1, micro_batch_indices=[[0], [1, 2], [3]], rollout_data={"total_lengths": lengths}
-        )
-        plans = []
-        for source in ([2050, 300], [4097]):
-            chunks = self.cf.scheduler.build_chunks(source, 1024, repack_tail=False)
-            units = self.cf.units.build_micro_batches(chunks, "staggered")
-            plans.append(
-                replace(
-                    self.cf.telemetry.summarize_plan(
-                        [*source, (-sum(source)) % 256],
-                        chunks,
-                        units,
-                        1 << 30,
-                        4,
-                        [0] * 4,
-                        source_rows=sum(source),
-                        include_schedule=True,
-                    ),
-                    parent_window=2,
-                )
-            )
-        expected = self.cf.telemetry.StepPlanTelemetry(plans).to_metrics(4, simulate_schedule=True)
-        got, fingerprint = self.cf.gating.forecast_step(
-            iterator, 2, chunk_size=1024, pp_size=4, tp_size=2, pad_multiplier=128
-        )
-        for key in expected.keys() - {"schedule_model_analysis_time_s"}:
-            self.assertEqual(got[key], expected[key], key)
-        self.assertEqual(iterator.offset, 1)
-        self.assertEqual(got["recompute_units"], 0)
-        other, other_hash = self.cf.gating.forecast_step(
-            iterator, 2, chunk_size=1024, pp_size=4, tp_size=2, pad_multiplier=128, parent_window=1
-        )
-        self.assertNotEqual(fingerprint, other_hash)
-        self.assertNotEqual(got["schedule_model_speedup"], other["schedule_model_speedup"])
-        iterator.dummy_micro_batch_offsets = {2}
-        with self.assertRaisesRegex(ValueError, "dummy"):
-            self.cf.gating.forecast_step(iterator, 2, chunk_size=1024, pp_size=4, tp_size=2, pad_multiplier=128)
 
     def test_plan_prediction_preserves_parent_padding(self):
         chunks = self.cf.scheduler.build_chunks([1100, 180], 512, repack_tail=False)

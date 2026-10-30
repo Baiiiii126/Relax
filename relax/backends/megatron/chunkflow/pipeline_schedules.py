@@ -25,9 +25,8 @@ from megatron.core.utils import get_model_config
 
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
 from relax.backends.megatron.chunkflow.schedule_model import make_model_plan, merge_model_plans, pipeline_plan
-from relax.backends.megatron.chunkflow.tail_pool import pool_terminal_units
 from relax.backends.megatron.chunkflow.telemetry import summarize_plan
-from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch, slice_pooled_batch
+from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
 from relax.backends.megatron.chunkflow.units import Unit, completed_groups
 from relax.backends.megatron.training_profile import train_phase
 from relax.utils.logging_utils import get_logger
@@ -123,21 +122,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     parent_window = int(os.environ.get("RELAX_CHUNKFLOW_PARENT_WINDOW", "0"))
     if parent_window < 0:
         raise ValueError("RELAX_CHUNKFLOW_PARENT_WINDOW must be nonnegative (0 uses all step parents)")
-    tail_pool = os.environ.get("RELAX_CHUNKFLOW_TAIL_POOL", "0")
-    if tail_pool not in ("0", "1"):
-        raise ValueError("RELAX_CHUNKFLOW_TAIL_POOL must be 0 or 1")
-    tail_pool = tail_pool == "1"
-    if tail_pool and (
-        getattr(args, "loss_type", None) != "sft"
-        or not getattr(args, "calculate_per_token_loss", False)
-        or not getattr(args, "uses_unsplit_forward", False)
-        or getattr(args, "chunkflow_keep_last_k", 0) != 0
-        or policy != "staggered"
-    ):
-        raise ValueError(
-            "tail pooling requires per-token text SFT, explicit MRoPE, staggered packing and keep_last_k=0"
-        )
-
     if p2p_communicator is None and pg_collection is None:
         from megatron.core.pipeline_parallel.schedules import ProcessGroupCollection
 
@@ -276,15 +260,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         group_offset += len(groups)
                         chunk_offset += len(chunks)
                     plan = merge_model_plans(plans, p2p_communicator.total_stages)
-                    sources = {}
-                    if tail_pool:
-                        sources = {uid: [(parent, by_id[uid])] for uid, (parent, _) in owners.items()}
-                        by_id, members, plan = pool_terminal_units(
-                            by_id, {uid: mb for uid, (_, mb) in owners.items()}, plan, chunk_size
-                        )
-                        sources = {uid: [sources[member][0] for member in ids] for uid, ids in members.items()}
-                        owners = {uid: owners[uid] for uid in by_id}
-                        runtime.record_window(plan, sum(len(ids) > 1 for ids in members.values()))
                     fwd_seq, bwd_seq, need_fr = plan.forward, plan.backward, plan.recompute
                     W, n = plan.warmups[p2p_communicator.current_stage], len(fwd_seq)
                     unit_shapes = {
@@ -306,11 +281,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                     unit = by_id[unit_id]
                     with train_phase("chunkflow.unit_prepare"):
                         pad_token_id = getattr(args, "pad_token_id", 0) or 0
-                        batch = (
-                            slice_pooled_batch(sources[unit_id], pad_token_id=pad_token_id, args=args)
-                            if tail_pool and len(sources[unit_id]) > 1
-                            else slice_parent_batch(parent, unit, pad_token_id=pad_token_id, args=args)
-                        )
+                        batch = slice_parent_batch(parent, unit, pad_token_id=pad_token_id, args=args)
                     batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
                     recompute = unit_id in need_fr
                     if recompute:
@@ -375,8 +346,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         _check_tensor_shapes(input_tensor_grad, unit_shapes[unit_id][0])
                     for group in completed_groups(by_id[unit_id]):
                         runtime.release_group(group)
-                    if tail_pool:
-                        sources.pop(unit_id)
                     return input_tensor_grad, fr_num_tokens
 
                 with train_phase(f"{window}.warmup.units{W}.total{n}"):

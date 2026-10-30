@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 
-from relax.backends.megatron.chunkflow.schedule_model import ModelPlan
 from relax.backends.megatron.chunkflow.state_store import StateStore
 from relax.backends.megatron.chunkflow.telemetry import PlanTelemetry, StepPlanTelemetry
 
@@ -21,8 +20,6 @@ class ChunkflowRuntime:
         self.schedule_analysis = os.environ.get("RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS") == "1"
         self._stores: dict[tuple[int, int], StateStore] = {}
         self._step_telemetry: StepPlanTelemetry | None = None
-        self.gate_metrics: dict[str, int | float] = {}
-        self.baseline_rope_configs: dict[int, tuple[object, bool]] = {}
 
     def begin_step(self) -> None:
         self._step_telemetry = StepPlanTelemetry()
@@ -37,14 +34,7 @@ class ChunkflowRuntime:
         metrics = (
             telemetry.to_metrics(pp_size, simulate_schedule=self.schedule_analysis) if telemetry is not None else {}
         )
-        gate, self.gate_metrics = self.gate_metrics, {}
-        return metrics | gate
-
-    def record_window(self, plan: ModelPlan, pooled_units: int) -> None:
-        if self._step_telemetry is None:
-            self._step_telemetry = StepPlanTelemetry()
-        self._step_telemetry.windows.append(plan)
-        self._step_telemetry.pooled_units += pooled_units
+        return metrics
 
     def store(self, layer_number: int, group_id: int) -> StateStore:
         key = (layer_number, group_id)

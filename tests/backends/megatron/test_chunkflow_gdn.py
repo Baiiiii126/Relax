@@ -176,11 +176,9 @@ def _packed(lengths, unit=None):
     return packed
 
 
-def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, tail_pool=False, padding=3):
+def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, padding=3):
     torch.manual_seed(21)
     lengths = [11, 7, 2, 1] if device == "cpu" else [151, 83, 2, 1]
-    if tail_pool:
-        lengths = [5, 8, 10, 2, 1] if device == "cpu" else [71, 128, 149, 2, 1]
     model = GatedDeltaNet(kernels, mode, heads, dim).to(
         device=device, dtype=torch.float64 if device == "cpu" else torch.bfloat16
     )
@@ -209,17 +207,6 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, tail_p
     chunks = build_chunks(lengths, chunk_size, repack_tail=False)
     units = build_micro_batches(chunks, "staggered")
     ops = gen_unit_ops(units, chunks, 1 if mode == "fr" else 1 << 30, pp=1, stage=0)
-    if tail_pool:
-        from relax.backends.megatron.chunkflow.schedule_model import make_model_plan
-        from relax.backends.megatron.chunkflow.tail_pool import pool_terminal_units
-
-        plan = make_model_plan(units, chunks, 1 << 30, 1)
-        by_id, members, plan = pool_terminal_units(
-            {u.unit_id: u for u in units}, {u.unit_id: 0 for u in units}, plan, chunk_size
-        )
-        assert any(len(ids) > 1 for ids in members.values())
-        units = by_id
-        ops = [("F", uid) for uid in plan.forward] + [("B", uid) for uid in plan.backward]
     pending, actual, identities = {}, {}, {}
     for kind, uid in ops:
         unit = units[uid]
@@ -317,9 +304,19 @@ def test_gdn_state_outputs_and_gradients_match_full_sequence(kernels, mode, chun
     _alignment(kernels, mode, chunk_size)
 
 
-@pytest.mark.parametrize("mode", ["keep", "last", "selective", "selective_last"])
-def test_gdn_pooled_tails_outputs_and_gradients_match_full_sequence(kernels, mode):
-    _alignment(kernels, mode, tail_pool=True)
+def test_gdn_rejects_multiple_dependent_chunks_before_state_access():
+    chunks = build_chunks([11, 11], 4, repack_tail=False)
+    unit = next(u for u in build_micro_batches(chunks, "lockstep") if u.is_dependent and len(u.chunks) > 1)
+    packed = SimpleNamespace(**{UNIT_ATTR: unit})
+    runtime = ChunkflowRuntime(4)
+
+    def original(packed_seq_params):
+        raise AssertionError("unsupported units must not enter the kernel")
+
+    forward = gdn._wrap_forward(SimpleNamespace(layer_number=1), original, runtime, prepare=False)
+    with pytest.raises(NotImplementedError, match="one dependent chunk per unit"):
+        forward(packed_seq_params=packed)
+    runtime.assert_empty("rejected unit")
 
 
 @pytest.mark.parametrize("enabled", ["0", "1"])
@@ -386,13 +383,3 @@ def test_gdn_fla_state_outputs_and_gradients_match_full_sequence(kernels, mode):
 
     kernels.causal_conv1d, kernels.rule = causal_conv1d, chunk_gated_delta_rule
     _alignment(kernels, mode, chunk_size=64, device="cuda", heads=2, dim=32)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and differentiable FLA state kernels")
-@pytest.mark.parametrize("mode", ["last", "selective_last"])
-def test_gdn_fla_pooled_tails_match_full_sequence(kernels, mode):
-    from fla.modules.convolution import causal_conv1d
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-
-    kernels.causal_conv1d, kernels.rule = causal_conv1d, chunk_gated_delta_rule
-    _alignment(kernels, mode, chunk_size=64, device="cuda", heads=2, dim=128, tail_pool=True)

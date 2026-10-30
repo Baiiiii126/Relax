@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -410,10 +409,6 @@ def get_log_probs_and_entropy(
                     tp_group,
                     with_entropy=False,
                 )
-                if os.environ.get("RELAX_CHUNKFLOW_TAIL_TRACE") == "1":
-                    from relax.backends.megatron.chunkflow.tail_diagnostics import tap_head
-
-                    tap_head(logits, h_sub, logits_sub, log_prob_sub, tokens_chunk[s:e])
                 chunk_lps.append(log_prob_sub.squeeze(-1))
             log_prob = (
                 torch.cat(chunk_lps, dim=0)
@@ -1541,10 +1536,6 @@ def loss_function(
             case _:
                 raise ValueError(f"Unknown loss type: {args.loss_type}")
 
-    if os.environ.get("RELAX_CHUNKFLOW_TAIL_TRACE") == "1":
-        from relax.backends.megatron.chunkflow.tail_diagnostics import bind_loss_probe
-
-        func = bind_loss_probe(func, batch)
     if args.recompute_loss_function:
         loss, log = checkpoint(
             func,

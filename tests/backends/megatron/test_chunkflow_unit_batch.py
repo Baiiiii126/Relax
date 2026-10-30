@@ -130,41 +130,6 @@ def test_lockstep_dependent_units_fail_closed_until_per_segment_rope_exists():
         _rope_offsets(merged)
 
 
-def test_pooled_tails_preserve_targets_masks_positions_and_padding():
-    from relax.backends.megatron.chunkflow.unit_batch import slice_pooled_batch
-
-    sources = []
-    for index, length in enumerate((301, 651)):
-        parent = _parent([length])
-        parent["replay_micro_batch_index"] = index
-        units, _ = _units([length], 256)
-        sources.append((parent, units[-1]))
-    args = SimpleNamespace(uses_unsplit_forward=True)
-    parts = [slice_parent_batch(p, u, pad_token_id=PAD, args=args) for p, u in sources]
-    pooled = slice_pooled_batch(sources, pad_token_id=PAD, args=args)
-    assert [p["replay_micro_batch_index"] for p in parts] == [0, 1]
-    assert "replay_micro_batch_index" not in pooled
-    lengths = [45, 139]
-    total = sum(lengths)
-    assert pooled["packed_seq_params"].cu_seqlens_q_cpu == [0, 45, total]
-    assert pooled["packed_seq_params"].cu_seqlens_q_padded.tolist() == [0, 45, 256]
-    for key in ("unconcat_tokens", "loss_masks"):
-        torch.testing.assert_close(pooled[key][0], torch.cat([p[key][0] for p in parts]))
-    torch.testing.assert_close(
-        pooled["position_ids"][..., :total],
-        torch.cat([p["position_ids"][..., :n] for p, n in zip(parts, lengths)], dim=-1),
-    )
-    torch.testing.assert_close(
-        pooled["tokens"][0, :total], torch.cat([p["tokens"][0, :n] for p, n in zip(parts, lengths)])
-    )
-    assert not pooled["full_loss_masks"][0, total:].any()
-    assert pooled["__num_tokens_override__"] == sum(p["__num_tokens_override__"] for p in parts)
-    assert pooled["unconcat_tokens"][0][44] == PAD
-    sources[0][0]["__loss_scale__"] = 0.5
-    with pytest.raises(NotImplementedError, match="ordinary text SFT"):
-        slice_pooled_batch(sources, pad_token_id=PAD, args=args)
-
-
 def test_bridge_chunk_positions_and_padding_match_full_sequence():
     bridge_rope = pytest.importorskip("megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope")
     from relax.backends.megatron.chunkflow.schedules import _forward_kwargs

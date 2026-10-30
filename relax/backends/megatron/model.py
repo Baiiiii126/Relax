@@ -1068,13 +1068,6 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
-        if any(
-            os.environ.get(key) == "1"
-            for key in ("RELAX_CHUNKFLOW_LAYER_TRACE", "RELAX_CHUNKFLOW_CONV_TRACE", "RELAX_CHUNKFLOW_TAIL_TRACE")
-        ):
-            from relax.backends.megatron.chunkflow.layer_diagnostics import set_batch
-
-            set_batch(batch)
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
@@ -1183,14 +1176,6 @@ def train_one_step(
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
     use_chunkflow_this_step = getattr(args, "use_chunkflow", False)
-    fallback_context = nullcontext()
-    if use_chunkflow_this_step and os.environ.get("RELAX_CHUNKFLOW_GATE_GAIN_PCT"):
-        from relax.backends.megatron.chunkflow.gating import prepare_step_gate
-        from relax.backends.megatron.chunkflow.integration import baseline_execution
-
-        use_chunkflow_this_step = prepare_step_gate(args, model, data_iterator, num_microbatches)
-        if not use_chunkflow_this_step:
-            fallback_context = baseline_execution(model[0])
     if use_chunkflow_this_step:
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size > 1:
@@ -1234,7 +1219,7 @@ def train_one_step(
         if getattr(args, "use_pytorch_profiler", False)
         else nullcontext()
     )
-    with train_phase("forward_backward"), compute_context, fallback_context:
+    with train_phase("forward_backward"), compute_context:
         losses_reduced = forward_backward_func(
             forward_step_func=profile_forward_step(forward_step),
             data_iterator=data_iterator,
@@ -1267,17 +1252,7 @@ def train_one_step(
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
     valid_step = True
-    if os.environ.get("RELAX_CHUNKFLOW_GRAD_ROLLOUTS"):
-        from relax.backends.megatron.chunkflow.diagnostics import capture_gradients
-
-        capture_gradients(model, rollout_id, step_id)
-    if os.environ.get("RELAX_CHUNKFLOW_UPDATE_TRACE") == "1":
-        from relax.backends.megatron.chunkflow.update_diagnostics import trace_update
-
-        with trace_update(model, optimizer, rollout_id, step_id):
-            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-    else:
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
@@ -1510,14 +1485,8 @@ def train(
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
-        diagnostic_context = nullcontext()
-        if os.environ.get("RELAX_CHUNKFLOW_DIAGNOSTIC_DIR"):
-            from relax.backends.megatron.chunkflow.diagnostics import trace_gdn_calls
-
-            diagnostic_context = trace_gdn_calls(model, rollout_id)
         # Run training step.
         with (
-            diagnostic_context,
             timer(f"train_micro_batch_{step_id}", keep=False),
             profile_train_step(args, rollout_id, step_id, model, optimizer, config),
         ):

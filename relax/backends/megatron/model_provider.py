@@ -213,24 +213,6 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
-    from .moe_chunk_optimizations import install as install_moe_chunk_optimizations
-
-    install_moe_chunk_optimizations(
-        os.environ.get("RELAX_MOE_CHUNK_MODE", "off"), os.environ.get("RELAX_MOE_METADATA_MODE", "off")
-    )
-    metadata_mode = os.environ.get("RELAX_MOE_METADATA_MODE", "off")
-    if metadata_mode != "off":
-        from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
-
-        if metadata_mode not in ("a", "b"):
-            raise ValueError("RELAX_MOE_METADATA_MODE must be off, a or b")
-        if getattr(MoEAlltoAllTokenDispatcher, "_relax_moe_metadata_patch_version", None) != 1:
-            raise RuntimeError(
-                "Install the MoE metadata patch on every training node with "
-                "scripts/tools/apply_moe_metadata_patch.py before enabling A/B"
-            )
-        if args.moe_token_dispatcher_type != "alltoall":
-            raise ValueError("MoE metadata A/B requires the alltoall dispatcher")
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 

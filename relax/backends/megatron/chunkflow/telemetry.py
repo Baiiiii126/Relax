@@ -59,8 +59,6 @@ def summarize_plan(
 @dataclass
 class StepPlanTelemetry:
     plans: list[PlanTelemetry] = field(default_factory=list)
-    windows: list[ModelPlan] = field(default_factory=list)
-    pooled_units: int = 0
 
     def add(self, plan: PlanTelemetry) -> None:
         self.plans.append(plan)
@@ -79,24 +77,9 @@ class StepPlanTelemetry:
             "unit_padded_rows": sum(plan.unit_padded_rows for plan in self.plans),
             "recompute_units": sum(plan.recompute_units for plan in self.plans),
         }
-        if self.windows:
-            from relax.backends.megatron.chunkflow.tail_pool import peak_live_rows
-
-            units = sum(len(p.rows) for p in self.windows)
-            metrics.update(
-                tail_pool_enabled=1,
-                unpooled_units=metrics["num_units"],
-                tail_pool_saved_units=metrics["num_units"] - units,
-                tail_pool_pooled_units=self.pooled_units,
-                num_units=units,
-                unit_padded_rows=sum(sum(p.rows.values()) for p in self.windows),
-                window_count=len(self.windows),
-                max_warmup_units=max(max(p.warmups) for p in self.windows),
-                peak_live_activation_rows=max(max(peak_live_rows(p)) for p in self.windows),
-            )
         if simulate_schedule:
             started = time.perf_counter()
-            prediction = predict_step(self.plans, pp_size, executed_windows=self.windows or None)
+            prediction = predict_step(self.plans, pp_size)
             metrics.update(
                 {
                     "schedule_model_baseline_makespan": prediction["baseline"]["makespan"],
