@@ -52,6 +52,13 @@ try:
         chunk_size = _chunk_size()
         if chunk_size > 0:
             _install_chunkflow(model, chunk_size)
+        if (
+            os.environ.get("RELAX_MOE_EXPERT_BACKEND", "te") != "te"
+            or os.environ.get("RELAX_MOE_DISPATCH_OVERLAP", "0") != "0"
+        ):
+            from relax.backends.megatron.chunkflow.expert_adapter import install
+
+            install(model)
 
     _mp._install_cp_probe = _install_cp_probe_with_chunkflow
     logger.info(

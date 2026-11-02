@@ -28,6 +28,40 @@ class _StepProfile:
         )
         self.restore = ExitStack()
         self.patched: set[tuple[int, str]] = set()
+        self.route_limit = int(os.environ.get("RELAX_MOE_CAPTURE_LIMIT", "0"))
+        if self.route_limit < 0:
+            raise ValueError("RELAX_MOE_CAPTURE_LIMIT must be nonnegative")
+        self.routes: list[tuple[dict, Any, Any]] = []
+
+    def capture_routes(self, dispatcher: Any, layer: str) -> None:
+        if not self.route_limit or not callable(getattr(dispatcher, "dispatch_postprocess", None)):
+            return
+        original = dispatcher.dispatch_postprocess
+
+        @wraps(original)
+        def measured(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            if len(self.routes) < self.route_limit:
+                x, counts, _probs = result
+                event = None
+                if counts.is_cuda:
+                    snapshot = torch.empty(counts.shape, dtype=counts.dtype, device="cpu", pin_memory=True)
+                    snapshot.copy_(counts.detach(), non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream(counts.device))
+                else:
+                    snapshot = counts.detach().clone()
+                self.routes.append(
+                    (
+                        {"layer": layer, "call": len(self.routes), "rows": x.shape[0], "hidden": x.shape[-1]},
+                        snapshot,
+                        event,
+                    )
+                )
+            return result
+
+        dispatcher.dispatch_postprocess = measured
+        self.restore.callback(setattr, dispatcher, "dispatch_postprocess", original)
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -111,8 +145,8 @@ class _StepProfile:
                     if getattr(hook, "__name__", "") == "param_copy_back_gpu_hook":
                         cpu._optimizer_step_post_hooks[key] = self.wrap_call(hook, "offload.params_h2d")
                         self.restore.callback(cpu._optimizer_step_post_hooks.__setitem__, key, hook)
-        for model in models:
-            for module in model.modules():
+        for model_index, model in enumerate(models):
+            for module_name, module in model.named_modules():
                 names = {cls.__name__ for cls in type(module).__mro__}
                 if "GatedDeltaNet" in names:
                     self.wrap(module, "_forward_compute", "model.gdn_compute")
@@ -131,6 +165,7 @@ class _StepProfile:
                         "_maybe_dtoh_and_synchronize",
                     ):
                         self.wrap(dispatcher, method, f"model.moe.{method}")
+                    self.capture_routes(dispatcher, f"{model_index}:{module_name}")
                 elif any(name.endswith("SelfAttention") for name in names):
                     self.wrap(module, "forward", "model.attention_forward")
 
@@ -245,6 +280,24 @@ def profile_train_step(
     rank = _get_rank_tag()
     folder = Path(_get_train_trace_dir(args))
     folder.mkdir(parents=True, exist_ok=True)
+    if profile.routes:
+        with (folder / f"expert_counts_{rank}.jsonl").open("a") as stream:
+            for metadata, counts, event in profile.routes:
+                if event is not None:
+                    event.synchronize()
+                stream.write(
+                    json.dumps(
+                        {
+                            **metadata,
+                            "counts": counts.tolist(),
+                            "rank": rank,
+                            "rollout_id": rollout_id,
+                            "step_id": step_id,
+                            "arm": "chunkflow" if getattr(args, "use_chunkflow", False) else "baseline",
+                        }
+                    )
+                    + "\n"
+                )
     row = {
         "rollout_id": rollout_id,
         "step_id": step_id,

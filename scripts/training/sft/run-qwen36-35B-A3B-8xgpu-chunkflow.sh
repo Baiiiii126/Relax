@@ -26,6 +26,24 @@ LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 GDN_RECOMPUTE="${GDN_RECOMPUTE:-1}"
 CPU_OPTIMIZER_OVERLAP="${CPU_OPTIMIZER_OVERLAP:-1}"
 MOE_SHARED_EXPERT_OVERLAP="${MOE_SHARED_EXPERT_OVERLAP:-0}"
+export RELAX_MOE_EXPERT_BACKEND="${RELAX_MOE_EXPERT_BACKEND:-te}"
+export RELAX_MOE_DISPATCH_OVERLAP="${RELAX_MOE_DISPATCH_OVERLAP:-0}"
+export RELAX_MOE_CAPTURE_LIMIT="${RELAX_MOE_CAPTURE_LIMIT:-0}"
+case "${RELAX_MOE_EXPERT_BACKEND}" in
+   te|tiles128|tiles256|mixed) ;;
+   *) echo "ERROR: unknown RELAX_MOE_EXPERT_BACKEND" >&2; exit 2 ;;
+esac
+case "${RELAX_MOE_DISPATCH_OVERLAP}" in
+   0|1) ;;
+   *) echo "ERROR: RELAX_MOE_DISPATCH_OVERLAP must be 0 or 1" >&2; exit 2 ;;
+esac
+if ! [[ "${RELAX_MOE_CAPTURE_LIMIT}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+   echo "ERROR: RELAX_MOE_CAPTURE_LIMIT must be nonnegative" >&2; exit 2
+fi
+if [ "${RELAX_MOE_DISPATCH_OVERLAP}" = 1 ] &&
+   { [ "${RELAX_MOE_EXPERT_BACKEND}" = te ] || [ "${EP_SIZE}" != 2 ] || [ "${MOE_SHARED_EXPERT_OVERLAP}" != 0 ]; }; then
+   echo "ERROR: local-first dispatch needs expert tiles, EP2 and no shared-expert overlap" >&2; exit 2
+fi
 export RELAX_CHUNKFLOW_EXECUTION_OPT="${RELAX_CHUNKFLOW_EXECUTION_OPT:-0}"
 case "${RELAX_CHUNKFLOW_EXECUTION_OPT}" in
    0|1) ;;
@@ -147,7 +165,8 @@ for key in ("RELAX_MOE_CHUNK_MODE", "RELAX_CHUNKFLOW_TAIL_POOL"):
 for key in ("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "RELAX_CHUNKFLOW_FLASH_BACKEND",
             "RELAX_CHUNKFLOW_SCHEDULE_ANALYSIS", "RELAX_CHUNKFLOW_TELEMETRY_LOCAL_ONLY",
             "RELAX_CHUNKFLOW_PARENT_WINDOW", "RELAX_TRAIN_PROFILE_RECORD_SHAPES",
-            "RELAX_CHUNKFLOW_EXECUTION_OPT"):
+            "RELAX_CHUNKFLOW_EXECUTION_OPT", "RELAX_MOE_EXPERT_BACKEND",
+            "RELAX_MOE_DISPATCH_OVERLAP", "RELAX_MOE_CAPTURE_LIMIT"):
     env.setdefault("env_vars", {})[key] = os.environ[key]
 if os.environ.get("RELAX_TRAIN_PROFILE_DIR"):
     env.setdefault("env_vars", {})["RELAX_TRAIN_PROFILE_DIR"] = os.environ["RELAX_TRAIN_PROFILE_DIR"]
@@ -226,6 +245,7 @@ echo "MODE=${MODE} TP=2 PP=4 CP=1 EP=${EP_SIZE} GBS=${GBS} STEPS=${NUM_ROLLOUT} 
 echo "LR=${LEARNING_RATE} GDN_RECOMPUTE=${GDN_RECOMPUTE} CPU_OPTIMIZER_OVERLAP=${CPU_OPTIMIZER_OVERLAP}"
 echo "MOE_SHARED_EXPERT_OVERLAP=${MOE_SHARED_EXPERT_OVERLAP}"
 echo "RELAX_CHUNKFLOW_EXECUTION_OPT=${RELAX_CHUNKFLOW_EXECUTION_OPT}"
+echo "EXPERT_BACKEND=${RELAX_MOE_EXPERT_BACKEND} DISPATCH_OVERLAP=${RELAX_MOE_DISPATCH_OVERLAP} CAPTURE_LIMIT=${RELAX_MOE_CAPTURE_LIMIT}"
 echo "PARENT_WINDOW=${RELAX_CHUNKFLOW_PARENT_WINDOW}"
 echo "LOG_FILE=${LOG_FILE}"
 if [ "${CHUNKFLOW_PROFILE:-0}" = 1 ]; then
@@ -278,6 +298,10 @@ if [ -n "${memory_sampler_pid}" ]; then
 fi
 
 if [ "${RAY_NO_WAIT:-0}" != 1 ]; then
+   if [ "${RELAX_MOE_EXPERT_BACKEND}" != te ] &&
+      ! grep -Eq "Installed expert backend=${RELAX_MOE_EXPERT_BACKEND} on [1-9][0-9]* MoE layers" "${LOG_FILE}"; then
+      echo "ERROR: requested expert backend was not installed; inspect ${LOG_FILE}" >&2; exit 1
+   fi
    if ! grep -q "Actor training completed step $((NUM_ROLLOUT - 1))/${NUM_ROLLOUT}" "${LOG_FILE}"; then
       echo "ERROR: expected training steps not completed; inspect ${LOG_FILE}" >&2
       exit 1

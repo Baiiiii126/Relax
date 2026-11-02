@@ -42,17 +42,51 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--experts", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--ffn", type=int, default=512)
-    parser.add_argument("--block-m", type=int, nargs="+", choices=(32, 64, 128, 256), default=[128, 256])
+    parser.add_argument(
+        "--block-m",
+        type=int,
+        nargs="+",
+        choices=(0, 32, 64, 128, 256),
+        default=[128, 256, 0],
+        help="0 selects mixed 256/128/64 tiles within one kernel",
+    )
     parser.add_argument("--distribution", choices=("balanced", "skewed"), default="balanced")
+    parser.add_argument("--counts-file", type=Path, help="Replay a profiler expert_counts_*.jsonl record")
+    parser.add_argument("--counts-record", type=int, default=0, help="Zero-based record containing counts")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--steps", type=int, default=30)
     args = parser.parse_args()
     if min(args.rows, args.experts, args.hidden, args.ffn, args.warmup, args.steps) <= 0:
         parser.error("dimensions, warmup and steps must be positive")
+    if args.counts_record < 0 or (args.counts_record and args.counts_file is None):
+        parser.error("counts-record requires counts-file and must be nonnegative")
     return args
 
 
+def read_counts(path: Path, index: int) -> dict:
+    with path.open() as stream:
+        for line in stream:
+            record = json.loads(line)
+            if "counts" not in record:
+                continue
+            if index:
+                index -= 1
+                continue
+            counts = record["counts"]
+            if not isinstance(counts, list) or not counts or any(type(n) is not int or n < 0 for n in counts):
+                raise ValueError("Replay counts must be a nonempty list of nonnegative integers")
+            if not sum(counts) or record.get("rows", sum(counts)) != sum(counts):
+                raise ValueError("Replay counts must sum to a positive row count matching the record")
+            return record
+    raise ValueError(f"Requested counts record is absent in {path}")
+
+
 def run(args: argparse.Namespace) -> None:
+    replay = read_counts(args.counts_file, args.counts_record) if args.counts_file else None
+    if replay:
+        if replay.get("hidden", args.hidden) != args.hidden:
+            raise ValueError("--hidden must match the captured layer")
+        args.experts, args.rows = len(replay["counts"]), sum(replay["counts"])
     import torch
 
     rank = int(os.environ.get("RANK", "0"))
@@ -88,11 +122,22 @@ def run(args: argparse.Namespace) -> None:
             "reserved_scope": "Cumulative allocator cache across arms; not an arm-to-arm memory comparison",
         }
     )
-    proportions = [1 if args.distribution == "balanced" else (e + 1) ** 2 for e in range(args.experts)]
-    counts = [args.rows * p // sum(proportions) for p in proportions]
-    for e in range(args.rows - sum(counts)):
-        counts[e % args.experts] += 1
-    emit({"event": "expert_counts", "distribution": args.distribution, "counts": counts})
+    if replay:
+        counts = replay["counts"]
+    else:
+        proportions = [1 if args.distribution == "balanced" else (e + 1) ** 2 for e in range(args.experts)]
+        counts = [args.rows * p // sum(proportions) for p in proportions]
+        for e in range(args.rows - sum(counts)):
+            counts[e % args.experts] += 1
+    emit(
+        {
+            "event": "expert_counts",
+            "distribution": "captured" if replay else args.distribution,
+            "counts": counts,
+            "capture": replay,
+            "replay_scope": "real counts with synthetic operands" if replay else "synthetic counts and operands",
+        }
+    )
     offsets = tiles.make_offsets(torch.tensor(counts, device="cuda", dtype=torch.int64))
     x = (torch.randn(args.rows, args.hidden, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
     probs = torch.rand(args.rows, device="cuda", dtype=torch.float64, requires_grad=True)
@@ -143,7 +188,7 @@ def run(args: argparse.Namespace) -> None:
 
     reference = None
     for block_m in [None, *dict.fromkeys(args.block_m)]:
-        arm = "te" if block_m is None else f"gpu_tiles_m{block_m}"
+        arm = "te" if block_m is None else ("gpu_tiles_mixed" if block_m == 0 else f"gpu_tiles_m{block_m}")
         emit({"event": "arm_start", "arm": arm})
         for grad in grads:
             grad.zero_()

@@ -8,8 +8,10 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import json
 import math
 import re
+from datetime import datetime
 from pathlib import Path
 
 
@@ -28,6 +30,8 @@ CHUNK_METRICS = tuple(
 
 def read_rows(path: Path) -> dict[int, dict]:
     rows = {}
+    if not path.exists():
+        return rows
     with path.open(errors="replace") as stream:
         for line in stream:
             line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
@@ -44,6 +48,63 @@ def read_rows(path: Path) -> dict[int, dict]:
 
 def number(value: object) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def memory_report(folder: Path, arms: tuple[str, str], prefix: str) -> list[str]:
+    records = []
+    lines = [
+        "",
+        "## Memory",
+        "",
+        "Peaks are per rank/GPU, not sums across GPUs. Device values are 250 ms samples, including startup.",
+        "Missing memory files mean unmeasured, not zero. Allocator and device measurements have different scopes.",
+        "",
+        "| Arm | Allocator ranks | Max allocated GiB | Max reserved GiB | Sampled GPUs | Max device GiB |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for arm in arms:
+        peaks = {}
+        for path in sorted((folder / arm / "memory").glob("memory_*.jsonl")):
+            for line in path.read_text().splitlines():
+                row = json.loads(line)
+                rank = row["rank"]
+                peak = peaks.setdefault(rank, [0, 0])
+                for i, key in enumerate(("peak_allocated", "peak_reserved")):
+                    peak[i] = max(peak[i], row[key], row.get("before", {}).get(f"{key}_since_previous_reset", 0))
+        for rank, (allocated, reserved) in peaks.items():
+            records.append(
+                {
+                    "arm": arm,
+                    "kind": "allocator",
+                    "rank_or_gpu": rank,
+                    "peak_allocated_bytes": allocated,
+                    "peak_reserved_bytes": reserved,
+                }
+            )
+        devices = {}
+        device_path = folder / arm / "device-memory.csv"
+        start_path, end_path = folder / arm / "device-memory.start", folder / arm / "device-memory.end"
+        if device_path.exists() and start_path.exists() and end_path.exists():
+            start, end = float(start_path.read_text()), float(end_path.read_text())
+            with device_path.open() as stream:
+                for timestamp, gpu, mib in csv.reader(stream):
+                    sample = datetime.strptime(timestamp.strip(), "%Y/%m/%d %H:%M:%S.%f").timestamp()
+                    if start <= sample <= end:
+                        gpu = gpu.strip()
+                        devices[gpu] = max(devices.get(gpu, 0), float(mib) * 1024**2)
+            for gpu, used in devices.items():
+                records.append({"arm": arm, "kind": "device_sample", "rank_or_gpu": gpu, "peak_device_bytes": used})
+        allocated = f"{max(p[0] for p in peaks.values()) / 1024**3:.4f}" if peaks else "unmeasured"
+        reserved = f"{max(p[1] for p in peaks.values()) / 1024**3:.4f}" if peaks else "unmeasured"
+        device = f"{max(devices.values()) / 1024**3:.4f}" if devices else "unmeasured"
+        lines.append(f"| {arm} | {len(peaks)} | {allocated} | {reserved} | {len(devices)} | {device} |")
+    with (folder / f"{prefix}memory.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(
+            stream, ["arm", "kind", "rank_or_gpu", "peak_allocated_bytes", "peak_reserved_bytes", "peak_device_bytes"]
+        )
+        writer.writeheader()
+        writer.writerows(records)
+    return lines
 
 
 def summarize(
@@ -106,8 +167,9 @@ def summarize(
         "",
     ]
     for arm in (baseline_arm, chunkflow_arm):
+        log = folder / f"{arm}.log"
         urls = sorted(
-            set(re.findall(r"url:\s*(https?://[^\s\x1b]+)", (folder / f"{arm}.log").read_text(errors="replace")))
+            set(re.findall(r"url:\s*(https?://[^\s\x1b]+)", log.read_text(errors="replace") if log.exists() else ""))
         )
         lines.extend(f"- {arm}: {url}" for url in urls)
         if not urls:
@@ -171,6 +233,7 @@ def summarize(
             lines.append(
                 f"| {start} | {metric} | {len(valid)} | {bt / len(valid):.4f} | {ct / len(valid):.4f} | {bt / ct:.4f}x | {bt / ct - 1:+.2%} | {1 - ct / bt:+.2%} |"
             )
+    lines.extend(memory_report(folder, (baseline_arm, chunkflow_arm), output_prefix))
     (folder / f"{output_prefix}diagnosis.md").write_text("\n".join(lines) + "\n")
     return not issues
 
@@ -179,10 +242,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
     parser.add_argument("--expected-steps", type=int)
-    parser.add_argument("--baseline-arm", choices=("baseline", "chunkflow"), default="baseline")
+    parser.add_argument("--baseline-arm", choices=("baseline", "chunkflow", "expert_baseline"), default="baseline")
     parser.add_argument(
         "--chunkflow-arm",
-        choices=("chunkflow", "chunkflow_exec"),
+        choices=("chunkflow", "chunkflow_exec", "expert_chunkflow"),
         default="chunkflow",
     )
     parser.add_argument(
@@ -191,6 +254,8 @@ if __name__ == "__main__":
             "",
             "execution-vs-baseline-",
             "execution-vs-chunkflow-",
+            "experts-",
+            "production-",
         ),
         default="",
     )

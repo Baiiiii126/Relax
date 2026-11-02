@@ -100,6 +100,25 @@ def test_profile_directory_can_use_shared_storage(tmp_path, monkeypatch):
     assert profile_utils._get_train_trace_dir(args) == str(tmp_path)
 
 
+def test_route_capture_is_bounded_copied_and_restored(monkeypatch):
+    monkeypatch.setenv("RELAX_MOE_CAPTURE_LIMIT", "2")
+    counts = torch.tensor([0, 3, 1])
+    original = lambda: (torch.empty(4, 8), counts, torch.empty(4))
+    dispatcher = SimpleNamespace(dispatch_postprocess=original)
+    profile = profiling._StepProfile()
+    with profile.restore:
+        profile.capture_routes(dispatcher, "layer0")
+        for _ in range(5):
+            dispatcher.dispatch_postprocess()
+        counts.zero_()
+    assert dispatcher.dispatch_postprocess is original
+    assert len(profile.routes) == 2
+    for metadata, captured, event in profile.routes:
+        assert captured.tolist() == [0, 3, 1]
+        assert metadata["rows"] == 4 and metadata["hidden"] == 8
+        assert event is None
+
+
 @pytest.mark.parametrize("record_shapes", [None, "0", "1"])
 def test_profile_shape_recording_can_be_disabled(monkeypatch, record_shapes):
     monkeypatch.delenv("RELAX_TRAIN_PROFILE_RECORD_SHAPES", raising=False)
