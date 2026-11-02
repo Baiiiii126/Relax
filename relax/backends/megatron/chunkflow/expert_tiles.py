@@ -76,8 +76,8 @@ def _linear(
         inputs, outputs = outputs, inputs
     if experts == 0 or inputs == 0 or outputs == 0 or x.shape[1] != inputs or weights.device != x.device:
         raise ValueError("weights [experts, out, in] do not match the input")
-    if block_m not in (32, 64, 128):
-        raise ValueError("block_m must be 32, 64 or 128")
+    if block_m not in (32, 64, 128, 256):
+        raise ValueError("block_m must be 32, 64, 128 or 256")
     _check_offsets(offsets, experts, x.device)
     y = torch.empty((x.shape[0], outputs), device=x.device, dtype=x.dtype)
     if x.shape[0]:

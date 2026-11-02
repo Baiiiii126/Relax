@@ -63,9 +63,15 @@ def _reference(x, w, dy, counts):
 
 @pytest.mark.parametrize(
     "counts",
-    [[0, 1, 63, 64, 65, 129, 0], [0, 257, 0], [0, 0, 0], [(e * 17) % 131 if e % 5 == 0 else 0 for e in range(128)]],
+    [
+        [0, 1, 63, 64, 65, 129, 0],
+        [0, 257, 0],
+        [0, 0, 0],
+        [(e * 17) % 131 if e % 5 == 0 else 0 for e in range(128)],
+        [0, 255, 256, 257, 511, 512, 513, 0],
+    ],
 )
-@pytest.mark.parametrize("block_m", [32, 64, 128])
+@pytest.mark.parametrize("block_m", [32, 64, 128, 256])
 def test_expert_tiles_forward_and_backward_with_empty_experts_and_tails(tiles, counts, block_m):
     x, w, dy = _inputs(counts, 79, 113)
     offsets = tiles.make_offsets(torch.tensor(counts, dtype=torch.int64, device="cuda"))
@@ -87,12 +93,13 @@ def test_expert_tiles_forward_and_backward_with_empty_experts_and_tails(tiles, c
 
 
 @pytest.mark.parametrize("inputs,outputs", [(2048, 1024), (512, 2048)])
-def test_expert_tiles_qwen_expert_shapes(tiles, inputs, outputs):
-    counts = [0, 1, 63, 129]
+@pytest.mark.parametrize("block_m", [128, 256])
+def test_expert_tiles_qwen_expert_shapes(tiles, inputs, outputs, block_m):
+    counts = [0, 1, 255, 257]
     x, w, dy = _inputs(counts, inputs, outputs)
     offsets = tiles.make_offsets(torch.tensor(counts, device="cuda"))
-    actual_y = tiles.forward(x, w, offsets)
-    actual_dx = tiles.backward_input(dy, w, offsets)
+    actual_y = tiles.forward(x, w, offsets, block_m=block_m)
+    actual_dx = tiles.backward_input(dy, w, offsets, block_m=block_m)
     expected_y = torch.cat([xe @ we.T for xe, we in zip(x.split(counts), w.unbind())])
     expected_dx = torch.cat([dye @ we for dye, we in zip(dy.split(counts), w.unbind())])
     torch.testing.assert_close(actual_y, expected_y, atol=0.01, rtol=0.02)
@@ -116,25 +123,26 @@ def test_expert_tiles_accumulates_fp32_without_changing_empty_expert_gradients(t
     torch.testing.assert_close(grad, expected, atol=0, rtol=0)
 
 
-def test_expert_tiles_counts_are_read_on_device_during_graph_replay(tiles):
-    counts = torch.tensor([64, 0, 64], device="cuda", dtype=torch.int64)
-    x, w, dy = _inputs([64, 0, 64], 64, 64)
+@pytest.mark.parametrize("block_m", [64, 256])
+def test_expert_tiles_counts_are_read_on_device_during_graph_replay(tiles, block_m):
+    counts = torch.tensor([256, 0, 256], device="cuda", dtype=torch.int64)
+    x, w, dy = _inputs([256, 0, 256], 64, 64)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
             offsets = tiles.make_offsets(counts)
-            tiles.forward(x, w, offsets)
-            tiles.backward_input(dy, w, offsets)
+            tiles.forward(x, w, offsets, block_m=block_m)
+            tiles.backward_input(dy, w, offsets, block_m=block_m)
             tiles.backward_weight(x, dy, offsets)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         offsets = tiles.make_offsets(counts)
-        result = tiles.forward(x, w, offsets)
-        dx = tiles.backward_input(dy, w, offsets)
+        result = tiles.forward(x, w, offsets, block_m=block_m)
+        dx = tiles.backward_input(dy, w, offsets, block_m=block_m)
         dw = tiles.backward_weight(x, dy, offsets)
-    for layout in ([0, 128, 0], [1, 63, 64], [64, 0, 64]):
+    for layout in ([0, 512, 0], [1, 255, 256], [256, 0, 256]):
         counts.copy_(torch.tensor(layout, device="cuda"))
         graph.replay()
         expected_y, expected_dx, expected_dw = _reference(x, w, dy, layout)
@@ -150,7 +158,8 @@ def _activation(h, probs):
 
 
 @pytest.mark.parametrize("use_mcore_activation", [False, True])
-def test_expert_tiles_mlp_preserves_probability_gradients_and_reverse_backward(tiles, use_mcore_activation):
+@pytest.mark.parametrize("block_m", [64, 256])
+def test_expert_tiles_mlp_preserves_probability_gradients_and_reverse_backward(tiles, use_mcore_activation, block_m):
     activation = _activation
     if use_mcore_activation:
         fused = pytest.importorskip("megatron.core.fusions.fused_bias_swiglu")
@@ -158,18 +167,18 @@ def test_expert_tiles_mlp_preserves_probability_gradients_and_reverse_backward(t
         def activation(h, probs):
             return fused.weighted_bias_swiglu_impl(h, None, probs[:, None], False, None)
 
-    x, w1, _ = _inputs([0, 67, 130], 64, 128)
+    x, w1, _ = _inputs([0, 67, 260], 64, 128)
     w2 = torch.randn(3, 64, 64, device="cuda", dtype=torch.bfloat16) * 0.1
     w1.requires_grad_()
     w2.requires_grad_()
     main = (torch.zeros_like(w1, dtype=torch.float32), torch.zeros_like(w2, dtype=torch.float32))
     expected_main = [torch.zeros_like(w1, dtype=torch.float32), torch.zeros_like(w2, dtype=torch.float32)]
     contexts = []
-    for counts in ([0, 67, 130], [64, 1, 132]):
+    for counts in ([0, 67, 260], [64, 1, 262]):
         xi = x.clone().requires_grad_()
         probs = torch.rand(x.shape[0], device="cuda", dtype=torch.float64, requires_grad=True)
         offsets = tiles.make_offsets(torch.tensor(counts, device="cuda"))
-        actual = tiles.expert_mlp(xi, w1, w2, offsets, probs, activation, main_grads=main)
+        actual = tiles.expert_mlp(xi, w1, w2, offsets, probs, activation, main_grads=main, block_m=block_m)
         xr, pr = xi.detach().clone().requires_grad_(), probs.detach().clone().requires_grad_()
         wr1, wr2 = w1.detach().clone().requires_grad_(), w2.detach().clone().requires_grad_()
         fc1_inputs, fc1_outputs, fc2_inputs = [], [], []

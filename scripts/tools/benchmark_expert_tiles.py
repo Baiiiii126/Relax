@@ -42,7 +42,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--experts", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--ffn", type=int, default=512)
-    parser.add_argument("--block-m", type=int, nargs="+", choices=(32, 64, 128), default=[64, 128])
+    parser.add_argument("--block-m", type=int, nargs="+", choices=(32, 64, 128, 256), default=[128, 256])
     parser.add_argument("--distribution", choices=("balanced", "skewed"), default="balanced")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--steps", type=int, default=30)
@@ -92,6 +92,7 @@ def run(args: argparse.Namespace) -> None:
     counts = [args.rows * p // sum(proportions) for p in proportions]
     for e in range(args.rows - sum(counts)):
         counts[e % args.experts] += 1
+    emit({"event": "expert_counts", "distribution": args.distribution, "counts": counts})
     offsets = tiles.make_offsets(torch.tensor(counts, device="cuda", dtype=torch.int64))
     x = (torch.randn(args.rows, args.hidden, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
     probs = torch.rand(args.rows, device="cuda", dtype=torch.float64, requires_grad=True)
