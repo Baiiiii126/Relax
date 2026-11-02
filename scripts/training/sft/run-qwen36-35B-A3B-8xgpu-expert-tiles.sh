@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Matched TE/tiles x baseline/ChunkFlow; no precision or performance gates.
+# Original baseline vs optimized ChunkFlow; no precision or performance gates.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -44,11 +44,12 @@ RESULT_DIR="${QWEN36_RESULT_DIR:-$(pwd)/analysis/${RUN_ID}}"
 if [ -e "${RESULT_DIR}" ]; then echo "ERROR: result directory exists: ${RESULT_DIR}" >&2; exit 2; fi
 mkdir -p "${RESULT_DIR}" analysis
 printf '%s\n' "${RESULT_DIR}" > analysis/expert-tiles-latest-path.txt
-ARMS=(baseline chunkflow expert_baseline expert_chunkflow)
-case "${EXPERIMENT_ARMS:-all}" in
-   all) ;;
+ARMS=(baseline expert_chunkflow)
+case "${EXPERIMENT_ARMS:-production}" in
+   production) ;;
+   all) ARMS=(baseline chunkflow expert_baseline expert_chunkflow) ;;
    optimized) ARMS=(expert_baseline expert_chunkflow) ;;
-   *) echo "ERROR: EXPERIMENT_ARMS must be all or optimized" >&2; exit 2 ;;
+   *) echo "ERROR: EXPERIMENT_ARMS must be production, all or optimized" >&2; exit 2 ;;
 esac
 cat > "${RESULT_DIR}/comparison.md" <<REPORT
 # Expert tiles training comparison
@@ -58,7 +59,7 @@ Arms: ${ARMS[*]}; steps=${NUM_ROLLOUT}; seed=${TRAIN_SEED}.
 TP2/PP4/EP2/ETP1; GBS8; sequence=32768; chunk=8192.
 All arms: BF16 / FP32 main_grad / FP64 router; GDN recompute=${GDN_RECOMPUTE}.
 CPU optimizer offload and overlap on; shared expert overlap off.
-ChunkFlow execution patch=${RELAX_CHUNKFLOW_EXECUTION_OPT} in both ChunkFlow arms.
+ChunkFlow execution patch=${RELAX_CHUNKFLOW_EXECUTION_OPT} in the selected ChunkFlow arms.
 Expert arms: backend=${EXPERT_BACKEND}; local-first dispatch=${DISPATCH_OVERLAP}.
 No numerical, speed or memory gates. Missing steps or failed installation are failures.
 Profile=${CHUNKFLOW_PROFILE}; capture limit=${RELAX_MOE_CAPTURE_LIMIT} per profiled step/rank.
@@ -94,10 +95,14 @@ for arm in "${ARMS[@]}"; do
 done
 if [ "${MODE}" = run ]; then
    REPORT=scripts/training/sft/tools/summarize_qwen36_comparison.py
-   python3 "${REPORT}" "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}" \
-      --baseline-arm expert_baseline --chunkflow-arm expert_chunkflow --output-prefix experts- || failed=1
-   if [ "${EXPERIMENT_ARMS:-all}" = all ]; then
+   if [ "${EXPERIMENT_ARMS:-production}" != production ]; then
+      python3 "${REPORT}" "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}" \
+         --baseline-arm expert_baseline --chunkflow-arm expert_chunkflow --output-prefix experts- || failed=1
+   fi
+   if [ "${EXPERIMENT_ARMS:-production}" = all ]; then
       python3 "${REPORT}" "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}" || failed=1
+   fi
+   if [ "${EXPERIMENT_ARMS:-production}" != optimized ]; then
       python3 "${REPORT}" "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}" \
          --baseline-arm baseline --chunkflow-arm expert_chunkflow --output-prefix production- || failed=1
    fi
