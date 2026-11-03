@@ -20,18 +20,39 @@ if TYPE_CHECKING:
     import torch
 
 
-def make_offsets(counts: torch.Tensor) -> torch.Tensor:
-    """Prefix-sum nonnegative CUDA expert counts without a host scalar read."""
+def _check_counts(counts: torch.Tensor) -> None:
     import torch
 
     if not counts.is_cuda or counts.ndim != 1 or counts.dtype not in (torch.int32, torch.int64):
         raise ValueError("counts must be a one-dimensional CUDA int32/int64 tensor")
     if counts.numel() == 0 or not counts.is_contiguous():
         raise ValueError("counts must be nonempty and contiguous")
+
+
+def make_offsets(counts: torch.Tensor) -> torch.Tensor:
+    """Prefix-sum nonnegative CUDA expert counts without a host scalar read."""
+    import torch
+
+    _check_counts(counts)
     offsets = torch.empty(counts.numel() + 1, dtype=torch.int64, device=counts.device)
     offsets[:1].zero_()
     torch.cumsum(counts, dim=0, dtype=torch.int64, out=offsets[1:])
     return offsets
+
+
+def _make_plan(counts: torch.Tensor, block_m: int, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch
+    import triton
+
+    from . import _expert_tile_kernels as kernels
+
+    _check_counts(counts)
+    if block_m not in (32, 64, 128, 256) or not 0 <= rows <= 2**31 - 1:
+        raise ValueError("Expert tile plans require a fixed block size and int32 row offsets")
+    # Two int32 arrays occupy exactly the previous int64 offsets allocation.
+    metadata = torch.empty((2, counts.numel() + 1), dtype=torch.int32, device=counts.device)
+    kernels.tile_metadata[(1,)](counts, metadata, counts.numel(), block_m, triton.next_power_of_2(counts.numel()))
+    return metadata[0], metadata[1]
 
 
 def _check_tensor(tensor: torch.Tensor, ndim: int, name: str) -> None:
@@ -63,7 +84,12 @@ def _workers(device_index: int) -> int:
 
 
 def _linear(
-    x: torch.Tensor, weights: torch.Tensor, offsets: torch.Tensor, block_m: int, transpose: bool
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    offsets: torch.Tensor,
+    block_m: int,
+    transpose: bool,
+    tile_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     import torch
 
@@ -101,6 +127,7 @@ def _linear(
             64,
             32,
             workers,
+            TILE_OFFSETS=tile_offsets,
             num_warps=4,
             num_stages=3,
         )

@@ -125,24 +125,32 @@ def test_expert_tiles_accumulates_fp32_without_changing_empty_expert_gradients(t
 
 
 @pytest.mark.parametrize("block_m", [0, 64, 256])
-def test_expert_tiles_counts_are_read_on_device_during_graph_replay(tiles, block_m):
+@pytest.mark.parametrize("indexed", [False, True])
+def test_expert_tiles_counts_are_read_on_device_during_graph_replay(tiles, block_m, indexed):
+    if indexed and not block_m:
+        pytest.skip("Tile plans require a fixed row block")
     counts = torch.tensor([256, 0, 256], device="cuda", dtype=torch.int64)
     x, w, dy = _inputs([256, 0, 256], 64, 64)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
+
+    def execute():
+        offsets, plan = (
+            tiles._make_plan(counts, block_m, x.shape[0]) if indexed else (tiles.make_offsets(counts), None)
+        )
+        return (
+            tiles._linear(x, w, offsets, block_m, False, tile_offsets=plan),
+            tiles._linear(dy, w, offsets, block_m, True, tile_offsets=plan),
+            tiles.backward_weight(x, dy, offsets),
+        )
+
     with torch.cuda.stream(stream):
         for _ in range(3):
-            offsets = tiles.make_offsets(counts)
-            tiles.forward(x, w, offsets, block_m=block_m)
-            tiles.backward_input(dy, w, offsets, block_m=block_m)
-            tiles.backward_weight(x, dy, offsets)
+            execute()
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        offsets = tiles.make_offsets(counts)
-        result = tiles.forward(x, w, offsets, block_m=block_m)
-        dx = tiles.backward_input(dy, w, offsets, block_m=block_m)
-        dw = tiles.backward_weight(x, dy, offsets)
+        result, dx, dw = execute()
     for layout in ([0, 512, 0], [1, 255, 256], [256, 0, 256]):
         counts.copy_(torch.tensor(layout, device="cuda"))
         graph.replay()
@@ -150,6 +158,21 @@ def test_expert_tiles_counts_are_read_on_device_during_graph_replay(tiles, block
         torch.testing.assert_close(result, expected_y, atol=0.004, rtol=0.02)
         torch.testing.assert_close(dx, expected_dx, atol=0.004, rtol=0.02)
         torch.testing.assert_close(dw, expected_dw, atol=3e-5, rtol=3e-4)
+
+
+@pytest.mark.parametrize("counts", [[0] * 128, [0] * 63 + [8192] + [0] * 64, [0, 1, 255, 256, 257, 0, 0]])
+def test_expert_indexed_tiles_cover_skew_and_empty_experts_without_larger_metadata(tiles, counts):
+    x, w, dy = _inputs(counts, 79, 113)
+    offsets, plan = tiles._make_plan(torch.tensor(counts, device="cuda"), 256, x.shape[0])
+    assert offsets.untyped_storage().nbytes() == 8 * (len(counts) + 1)
+    assert offsets.untyped_storage().data_ptr() == plan.untyped_storage().data_ptr()
+    expected_y, expected_dx, expected_dw = _reference(x, w, dy, counts)
+    result = tiles._linear(x, w, offsets, 256, False, tile_offsets=plan)
+    dx = tiles._linear(dy, w, offsets, 256, True, tile_offsets=plan)
+    dw = tiles.backward_weight(x, dy, offsets)
+    torch.testing.assert_close(result, expected_y, atol=0.004, rtol=0.02)
+    torch.testing.assert_close(dx, expected_dx, atol=0.004, rtol=0.02)
+    torch.testing.assert_close(dw, expected_dw, atol=3e-5, rtol=3e-4)
 
 
 def _activation(h, probs):
@@ -264,7 +287,7 @@ def test_expert_adapter_preserves_parameters_and_reverse_backward_hooks(adapter,
     for counts in ([0, 63, 256, 257], [65, 0, 258, 253]):
         x = (torch.randn(sum(counts), 73, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
         dy = torch.randn(sum(counts), 85, device="cuda", dtype=torch.bfloat16) * 0.1
-        y, bias = state.forward(x, adapter._DeviceCounts(torch.tensor(counts, device="cuda")))
+        y, bias = state.forward(x, adapter._DeviceCounts(torch.tensor(counts, device="cuda"), block_m, x.shape[0]))
         reference = torch.cat([xe @ we.T for xe, we in zip(x.split(counts), weights)])
         torch.testing.assert_close(y, reference, atol=0.004, rtol=0.02)
         assert bias is None
@@ -285,7 +308,7 @@ def test_expert_adapter_preserves_parameters_and_reverse_backward_hooks(adapter,
         weight.data = weight.detach().clone()
         weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
     x, _, dy, counts = pending[0]
-    y, _ = state.forward(x.detach(), adapter._DeviceCounts(torch.tensor(counts, device="cuda")))
+    y, _ = state.forward(x.detach(), adapter._DeviceCounts(torch.tensor(counts, device="cuda"), block_m, x.shape[0]))
     y.backward(dy)
     for weight, xe, de in zip(weights, x.split(counts), dy.split(counts)):
         torch.testing.assert_close(weight.main_grad, de.float().T @ xe.float(), atol=3e-5, rtol=3e-4)
@@ -411,7 +434,71 @@ def test_expert_transport_matches_serial_dispatch_and_reverse_backward(tiles, ad
     current.wait_stream(stream)
 
 
-def test_expert_adapter_real_ddp_hooks_and_master_optimizer(adapter, ep_group):
+@pytest.mark.parametrize("layout", ["local", "remote", "one_way"])
+def test_expert_compact_metadata_matches_real_dispatcher_and_reverse_backward(adapter, ep_group, layout, monkeypatch):
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    monkeypatch.setenv("RELAX_MOE_METADATA_MODE", "off")
+    parallel_state.initialize_model_parallel(expert_model_parallel_size=2, expert_tensor_parallel_size=1)
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups(["ep", "expt_tp", "tp_ep"])
+        rank = dist.get_rank(ep_group)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=2,
+            ffn_hidden_size=64,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            moe_permute_fusion=True,
+            moe_router_dtype="fp64",
+        )
+        dispatchers = [
+            MoEAlltoAllTokenDispatcher(4, list(range(rank * 4, rank * 4 + 4)), config, pg) for _ in range(2)
+        ]
+        assert adapter._install_compact_metadata(dispatchers[1])
+
+        def forward(owner, x, p, routing):
+            h, probabilities = owner.dispatch_preprocess(x, routing, p)
+            h, probabilities = owner.token_dispatch(h, probabilities)
+            h, counts, probabilities = owner.dispatch_postprocess(h, probabilities)
+            h = (h * probabilities[:, None]).to(x.dtype)
+            result = owner.combine_postprocess(owner.token_combine(owner.combine_preprocess(h)))
+            return result, counts
+
+        pending = []
+        torch.manual_seed(712 + rank)
+        for invocation in range(2):
+            rows = 5 + 2 * invocation + rank
+            x = (torch.randn(rows, 32, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
+            p = torch.rand(rows, 8, device="cuda", dtype=torch.float64, requires_grad=True)
+            rx, rp = x.detach().clone().requires_grad_(), p.detach().clone().requires_grad_()
+            destination = rank if layout == "local" else 1 - rank if layout == "remote" else 0
+            routing = torch.zeros(rows, 8, dtype=torch.bool, device="cuda")
+            routing[:, destination * 4 + invocation : destination * 4 + invocation + 2] = True
+            expected, _ = forward(dispatchers[0], rx, rp, routing)
+            result, counts = forward(dispatchers[1], x, p, routing)
+            assert counts.is_cuda
+            torch.testing.assert_close(result, expected, atol=0, rtol=0)
+            pending.append((x, p, result, rx, rp, expected))
+        for x, p, result, rx, rp, expected in reversed(pending):
+            dy = torch.randn_like(result)
+            expected.backward(dy)
+            result.backward(dy)
+            torch.testing.assert_close(x.grad, rx.grad, atol=0, rtol=0)
+            torch.testing.assert_close(p.grad, rp.grad, atol=1e-10, rtol=1e-8)
+    finally:
+        parallel_state.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("block_m", [0, 256])
+def test_expert_adapter_real_ddp_hooks_and_master_optimizer(adapter, ep_group, block_m):
     from megatron.core import parallel_state
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear, TERowParallelGroupedLinear
@@ -461,7 +548,7 @@ def test_expert_adapter_real_ddp_hooks_and_master_optimizer(adapter, ep_group):
         reference = TEGroupedMLP(4, config, submodules, pg_collection=pg).cuda()
         weights = tuple(experts.parameters())
         for linear in (experts.linear_fc1, experts.linear_fc2):
-            linear.forward = adapter._Linear(linear, 0).forward
+            linear.forward = adapter._Linear(linear, block_m).forward
         ddp = DistributedDataParallel(
             config,
             DistributedDataParallelConfig(
@@ -502,7 +589,7 @@ def test_expert_adapter_real_ddp_hooks_and_master_optimizer(adapter, ep_group):
                 x = (torch.randn(sum(counts), 64, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
                 p = torch.rand(sum(counts), device="cuda", dtype=torch.float64, requires_grad=True)
                 rx, rp = x.detach().clone().requires_grad_(), p.detach().clone().requires_grad_()
-                y, _ = ddp(x, adapter._DeviceCounts(torch.tensor(counts, device="cuda")), p)
+                y, _ = ddp(x, adapter._DeviceCounts(torch.tensor(counts, device="cuda"), block_m, x.shape[0]), p)
                 expected, _ = reference(rx, torch.tensor(counts), rp)
                 torch.testing.assert_close(y, expected, atol=0.001, rtol=0.02)
                 pending.append((x, p, y, rx, rp, expected))

@@ -29,9 +29,15 @@ class _DeviceCounts:
     and its probability dtype, clamp and recomputation behavior are retained.
     """
 
-    def __init__(self, counts: Any) -> None:
+    def __init__(self, counts: Any, block_m: int = 0, rows: int | None = None) -> None:
         self.dispatch = getattr(counts, "_relax_dispatch", None)
-        self.offsets = self.dispatch.offsets if self.dispatch is not None else expert_tiles.make_offsets(counts)
+        self.tile_offsets = None
+        if self.dispatch is not None:
+            self.offsets = self.dispatch.offsets
+        elif block_m > 0 and rows is not None:
+            self.offsets, self.tile_offsets = expert_tiles._make_plan(counts, block_m, rows)
+        else:
+            self.offsets = expert_tiles.make_offsets(counts)
 
     def tolist(self) -> _DeviceCounts:
         return self
@@ -42,16 +48,25 @@ class _Pointers:
         self.key: tuple = ()
         self.table: Any = None
 
-    def get(self, tensors: tuple) -> Any:
+    def get(self, tensors: tuple, key: tuple | None = None) -> Any:
         import torch
 
-        key = (tensors[0].device, *(tensor.data_ptr() for tensor in tensors))
+        if key is None:
+            key = (tensors[0].device, *(tensor.data_ptr() for tensor in tensors))
         if key != self.key:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Expert pointer tables must be warmed up before CUDA Graph capture")
             self.table = torch.tensor(key[1:], dtype=torch.int64, device=tensors[0].device)
             self.key = key
         return self.table
+
+
+def _tensor_signature(tensors: tuple) -> tuple:
+    # CPU metadata only. .data replacement can change layout without changing _version.
+    return tuple(
+        (id(t), t.data_ptr(), t.dtype, t.device, t.shape, t.stride(), t.requires_grad, hasattr(t, "__fsdp_param__"))
+        for t in tensors
+    )
 
 
 class _Linear:
@@ -61,11 +76,18 @@ class _Linear:
         self.source_first = source_first
         self.weights = _Pointers()
         self.gradients = _Pointers()
+        self.weight_names = tuple(f"weight{i}" for i in range(module.num_gemms))
+        self.weight_signature: tuple = ()
+        self.weight_key: tuple = ()
+        self.cached_weights: tuple = ()
 
     def parameters(self) -> tuple:
         import torch
 
-        weights = tuple(getattr(self.module, f"weight{i}") for i in range(self.module.num_gemms))
+        weights = tuple(self.module._parameters[name] for name in self.weight_names)
+        signature = _tensor_signature(weights)
+        if signature == self.weight_signature:
+            return self.cached_weights
         for weight in weights:
             expert_tiles._check_tensor(weight, 2, "expert weight")
             if not isinstance(weight, torch.nn.Parameter) or hasattr(weight, "__fsdp_param__"):
@@ -74,6 +96,9 @@ class _Linear:
                 raise ValueError("Expert weights must have a common shape and device")
             if weight.requires_grad != weights[0].requires_grad:
                 raise ValueError("Mixed frozen/trainable expert weights are unsupported")
+        self.cached_weights = weights
+        self.weight_key = (weights[0].device, *(entry[1] for entry in signature))
+        self.weight_signature = signature
         return weights
 
     def matmul(
@@ -86,6 +111,7 @@ class _Linear:
         output: Any = None,
         dispatch: Any = None,
         source: int = -1,
+        tile_offsets: Any = None,
     ) -> Any:
         import torch
 
@@ -119,6 +145,7 @@ class _Linear:
                 True,
                 None if dispatch is None else dispatch.counts,
                 source,
+                TILE_OFFSETS=tile_offsets,
                 num_warps=4,
                 num_stages=3,
             )
@@ -131,16 +158,20 @@ class _Linear:
         from . import _expert_tile_kernels as kernels
 
         gradients = tuple(weight.main_grad for weight in weights)
+        device = x.device
+        pointers = []
         for weight, grad in zip(weights, gradients):
-            if grad.dtype != torch.float32 or grad.device != x.device or grad.shape != weight.shape:
+            if grad.dtype != torch.float32 or grad.device != device or grad.shape != weight.shape:
                 raise ValueError("Expert main_grad must retain the original CUDA FP32 shape/device")
             if not grad.is_contiguous():
                 raise ValueError("Expert main_grad must be contiguous")
+            pointers.append(grad.data_ptr())
         overwrite = {bool(getattr(w, "overwrite_main_grad", False)) for w in weights}
         if len(overwrite) != 1:
             raise ValueError("Expert overwrite_main_grad flags must agree within a group")
         accumulate = first is not True and not next(iter(overwrite))
-        table = self.gradients.get(gradients)
+        # Do not cache gradient tensors: offload/rebinding must release their old storage.
+        table = self.gradients.get(gradients, (device, *pointers))
         n, k = dy.shape[1], x.shape[1]
         kernels.weight_grad[(((n + 63) // 64) * ((k + 63) // 64), len(weights))](
             x,
@@ -188,13 +219,13 @@ def _linear_autograd() -> type:
         @staticmethod
         def forward(ctx: Any, x: Any, counts: _DeviceCounts, state: _Linear, first: bool | None, *weights: Any) -> Any:
             offsets = counts.offsets
-            table = state.weights.get(weights)
-            ctx.save_for_backward(x, offsets, table, *weights)
+            table = state.weights.get(weights, state.weight_key)
+            ctx.save_for_backward(x, offsets, table, counts.tile_offsets, *weights)
             ctx.original_weights = weights
             ctx.state, ctx.first = state, first
             transport = counts.dispatch if state.source_first else None
             if transport is None:
-                return state.matmul(x, table, offsets, weights[0].shape, False)
+                return state.matmul(x, table, offsets, weights[0].shape, False, tile_offsets=counts.tile_offsets)
             output = state.matmul(
                 x, table, offsets, weights[0].shape, False, dispatch=transport, source=transport.rank
             )
@@ -213,9 +244,13 @@ def _linear_autograd() -> type:
         @staticmethod
         @once_differentiable
         def backward(ctx: Any, dy: Any) -> tuple:
-            x, offsets, table, *weights = ctx.saved_tensors
+            x, offsets, table, tile_offsets, *weights = ctx.saved_tensors
             dy = dy.contiguous()
-            dx = ctx.state.matmul(dy, table, offsets, weights[0].shape, True) if ctx.needs_input_grad[0] else None
+            dx = (
+                ctx.state.matmul(dy, table, offsets, weights[0].shape, True, tile_offsets=tile_offsets)
+                if ctx.needs_input_grad[0]
+                else None
+            )
             gradients = (None,) * len(weights)
             if ctx.needs_input_grad[4]:
                 gradients = ctx.state.wgrad(x, dy, offsets, ctx.original_weights, ctx.first)
@@ -248,6 +283,8 @@ def _validate(experts: Any, dispatcher: Any, overlap: bool) -> None:
         raise ValueError("Expert tiles currently require expert tensor parallel size 1")
     if type(dispatcher).__name__ != "MoEAlltoAllTokenDispatcher" or getattr(dispatcher, "drop_and_pad", False):
         raise ValueError("Expert tiles require the dropless alltoall dispatcher")
+    if getattr(dispatcher, "relax_metadata_mode", "off") == "b":
+        raise ValueError("Expert tiles require GPU expert counts; legacy RELAX_MOE_METADATA_MODE=b is incompatible")
     if overlap:
         if dispatcher.ep_size != 2 or dispatcher.tp_size != 1 or dispatcher.num_local_experts < 2:
             raise ValueError("Local-first dispatch requires EP2, ETP1 and multiple local experts")
@@ -268,10 +305,60 @@ def _validate(experts: Any, dispatcher: Any, overlap: bool) -> None:
             raise ValueError("Expert tiles require separate weight0..weightN Parameters")
 
 
+def _install_compact_metadata(dispatcher: Any) -> bool:
+    config = dispatcher.config
+    if (
+        dispatcher.tp_size != 1
+        or dispatcher.ep_size <= 1
+        or dispatcher.drop_and_pad
+        or config.moe_expert_capacity_factor is not None
+        or config.moe_router_padding_for_quantization
+        or not config.moe_permute_fusion
+        or config.cuda_graph_impl != "none"
+        or getattr(dispatcher, "relax_metadata_mode", "off") != "off"
+        or dispatcher.cuda_dtoh_point != "before_permutation_1"
+    ):
+        return False
+    original = dispatcher._maybe_dtoh_and_synchronize
+    pending = False
+
+    def metadata(_self: Any, point: str, tokens_per_expert: Any = None) -> Any:
+        import torch
+
+        nonlocal pending
+        if point == "before_permutation_1":
+            if pending or _self.cuda_sync_point != "before_ep_alltoall":
+                raise RuntimeError("Unexpected expert metadata synchronization order")
+            inputs, outputs = _self.input_splits, _self.output_splits
+            if any(not t.is_cuda or t.dtype != torch.int64 or t.shape != (_self.ep_size,) for t in (inputs, outputs)):
+                raise RuntimeError("Compact expert metadata requires CUDA int64 EP splits")
+            # Counts and fused-sort metadata stay on device; only EP splits go to CPU.
+            _self.input_splits = torch.cat((inputs, outputs))
+            _self.output_splits = _self.output_splits_tp = None
+            original(point, None)
+            pending = True
+        elif point == "before_ep_alltoall":
+            if not pending:
+                raise RuntimeError("Expert metadata must be copied before the EP wait")
+            original(point, None)  # Retain MCore's one required event wait before reading host splits.
+            packed = _self.input_splits
+            _self.input_splits = packed[: _self.ep_size]
+            _self.output_splits = packed[_self.ep_size :]
+            # Each invocation owns this backing buffer; backward may run in reverse order.
+            pending = False
+        elif point not in ("before_permutation_2", "before_finish"):
+            raise RuntimeError(f"Unexpected expert metadata point: {point}")
+        return tokens_per_expert
+
+    dispatcher._maybe_dtoh_and_synchronize = MethodType(metadata, dispatcher)
+    return True
+
+
 def _install_layer(experts: Any, dispatcher: Any, block_m: int, overlap: bool) -> None:
     original_preprocess = dispatcher.preprocess
     original_postprocess = dispatcher.dispatch_postprocess
     original_forward = experts.forward
+    experts._relax_compact_metadata = _install_compact_metadata(dispatcher)
 
     def preprocess(_self: Any, *args: Any, **kwargs: Any) -> Any:
         counts = original_preprocess(*args, **kwargs)
@@ -295,7 +382,7 @@ def _install_layer(experts: Any, dispatcher: Any, block_m: int, overlap: bool) -
         return x, counts, probabilities
 
     def forward(_self: Any, x: Any, counts: Any, probabilities: Any, **kwargs: Any) -> Any:
-        return original_forward(x, _DeviceCounts(counts), probabilities, **kwargs)
+        return original_forward(x, _DeviceCounts(counts, block_m, x.shape[0]), probabilities, **kwargs)
 
     dispatcher.preprocess = MethodType(preprocess, dispatcher)
     dispatcher.dispatch_postprocess = MethodType(postprocess, dispatcher)
@@ -351,5 +438,14 @@ def install(model: Any) -> int:
         raise ValueError("Expert backend requested but no eligible MoE layers were found")
     for experts, dispatcher in layers:
         _install_layer(experts, dispatcher, BACKENDS[backend], overlap)
-    logger.info("Installed expert backend=%s on %d MoE layers; local-first dispatch=%s", backend, len(layers), overlap)
+    logger.info(
+        "Installed expert backend=%s on %d MoE layers; local-first dispatch=%s; "
+        "indexed tiles=%s; compact EP metadata=%d/%d",
+        backend,
+        len(layers),
+        overlap,
+        BACKENDS[backend] > 0 and not overlap,
+        sum(experts._relax_compact_metadata for experts, _ in layers),
+        len(layers),
+    )
     return len(layers)

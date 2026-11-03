@@ -47,6 +47,9 @@ output
 outputs
 tensorboard_log
 
+# Local experiment results and profiler artifacts
+/analysis/
+
 .history
 *.log
 *.out

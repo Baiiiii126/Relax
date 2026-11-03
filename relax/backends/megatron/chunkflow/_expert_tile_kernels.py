@@ -7,6 +7,16 @@ import triton.language as tl
 
 
 @tr.jit
+def tile_metadata(COUNTS, METADATA, EXPERTS: tl.constexpr, BM: tl.constexpr, BLOCK: tl.constexpr):
+    expert = tl.arange(0, BLOCK)
+    counts = tl.load(COUNTS + expert, expert < EXPERTS, 0).to(tl.int64)
+    tl.store(METADATA, 0)
+    tl.store(METADATA + EXPERTS + 1, 0)
+    tl.store(METADATA + expert + 1, tl.cumsum(counts), expert < EXPERTS)
+    tl.store(METADATA + EXPERTS + 2 + expert, tl.cumsum(tl.cdiv(counts, BM)), expert < EXPERTS)
+
+
+@tr.jit
 def _linear_tile(
     X,
     W,
@@ -61,58 +71,104 @@ def linear(
     POINTERS: tl.constexpr = False,
     SOURCE_COUNTS=None,
     SOURCE: tl.constexpr = -1,
+    TILE_OFFSETS=None,
 ):
     task = tl.program_id(0).to(tl.int64)
     first_task = tl.full((), 0, tl.int64)
     n_tiles = tr.cdiv(N, BN)
-    for expert in range(EXPERTS):
-        start = tl.load(OFFSETS + expert)
-        end = tl.load(OFFSETS + expert + 1)
-        if SOURCE >= 0:
-            if SOURCE == 1:
-                start += tl.load(SOURCE_COUNTS + expert)
-            end = start + tl.load(SOURCE_COUNTS + SOURCE * EXPERTS + expert)
-        if POINTERS:
-            weight = tl.load(W + expert).to(tl.pointer_type(tl.bfloat16))
-        else:
-            weight = W + expert * WE
-        if BM == 0:
-            full = (end - start) // 256
-            half = ((end - start) % 256) // 128
-            tail = tl.cdiv((end - start) % 128, 64)
-            tasks = (full + half + tail) * n_tiles
-        else:
-            tasks = tl.cdiv(end - start, BM) * n_tiles
-        while task < first_task + tasks:
-            local_task = task - first_task
-            block = local_task // n_tiles
-            column = (local_task % n_tiles) * BN
-            if BM == 0:
-                if block < full:
-                    _linear_tile(X, weight, Y, ROWS, start + block * 256, end, column, N, K, WN, WK, 256, BN, BK)
-                elif block < full + half:
-                    _linear_tile(X, weight, Y, ROWS, start + full * 256, end, column, N, K, WN, WK, 128, BN, BK)
-                else:
-                    _linear_tile(
-                        X,
-                        weight,
-                        Y,
-                        ROWS,
-                        start + full * 256 + half * 128 + (block - full - half) * 64,
-                        end,
-                        column,
-                        N,
-                        K,
-                        WN,
-                        WK,
-                        64,
-                        BN,
-                        BK,
-                    )
+    if TILE_OFFSETS is not None:
+        tl.static_assert(BM > 0 and SOURCE == -1)
+        total_tasks = tl.load(TILE_OFFSETS + EXPERTS).to(tl.int64) * n_tiles
+        expert = tl.full((), 0, tl.int32)
+        expert_end = tl.full((), 0, tl.int64)
+        start = tl.full((), 0, tl.int64)
+        end = tl.full((), 0, tl.int64)
+        while task < total_tasks:
+            if task >= expert_end:
+                left, right = expert, tl.full((), EXPERTS, tl.int32)
+                row_task = task // n_tiles
+                for _ in range((EXPERTS + 1).bit_length()):
+                    middle = (left + right) // 2
+                    boundary = tl.load(TILE_OFFSETS + middle + 1, middle < EXPERTS, 0x7FFFFFFF)
+                    move = row_task >= boundary
+                    left = tl.where(move, middle + 1, left)
+                    right = tl.where(move, right, middle)
+                expert = tl.minimum(left, EXPERTS - 1)
+                first_task = tl.load(TILE_OFFSETS + expert).to(tl.int64) * n_tiles
+                expert_end = tl.load(TILE_OFFSETS + expert + 1).to(tl.int64) * n_tiles
+                start = tl.load(OFFSETS + expert).to(tl.int64)
+                end = tl.load(OFFSETS + expert + 1).to(tl.int64)
+            if POINTERS:
+                weight = tl.load(W + expert).to(tl.pointer_type(tl.bfloat16))
             else:
-                _linear_tile(X, weight, Y, ROWS, start + block * BM, end, column, N, K, WN, WK, BM, BN, BK)
+                weight = W + expert * WE
+            local_task = task - first_task
+            _linear_tile(
+                X,
+                weight,
+                Y,
+                ROWS,
+                start + (local_task // n_tiles) * BM,
+                end,
+                (local_task % n_tiles) * BN,
+                N,
+                K,
+                WN,
+                WK,
+                BM,
+                BN,
+                BK,
+            )
             task += WORKERS
-        first_task += tasks
+    else:
+        for expert in range(EXPERTS):
+            start = tl.load(OFFSETS + expert).to(tl.int64)
+            end = tl.load(OFFSETS + expert + 1).to(tl.int64)
+            if SOURCE >= 0:
+                if SOURCE == 1:
+                    start += tl.load(SOURCE_COUNTS + expert)
+                end = start + tl.load(SOURCE_COUNTS + SOURCE * EXPERTS + expert)
+            if POINTERS:
+                weight = tl.load(W + expert).to(tl.pointer_type(tl.bfloat16))
+            else:
+                weight = W + expert * WE
+            if BM == 0:
+                full = (end - start) // 256
+                half = ((end - start) % 256) // 128
+                tail = tl.cdiv((end - start) % 128, 64)
+                tasks = (full + half + tail) * n_tiles
+            else:
+                tasks = tl.cdiv(end - start, BM) * n_tiles
+            while task < first_task + tasks:
+                local_task = task - first_task
+                block = local_task // n_tiles
+                column = (local_task % n_tiles) * BN
+                if BM == 0:
+                    if block < full:
+                        _linear_tile(X, weight, Y, ROWS, start + block * 256, end, column, N, K, WN, WK, 256, BN, BK)
+                    elif block < full + half:
+                        _linear_tile(X, weight, Y, ROWS, start + full * 256, end, column, N, K, WN, WK, 128, BN, BK)
+                    else:
+                        _linear_tile(
+                            X,
+                            weight,
+                            Y,
+                            ROWS,
+                            start + full * 256 + half * 128 + (block - full - half) * 64,
+                            end,
+                            column,
+                            N,
+                            K,
+                            WN,
+                            WK,
+                            64,
+                            BN,
+                            BK,
+                        )
+                else:
+                    _linear_tile(X, weight, Y, ROWS, start + block * BM, end, column, N, K, WN, WK, BM, BN, BK)
+                task += WORKERS
+            first_task += tasks
 
 
 @tr.jit(do_not_specialize=["ROWS"])
@@ -134,8 +190,8 @@ def weight_grad(
     tile = tl.program_id(0)
     ns = (tile // tr.cdiv(K, BK)) * BN + tl.arange(0, BN)
     ks = (tile % tr.cdiv(K, BK)) * BK + tl.arange(0, BK)
-    start = tl.load(OFFSETS + expert)
-    end = tl.load(OFFSETS + expert + 1)
+    start = tl.load(OFFSETS + expert).to(tl.int64)
+    end = tl.load(OFFSETS + expert + 1).to(tl.int64)
     # Each output element has one writer; no atomic or partial-dW workspace.
     if end > start or not ACCUMULATE:
         acc = tl.zeros((BN, BK), tl.float32)

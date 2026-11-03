@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from relax.utils.logging_utils import get_logger
 
+from .metadata import execution_optimizations_enabled, int32_metadata
+
 
 logger = get_logger(__name__)
 
@@ -20,8 +22,6 @@ def apply_rope_offset(
     lengths: list[int],
     headroom: int = 1,
 ) -> None:
-    import torch
-
     absolute = [0]
     for length in lengths:
         absolute.append(absolute[-1] + length)
@@ -29,13 +29,10 @@ def apply_rope_offset(
     for offset, length in zip(offsets, lengths, strict=True):
         padded.append(offset + length)
 
-    packed_seq_params.cu_seqlens_q = torch.tensor(
-        absolute, dtype=torch.int32, device=packed_seq_params.cu_seqlens_q.device
-    )
+    if not execution_optimizations_enabled() or getattr(packed_seq_params, "cu_seqlens_q_cpu", None) != absolute:
+        packed_seq_params.cu_seqlens_q = int32_metadata(absolute, packed_seq_params.cu_seqlens_q.device)
     packed_seq_params.cu_seqlens_kv = packed_seq_params.cu_seqlens_q
-    packed_seq_params.cu_seqlens_q_padded = torch.tensor(
-        padded, dtype=torch.int32, device=packed_seq_params.cu_seqlens_q.device
-    )
+    packed_seq_params.cu_seqlens_q_padded = int32_metadata(padded, packed_seq_params.cu_seqlens_q.device)
     packed_seq_params.cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_q_padded
     packed_seq_params.cu_seqlens_q_cpu = absolute
     packed_seq_params.max_seqlen_q = max(lengths)
