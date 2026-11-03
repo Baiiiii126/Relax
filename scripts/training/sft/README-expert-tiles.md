@@ -34,12 +34,20 @@ test -f "$HF_CHECKPOINT/config.json"
 test -f "$PROMPT_DATA"
 
 python3 -m pytest -q tests/tools/test_expert_counts_replay.py tests/tools/test_summarize_qwen36_comparison.py
+python3 -m pytest -q tests/tools/test_expert_kernel_cache.py
 torchrun --standalone --nproc_per_node=2 -m pytest -q tests/backends/megatron/test_expert_tiles.py
 
 NUM_ROLLOUT=100 bash scripts/training/sft/run-qwen36-35B-A3B-8xgpu-expert-tiles.sh run
 ```
 
-The launcher defaults to two eight-GPU jobs sequentially, with live terminal logs:
+The launcher defaults to one eight-GPU `expert_chunkflow` job, with live terminal
+logs. `EXPERIMENT_ARMS=expert_chunkflow` selects this explicitly. Use
+`NUM_ROLLOUT=10` for a short diagnostic run or `NUM_ROLLOUT=100` for the full run.
+Single-arm runs retain loss/timing logs and memory records without generating
+a paired comparison. The offline cache test verifies that varying routed token
+counts reuse compiled kernels; it does not execute GPU kernels.
+
+Set `EXPERIMENT_ARMS=production` to run the following pair sequentially:
 
 | Arm              | ChunkFlow | Expert backend | Local-first dispatch |
 | ---------------- | --------- | -------------- | -------------------- |
@@ -71,7 +79,8 @@ EXPERIMENT_ARMS=optimized DISPATCH_OVERLAP=0 NUM_ROLLOUT=100 \
 ```bash
 exp_dir="$(cat analysis/expert-tiles-latest-path.txt)"
 cat "$exp_dir/comparison.md"
-cat "$exp_dir/production-diagnosis.md"  # New ChunkFlow vs original unchunked baseline
+# Available after EXPERIMENT_ARMS=production or all:
+# cat "$exp_dir/production-diagnosis.md"
 ```
 
 Each pair also writes every loss/timing point to `*paired.csv`, and per-rank

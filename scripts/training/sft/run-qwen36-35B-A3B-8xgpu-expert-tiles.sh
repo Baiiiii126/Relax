@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Original baseline vs optimized ChunkFlow; no precision or performance gates.
+# Optimized ChunkFlow, with optional comparisons; no precision or performance gates.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -17,10 +17,14 @@ export NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
 export GDN_RECOMPUTE="${GDN_RECOMPUTE:-1}"
 EXPERT_BACKEND="${EXPERT_BACKEND:-mixed}"
 DISPATCH_OVERLAP="${DISPATCH_OVERLAP:-1}"
+EXPERIMENT_ARMS="${EXPERIMENT_ARMS:-expert_chunkflow}"
 case "${EXPERT_BACKEND}" in tiles128|tiles256|mixed) ;; *) echo "Invalid EXPERT_BACKEND" >&2; exit 2 ;; esac
 case "${DISPATCH_OVERLAP}" in 0|1) ;; *) echo "Invalid DISPATCH_OVERLAP" >&2; exit 2 ;; esac
 case "${GDN_RECOMPUTE}" in 0|1) ;; *) echo "Invalid GDN_RECOMPUTE" >&2; exit 2 ;; esac
-if ! [[ "${NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]] || [ "${NUM_ROLLOUT}" -le 30 ]; then
+if ! [[ "${NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "ERROR: NUM_ROLLOUT must be positive" >&2; exit 2
+fi
+if [ "${EXPERIMENT_ARMS}" != expert_chunkflow ] && [ "${NUM_ROLLOUT}" -le 30 ]; then
    echo "ERROR: NUM_ROLLOUT must exceed the 30-step warmup" >&2; exit 2
 fi
 export GBS=8 NUM_GPUS=8 TP_SIZE=2 PP_SIZE=4 EP_SIZE=2
@@ -44,15 +48,16 @@ RESULT_DIR="${QWEN36_RESULT_DIR:-$(pwd)/analysis/${RUN_ID}}"
 if [ -e "${RESULT_DIR}" ]; then echo "ERROR: result directory exists: ${RESULT_DIR}" >&2; exit 2; fi
 mkdir -p "${RESULT_DIR}" analysis
 printf '%s\n' "${RESULT_DIR}" > analysis/expert-tiles-latest-path.txt
-ARMS=(baseline expert_chunkflow)
-case "${EXPERIMENT_ARMS:-production}" in
-   production) ;;
+ARMS=(expert_chunkflow)
+case "${EXPERIMENT_ARMS}" in
+   expert_chunkflow) ;;
+   production) ARMS=(baseline expert_chunkflow) ;;
    all) ARMS=(baseline chunkflow expert_baseline expert_chunkflow) ;;
    optimized) ARMS=(expert_baseline expert_chunkflow) ;;
-   *) echo "ERROR: EXPERIMENT_ARMS must be production, all or optimized" >&2; exit 2 ;;
+   *) echo "ERROR: EXPERIMENT_ARMS must be expert_chunkflow, production, all or optimized" >&2; exit 2 ;;
 esac
 cat > "${RESULT_DIR}/comparison.md" <<REPORT
-# Expert tiles training comparison
+# Expert tiles training experiment
 
 Commit: $(git rev-parse HEAD)
 Arms: ${ARMS[*]}; steps=${NUM_ROLLOUT}; seed=${TRAIN_SEED}.
@@ -61,10 +66,11 @@ All arms: BF16 / FP32 main_grad / FP64 router; GDN recompute=${GDN_RECOMPUTE}.
 CPU optimizer offload and overlap on; shared expert overlap off.
 ChunkFlow execution patch=${RELAX_CHUNKFLOW_EXECUTION_OPT} in the selected ChunkFlow arms.
 Expert arms: backend=${EXPERT_BACKEND}; local-first dispatch=${DISPATCH_OVERLAP}.
-No numerical, speed or memory gates. Missing steps or failed installation are failures.
+No numerical, speed or memory gates. Requested backend installation must succeed.
 Profile=${CHUNKFLOW_PROFILE}; capture limit=${RELAX_MOE_CAPTURE_LIMIT} per profiled step/rank.
 Profile runs include overhead and must not be used as production speed measurements.
-Timing reports discard the first 30 steps; inspect loss and peak-memory CSVs separately.
+Paired reports require complete runs and discard the first 30 timing steps.
+Single-arm runs retain logs and memory records without generating a paired comparison.
 Local-first overlaps only forward dispatch with local-source FC1; CPU split sync and combine remain.
 It adds one FC1 launch; it does not reduce remote payload bytes or guarantee peak-memory savings.
 Data: ${PROMPT_DATA}; checkpoint: ${HF_CHECKPOINT}; input=${INPUT_KEY}; label=${LABEL_KEY}.
@@ -93,16 +99,16 @@ for arm in "${ARMS[@]}"; do
       if [ "${status}" -eq 130 ] || [ "${status}" -eq 143 ]; then exit "${status}"; fi
    fi
 done
-if [ "${MODE}" = run ]; then
+if [ "${MODE}" = run ] && [ "${EXPERIMENT_ARMS}" != expert_chunkflow ]; then
    REPORT=scripts/training/sft/tools/summarize_qwen36_comparison.py
-   if [ "${EXPERIMENT_ARMS:-production}" != production ]; then
+   if [ "${EXPERIMENT_ARMS}" != production ]; then
       python3 "${REPORT}" "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}" \
          --baseline-arm expert_baseline --chunkflow-arm expert_chunkflow --output-prefix experts- || failed=1
    fi
-   if [ "${EXPERIMENT_ARMS:-production}" = all ]; then
+   if [ "${EXPERIMENT_ARMS}" = all ]; then
       python3 "${REPORT}" "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}" || failed=1
    fi
-   if [ "${EXPERIMENT_ARMS:-production}" != optimized ]; then
+   if [ "${EXPERIMENT_ARMS}" != optimized ]; then
       python3 "${REPORT}" "${RESULT_DIR}" --expected-steps "${NUM_ROLLOUT}" \
          --baseline-arm baseline --chunkflow-arm expert_chunkflow --output-prefix production- || failed=1
    fi

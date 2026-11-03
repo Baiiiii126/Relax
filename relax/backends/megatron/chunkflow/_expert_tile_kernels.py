@@ -41,13 +41,13 @@ def _linear_tile(
     )
 
 
-@tr.jit
+@tr.jit(do_not_specialize=["ROWS"])
 def linear(
     X,
     W,
     Y,
     OFFSETS,
-    ROWS: tl.constexpr,
+    ROWS,
     EXPERTS: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -115,13 +115,13 @@ def linear(
         first_task += tasks
 
 
-@tr.jit
+@tr.jit(do_not_specialize=["ROWS"])
 def weight_grad(
     X,
     DY,
     DW,
     OFFSETS,
-    ROWS: tl.constexpr,
+    ROWS,
     N: tl.constexpr,
     K: tl.constexpr,
     BN: tl.constexpr,
@@ -177,7 +177,7 @@ def dispatch_offsets(COUNTS, OFFSETS, EXPERTS: tl.constexpr, BLOCK: tl.constexpr
     tl.store(OFFSETS + 2 * (EXPERTS + 1) + expert + 1, prefix0 + prefix1, expert < EXPERTS)
 
 
-@tr.jit
+@tr.jit(do_not_specialize=["ROWS"])
 def source_copy(
     X,
     P,
@@ -186,7 +186,7 @@ def source_copy(
     SOURCE_OFFSETS,
     OFFSETS,
     SOURCE_COUNTS,
-    ROWS: tl.constexpr,
+    ROWS,
     H: tl.constexpr,
     EXPERTS: tl.constexpr,
     SOURCE: tl.constexpr,
