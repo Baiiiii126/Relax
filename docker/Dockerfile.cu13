@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Backport NVCC preload isolation to an existing Blackwell Muon delivery image.
+# Install Muon and isolate NVCC preloads in one layer above the Blackwell delivery base.
 # The pipeline supplies the parent by digest and publishes the train and relax stages.
 ARG BASE_IMAGE=scratch
 ARG TRAIN_IMAGE=train
@@ -8,7 +8,13 @@ FROM ${TRAIN_IMAGE} AS relax
 
 RUN --mount=type=bind,source=docker/scripts/nvcc-without-preload.sh,target=/tmp/nvcc-wrapper \
     set -eu; \
-    /opt/sglang/bin/python3 -B -c 'from importlib.metadata import version; assert version("emerging-optimizers") == "0.3.0"'; \
+    py=/opt/sglang/bin/python3; \
+    if ! "$py" -c 'from absl import logging'; then \
+        "$py" -m pip install --no-cache-dir --only-binary=:all: --no-deps absl-py==2.3.1; \
+    fi; \
+    printf '%s\n' 'emerging-optimizers==0.3.0 --hash=sha256:e993682a8b93b6953b3056b0d4e2714e3a3182b0c85f456bcc78d76cd7b47429' | \
+        "$py" -m pip install --no-cache-dir --only-binary=:all: --no-deps --require-hashes -r /dev/stdin; \
+    "$py" -c 'from importlib.metadata import version; assert version("emerging-optimizers") == "0.3.0"; from absl import logging'; \
     nvcc=/usr/local/cuda/bin/nvcc; \
     if [ -e "$nvcc.real" ]; then \
         cmp /tmp/nvcc-wrapper "$nvcc"; \
